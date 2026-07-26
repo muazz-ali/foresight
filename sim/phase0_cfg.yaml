@@ -1,0 +1,65 @@
+# Foresight Phase 0 — Franka-only in-repo scene (no DynamicVLA SM).
+camera:
+  clip:
+    far: 100.0
+    near: 0.01
+  data_types:
+  - rgb
+  focal_length: 2.3
+  focus_distance: 400.0
+  fps: 25
+  height: 360
+  horizontal_aperture: 4.6
+  width: 480
+robot:
+  name: franka
+  # TCP offset from panda_hand (Isaac Lab Franka DiffIK default)
+  tcp_offset: [0.0, 0.0, 0.107]
+  gripper_open: 0.04
+  gripper_close: 0.0
+  # EE pose: pos(3) + quat wxyz(4)
+  init_pose: [0.45, 0.0, 0.40, 0.0, 1.0, 0.0, 0.0]
+  place_pose: [0.35, 0.25, 0.25, 0.0, 1.0, 0.0, 0.0]
+  max_reach_dist: 0.85
+scene:
+  table_height: 0.0
+  table_size: [1.0, 1.0, 0.02]
+  table_pos: [0.50, 0.0, -0.01]
+  object_mass: 0.05
+  object_friction: 2.0
+  # Primitive sphere for reliable G0 physics; set false to use USD household assets.
+  use_primitive: true
+  object_radius: 0.03
+  object_categories:
+  - apple
+  - cup
+  - can
+  - orange
+  - tomato
+  cameras:
+  - name: static_cam
+    position: [1.0, 0.0, 0.60]
+    rotation_deg: [0.0, 60.0, 90.0]
+  - name: side_cam
+    position: [0.50, 1.0, 0.35]
+    rotation_deg: [-90.0, 0.0, 180.0]
+expert:
+  lookahead_s: 0.25
+  hover_z: 0.10
+  v_static: 0.05
+  lead_max: 0.08
+  approach_xy_tol: 0.04
+  approach_z_tol: 0.04
+  grasp_xy_tol: 0.03
+  grasp_z_tol: 0.03
+  settle_steps: 5
+  close_steps: 12
+  lift_height: 0.15
+  drop_ee_dist: 0.15
+  episode_steps: 300
+paths:
+  object_dir: /home/gpuadmin/Desktop/muazzam/objects
+  scene_dir: /home/gpuadmin/Desktop/muazzam/scenes
+sim:
+  dt: 0.04
+  device: cuda:0

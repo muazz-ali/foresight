@@ -1,0 +1,84 @@
+{
+  "gate": "G0",
+  "robot": "franka",
+  "criterion": {
+    "per_speed_success_ge": 0.7,
+    "speeds_m_s": [
+      0.0,
+      0.1,
+      0.2,
+      0.3,
+      0.4
+    ],
+    "throughput_ge_per_hour": 100
+  },
+  "summaries": [
+    {
+      "speed_m_s": 0.0,
+      "attempts": 20,
+      "successes": 20,
+      "success_rate": 1.0,
+      "elapsed_s": 19.51387643814087,
+      "episodes_per_hour": 3689.6820694873477,
+      "gate_g0_bin_pass": true,
+      "taxonomy_counts": {
+        "success": 20
+      }
+    },
+    {
+      "speed_m_s": 0.1,
+      "attempts": 20,
+      "successes": 20,
+      "success_rate": 1.0,
+      "elapsed_s": 19.489747762680054,
+      "episodes_per_hour": 3694.2499655059264,
+      "gate_g0_bin_pass": true,
+      "taxonomy_counts": {
+        "success": 20
+      }
+    },
+    {
+      "speed_m_s": 0.2,
+      "attempts": 20,
+      "successes": 20,
+      "success_rate": 1.0,
+      "elapsed_s": 22.58936619758606,
+      "episodes_per_hour": 3187.340422490209,
+      "gate_g0_bin_pass": true,
+      "taxonomy_counts": {
+        "success": 20
+      }
+    },
+    {
+      "speed_m_s": 0.3,
+      "attempts": 20,
+      "successes": 20,
+      "success_rate": 1.0,
+      "elapsed_s": 28.27944016456604,
+      "episodes_per_hour": 2546.0192840102804,
+      "gate_g0_bin_pass": true,
+      "taxonomy_counts": {
+        "success": 20
+      }
+    },
+    {
+      "speed_m_s": 0.4,
+      "attempts": 20,
+      "successes": 19,
+      "success_rate": 0.95,
+      "elapsed_s": 39.09190511703491,
+      "episodes_per_hour": 1841.8135361897434,
+      "gate_g0_bin_pass": true,
+      "taxonomy_counts": {
+        "success": 19,
+        "too-late": 1
+      }
+    }
+  ],
+  "overall_success_rate": 0.99,
+  "overall_throughput_eps_per_hour": 2791.1829567175896,
+  "all_bins_pass": true,
+  "throughput_pass": true,
+  "gate_g0_pass": true,
+  "wall_time_s": 128.97757172584534
+}

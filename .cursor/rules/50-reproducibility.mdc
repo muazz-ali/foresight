@@ -1,0 +1,25 @@
+---
+description: Seeds, shapes, and no-silent-failure standards for ML/robotics
+alwaysApply: true
+---
+
+# Reproducibility
+
+Strict on numerical correctness; lenient on style.
+
+## Seeds
+- Every stochastic path (numpy, torch, random, sim reset) takes an explicit seed arg.
+- Parallel workers: **distinct but reproducible** seeds — never the same seed (dupe data), never unseeded.
+
+## Contracts
+- Assert shapes at module boundaries (state, action, images, conditioning vector).
+- Never silently collapse batched/per-env data to index `[0]`.
+- Normalization stats must match convert → train → infer.
+
+## Failure discipline
+- No bare `except: pass`. Log context; re-raise or handle explicitly.
+- Log failure taxonomy every episode from day one: `never-engaged | too-late | early-close | wrong-object | grasp-slip | off-table | safety-abort`.
+- Do not claim a gate passed without the metric table from `foresight_plan.md` §8.
+
+## Long jobs
+Prove one iteration (shapes + one episode / one train step), then scale. Background long GPU runs; hard-cap steps/time.

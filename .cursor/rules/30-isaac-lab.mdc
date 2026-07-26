@@ -1,0 +1,25 @@
+---
+description: Isaac Sim / Isaac Lab headless conventions for this lab
+globs: "**/sim*/**,**/scripts/**,**/*isaac*,**/*robot*"
+alwaysApply: false
+---
+
+# Isaac Sim / Lab conventions
+
+Install: `~/Desktop/IsaacLab` → `muazzam/IsaacLab`. Connect cookbook: `ppt.md` (launch flags + step loop only). Sim env: `dynamicVLA_isaac` (do not mix with training).
+
+## Hard rules
+1. **Launch app before importing** `omni.*` / `isaaclab.*` (use `AppLauncher` or `SimulationApp` first).
+2. Images need **`--headless --enable_cameras`**. `--headless` alone → black frames.
+3. Loop: `sim.reset()` once → `set_target` → `write_data_to_sim` → `sim.step()` → `update`.
+4. GLFW / "no display" warnings are expected headless — ignore. Real failures: wrong env, early imports, missing cameras flag.
+5. Multi-GPU / multi-process: **disjoint seeds**; index tensors per-env (`[env_i]`), never hardcode `[0]`.
+6. **Own the runtime in `sim/`.** Do not `sys.path` DynamicVLA for the expert or episode loop. Assets from `~/Desktop/muazzam/{objects,scenes}` are fine; their Python SM is not.
+
+## Foresight specifics
+- Cameras mirror the real rig: static front RGB + wrist RGB-D.
+- Start with kinematic conveyor / scripted object motion; physics rolling later.
+- Expert: four-stage SM on GT `ObjectState` (plan §4), implemented under `sim/`.
+- Log the conditioning vector *exactly* as the policy will see it.
+- Prove **one** successful episode + shapes before scaling collection.
+- Success criterion and failure taxonomy are Foresight-owned; log `max_sm`, `z_max`, `z_end` so taxonomy is diagnosable.

@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": ".cursor/hooks/session-start.sh",
+        "timeout": 5
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": ".cursor/hooks/guard-shell.sh",
+        "failClosed": false
+      },
+      {
+        "command": ".cursor/hooks/guard-dynamicvla.sh",
+        "failClosed": false
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": ".cursor/hooks/py-syntax-check.sh",
+        "failClosed": false
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": ".cursor/hooks/task-workstream.sh",
+        "matcher": "Task",
+        "failClosed": false,
+        "timeout": 10
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": ".cursor/hooks/subagent-stop.sh",
+        "failClosed": false,
+        "timeout": 5
+      }
+    ]
+  }
+}

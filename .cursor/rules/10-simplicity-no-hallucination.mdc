@@ -1,0 +1,28 @@
+---
+description: Ban hallucination and prefer the shortest correct solution
+alwaysApply: true
+---
+
+# Simplicity & no hallucination
+
+## Verify before you invent
+- **Isaac / Omniverse APIs:** confirm against `ppt.md` (connect facts only), installed IsaacLab under `~/Desktop/IsaacLab`, or NVIDIA docs. Never invent `omni.*` / `isaaclab.*` APIs from memory.
+- **Numbers, papers, gate thresholds:** quote `foresight_plan.md`. If unsure, say so and read the file.
+- **External modules:** before importing into Foresight runtime, run one minimal smoke call. If it fails, debug/fix first — then wire it. Do not paper over with wrappers.
+- **DynamicVLA:** read-only reference for headless *launch* patterns. Never vendor their SM, termination terms, or success latch. Expert SM is ours (`sim/`, plan §4).
+
+## Prefer few lines
+- Default: off-the-shelf (FilterPy, OpenCV CSRT, LeRobot SmolVLA) + thin glue.
+- If a solution needs a new abstraction layer, base class hierarchy, or config framework — rewrite simpler first.
+- Escalation ladder for tracking: HSV → CSRT → SAM2-tiny *only if needed*. Same idea everywhere: dumbest thing that works.
+
+## Anti-patterns (block these)
+- Driving G0 through DynamicVLA `simulate` / `PickStateMachine` / `object_picked`
+- "While we're here" refactors, speculative Phase-5 features during Phase 0–1
+- Silent `except: pass`, fake fallbacks that hide broken sensors/filters
+- Claiming a gate passed without logged metrics
+- Mixing sim conda env with training env
+- Taxonomy that collapses most failures to `off-table` via a loose `z_min` check without logging `max_sm` / lift height
+
+## When stuck
+Ask one concrete question or run one minimal experiment. Do not paper over uncertainty with more architecture.

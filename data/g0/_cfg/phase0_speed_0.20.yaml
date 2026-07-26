@@ -1,0 +1,156 @@
+camera:
+  clip:
+    far: 10000
+    near: 0.01
+  data_types:
+  - rgb
+  - semantic_segmentation
+  focal_length: 2.3
+  focus_distance: 400
+  fps: 25
+  height: 360
+  horizontal_aperture: 4.6
+  width: 480
+lighting:
+  intensity:
+  - 150
+  - 750
+  position:
+    x:
+    - -50
+    - 50
+    y:
+    - -50
+    - 50
+    z:
+    - 10
+    - 20
+  temperature:
+  - 4000
+  - 8000
+robots:
+  franka:
+    final_pose:
+    - 0.3
+    - 0
+    - 0.3
+    - -1
+    - 0
+    - 0
+    - 0
+    gripper_length: 0.045
+    init_pose:
+    - 0.465906
+    - 0.0
+    - 0.38297
+    - 0.008583
+    - 0.921765
+    - 0.020404
+    - 0.387116
+    max_reach_dist: 0.75
+  piper:
+    final_pose:
+    - 0.373
+    - 0.0
+    - 0.271
+    - -1
+    - 0
+    - 0
+    - 0
+    gripper_length: 0.09
+    init_pose:
+    - 0.373
+    - 0.0
+    - 0.271
+    - 0.0
+    - 0.9739
+    - 0.0
+    - 0.227
+    max_reach_dist: 0.55
+  rb5_piper:
+    final_pose:
+    - 0.6396
+    - 0.1097
+    - 0.2188
+    - -1
+    - 0
+    - 0
+    - 0
+    gripper_length: 0.09
+    init_pose:
+    - 0.5007
+    - -0.1107
+    - 0.2076
+    - 0
+    - 1
+    - 0
+    - 0
+    max_reach_dist: 0.75
+scene:
+  cameras:
+  - name: opst_cam
+    position:
+    - 1
+    - 0
+    - 0.6
+    prim_path: /Robot/OppositeCamera
+    rotation:
+    - 0
+    - 60
+    - 90
+  - name: side_cam
+    position:
+    - 0.5
+    - 1
+    - 0.35
+    prim_path: /Robot/SideCamera
+    rotation:
+    - -90
+    - 0
+    - 180
+  containers:
+    categories:
+    - bowl
+    - box
+    - plate
+    - placemat
+    - tray
+    mass: 0.1
+    n_containers: 1
+  objects:
+    categories:
+    - cup
+    - can
+    - apple
+    - orange
+    - tomato
+    force_static: false
+    friction:
+    - 1.5
+    - 2.5
+    mass: 0.05
+    moving_speed:
+    - 0.2
+    - 0.2
+    n_objects: 1
+    perturbation: null
+    prob_rnd_quat: 0.2
+    prob_static: 0.0
+    tag_thresholds:
+      area: 0.1
+      distance_from_robot: 0.2
+      height: 0.1
+      position_from_bottom: 0.1
+      position_from_left: 0.1
+      velocity: 0.2
+      volume: 0.1
+tasks:
+  long-horizon:
+    episode_length: 20
+    sm: state_machines.place_sm.PlaceStateMachine
+  pick:
+    episode_length: 10
+    sm: state_machines.pick_sm.PickStateMachine
+  place:
+    episode_length: 12
+    sm: state_machines.place_sm.PlaceStateMachine

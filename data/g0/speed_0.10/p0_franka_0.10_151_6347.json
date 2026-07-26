@@ -1,0 +1,28 @@
+{
+  "seed": 151,
+  "speed_m_s": 0.1,
+  "robot": "franka",
+  "success": true,
+  "taxonomy": "success",
+  "usd": "primitive:sphere",
+  "category": "primitive",
+  "tags": [
+    "sphere"
+  ],
+  "init_pos": [
+    0.45402122547301144,
+    0.05025841170628162,
+    0.03
+  ],
+  "init_vel": [
+    -0.09986710359752475,
+    0.005153796565762016,
+    0.0
+  ],
+  "n_frames": 68,
+  "delta": 0.25,
+  "max_sm": 7,
+  "z_max": 0.24101077020168304,
+  "z_end": 0.24101077020168304,
+  "z_min": 0.02999993786215782
+}

@@ -1,0 +1,27 @@
+---
+description: Own sim+expert in-repo; ppt is Isaac connect only; verify before import
+alwaysApply: true
+---
+
+# Own the stack (G0 lesson)
+
+## What went wrong
+Gate G0 failed (~40% flat across 0–40 cm/s) while wrapping DynamicVLA's `PickStateMachine` / `simulate`. Their SM + `object_picked` latch has holes we cannot patch from outside. **Do not resume that strategy.**
+
+## Non-negotiables
+1. **`ppt.md` = Isaac Sim connect cookbook only** (AppLauncher order, `--headless --enable_cameras`, step loop). Not an architecture or state-machine guide.
+2. **Runtime lives in this repo:** `sim/` scene, cameras, scripted expert SM, success criterion, collection. Assets may live under `~/Desktop/muazzam/{objects,scenes}`; **control code must not**.
+3. **Expert SM = Foresight plan §4** four stages against GT `ObjectState` — write it here. Do not import or subclass DynamicVLA `state_machines.*`.
+4. **Verify before import.** Any external module (IsaacLab API, asset loader, third-party util): prove one minimal call works in `dynamicVLA_isaac` (or document the failure + fix) *before* wiring it into Phase 0. Broken import → debug first, then use.
+5. **DynamicVLA is read-only reference** for headless launch patterns. Never a dependency of `scripts/run_phase0.py` / `sim/`. If a change needs `sys.path` into DynamicVLA for the expert — stop.
+
+## Allowed from outside
+| Path | Use |
+|---|---|
+| `~/Desktop/IsaacLab` | Isaac Lab install (verified APIs) |
+| `ppt.md` | Launch / camera / step-loop facts |
+| `~/Desktop/muazzam/{objects,scenes}` | USD assets only |
+| DynamicVLA | Skim patterns; do not vendor SM / termination / latch |
+
+## G0 expert contract (plan §4)
+`(1) approach ~0.25 s ahead, hover ~10 cm → (2) descend, grasp, lift → (3) place → (4) reset`. Drop → stage 1. Success = our criterion (logged), not DynamicVLA `object_picked`.

@@ -1,0 +1,24 @@
+# Bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local run artifacts (keep out of git; source of truth is code + reports you choose)
+*.log
+
+# Old / intermediate episode dumps — only data/g0 (latest gate) is tracked
+data/g0_*/

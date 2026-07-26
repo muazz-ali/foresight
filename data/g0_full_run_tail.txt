@@ -1,0 +1,40 @@
+      "gate_g0_bin_pass": true,
+      "taxonomy_counts": {
+        "success": 20
+      }
+    },
+    {
+      "speed_m_s": 0.3,
+      "attempts": 20,
+      "successes": 20,
+      "success_rate": 1.0,
+      "elapsed_s": 28.27944016456604,
+      "episodes_per_hour": 2546.0192840102804,
+      "gate_g0_bin_pass": true,
+      "taxonomy_counts": {
+        "success": 20
+      }
+    },
+    {
+      "speed_m_s": 0.4,
+      "attempts": 20,
+      "successes": 19,
+      "success_rate": 0.95,
+      "elapsed_s": 39.09190511703491,
+      "episodes_per_hour": 1841.8135361897434,
+      "gate_g0_bin_pass": true,
+      "taxonomy_counts": {
+        "success": 19,
+        "too-late": 1
+      }
+    }
+  ],
+  "overall_success_rate": 0.99,
+  "overall_throughput_eps_per_hour": 2791.1829567175896,
+  "all_bins_pass": true,
+  "throughput_pass": true,
+  "gate_g0_pass": true,
+  "wall_time_s": 128.97757172584534
+}
+[foresight] exiting (skip app.close hang)
+EXIT:0

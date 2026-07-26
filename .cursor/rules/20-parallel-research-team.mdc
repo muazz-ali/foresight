@@ -1,0 +1,32 @@
+---
+description: Parallel agent team protocol — ownership, handoffs, no collisions
+alwaysApply: true
+---
+
+# Parallel research team
+
+Agents work like lab colleagues: **one workstream each**, shared frozen interfaces, no stepping on each other.
+
+## Workstreams (pick exactly one per Task/subagent)
+| Tag | Owns | Must not touch |
+|---|---|---|
+| `sim-scene` | In-repo Isaac scene, **Foresight** expert SM, collection | filter math, policy nets, DynamicVLA SM |
+| `perception` | detector→tracker→Kalman, 3D lift | policy training, reflex |
+| `policy` | SmolVLA/LeRobot conditioning + Δ/noise aug | sim PhysX knobs, executor |
+| `control` | timestamped buffer, reflex, safety/coast | dataset schemas, training |
+| `eval` | speed sweeps, RMSE, failure taxonomy, gates | production control loops |
+| `explore` | read-only search / docs | any writes |
+
+## Parallelism rules
+1. Tag every Task prompt: `WORKSTREAM: <tag>`. Hooks enforce this for general-purpose subagents.
+2. **Shared interface files** (`interfaces/`, state message schema) — change only with an explicit handoff note; prefer additive fields behind flags.
+3. Prefer disjoint paths: `sim/`, `perception/`, `policy/`, `control/`, `eval/`.
+4. Launch independent workstreams in **parallel** (multiple Task calls). Serialize only when they share a file or gate.
+5. Subagent return format: **result / evidence / open questions** — no speculative roadmaps.
+
+## Parent agent duties
+- Assign workstreams, merge results, run gate checks.
+- Never let two writers edit the same module concurrently.
+- After merges: one sanity check (shapes/seeds/import) before scaling GPU jobs.
+
+Full contract: `AGENTS.md`.
