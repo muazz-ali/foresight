@@ -1,16 +1,21 @@
-"""Foresight success criterion + failure taxonomy (plan §8).
+"""Success check + failure labels (plan §8).
 
-Success = place stage reached + object lifted + held at end.
-Taxonomy checks stage / lift diagnostics *before* off-table.
+Success = done stage reached + object lifted + (held high at end OR placed on container).
+We check stage / lift height *before* calling something “off table.”
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from sim.expert import STAGE_APPROACH, STAGE_DONE, STAGE_LIFT, STAGE_PLACE
+from sim.state_machine import (
+    STAGE_APPROACH,
+    STAGE_DONE,
+    STAGE_HOLD_IN_BOX,
+    STAGE_LIFT,
+)
 
-FAILURE_TAXONOMY = (
+FAILURE_LABELS = (
     "never-engaged",
     "too-late",
     "early-close",
@@ -22,82 +27,135 @@ FAILURE_TAXONOMY = (
     "success",
 )
 
+POLICY_FAILURE_LABELS = (
+    "never-held",
+    "held-no-lift",
+    "lifted-no-place",
+    "success",
+)
+
+
+def _stages(episode: dict | None) -> np.ndarray:
+    if episode is None:
+        return np.asarray([], dtype=np.int64)
+    return np.asarray(episode.get("stage", []), dtype=np.int64)
+
 
 def episode_success(
     episode: dict | None,
     *,
     z_lift_min: float = 0.12,
     z_end_min: float = 0.10,
-    place_stage: int = STAGE_PLACE,
+    place_stage: int = STAGE_DONE,
+    container_xy: np.ndarray | None = None,
+    container_xy_tol: float = 0.12,
+    z_placed_min: float = 0.02,
 ) -> bool:
-    """Plan-aligned expert success: grasp completed + object lifted + held."""
+    """Plan-aligned expert success: grasp + lift + hold, or place onto container."""
     if episode is None:
         return False
-    sm = np.asarray(episode.get("sm_state", []))
+    stages = _stages(episode)
     pos = np.asarray(episode.get("object_pos", np.zeros((0, 3))))
-    if len(sm) == 0 or len(pos) == 0:
+    if len(stages) == 0 or len(pos) == 0:
         return False
     z = pos[:, 2]
     lifted = float(z.max()) >= float(z_lift_min)
-    finished = int(sm.max()) >= int(place_stage)
+    finished = int(stages.max()) >= int(place_stage)
     held_at_end = (
         float(z[-5:].mean()) >= float(z_end_min)
         if len(z) >= 5
         else float(z[-1]) >= float(z_end_min)
     )
-    return bool(finished and lifted and held_at_end)
+    placed_on_container = False
+    if container_xy is not None and finished:
+        xy = pos[-1, :2]
+        cxy = np.asarray(container_xy, dtype=np.float64).reshape(2)
+        near = float(np.linalg.norm(xy - cxy)) <= float(container_xy_tol)
+        above_table = float(z[-1]) >= float(z_placed_min)
+        placed_on_container = bool(near and above_table)
+    if (
+        not placed_on_container
+        and container_xy is None
+        and "container_pos" in episode
+        and finished
+    ):
+        cpos = np.asarray(episode["container_pos"])
+        if len(cpos) and np.isfinite(cpos[-1, 0]):
+            xy = pos[-1, :2]
+            near = float(np.linalg.norm(xy - cpos[-1, :2])) <= float(container_xy_tol)
+            above_table = float(z[-1]) >= float(z_placed_min)
+            placed_on_container = bool(near and above_table)
+    return bool(finished and lifted and (held_at_end or placed_on_container))
 
 
 def classify_failure(
     *,
     success: bool,
-    max_sm_state: int,
+    max_stage: int,
     object_z_min: float,
     object_z_max: float,
     object_z_end: float,
     table_z: float = 0.0,
     off_table_margin: float = 0.04,
 ) -> str:
-    """Coarse taxonomy for Gate diagnostics.
+    """Why the expert run failed (or success).
 
     Order: success → never-engaged → too-late → grasp-slip → early-close →
     off-table (only if object fell below table) → timeout.
     """
     if success:
         return "success"
-    if max_sm_state <= STAGE_APPROACH:
+    if max_stage <= STAGE_APPROACH:
         return "never-engaged"
-    if max_sm_state < STAGE_LIFT:
+    if max_stage < STAGE_LIFT:
         return "too-late"
-    if max_sm_state < STAGE_PLACE:
-        # Reached lift but never place — slip or early drop.
+    if max_stage < STAGE_HOLD_IN_BOX:
         if object_z_max < 0.10:
             return "early-close"
         return "grasp-slip"
     if object_z_min < (table_z - off_table_margin):
         return "off-table"
-    if max_sm_state < STAGE_DONE:
+    if max_stage < STAGE_DONE:
         return "timeout"
-    # Reached DONE stage ints but success criterion failed (drop at end).
     if object_z_end < 0.10:
         return "grasp-slip"
     return "timeout"
 
 
+def classify_policy_failure(
+    *,
+    success: bool,
+    holding: np.ndarray | None,
+    object_z_max: float,
+    z_lift_min: float = 0.12,
+) -> str:
+    """Why a policy run failed. Uses holding (0/1), not expert stages."""
+    if success:
+        return "success"
+    held = False
+    if holding is not None and len(np.asarray(holding)):
+        held = bool(np.any(np.asarray(holding) > 0.5))
+    if not held:
+        return "never-held"
+    if float(object_z_max) < float(z_lift_min):
+        return "held-no-lift"
+    return "lifted-no-place"
+
+
 def episode_diagnostics(episode: dict | None) -> dict:
-    """Extract max_sm / z_max / z_end for logging."""
+    """Extract max_stage / z_max / z_end for logging."""
     if episode is None:
         return {
-            "max_sm": 0,
+            "max_stage": 0,
             "z_min": 0.0,
             "z_max": 0.0,
             "z_end": 0.0,
         }
-    sm = np.asarray(episode.get("sm_state", [0]))
+    stages = _stages(episode)
     pos = np.asarray(episode.get("object_pos", [[0.0, 0.0, 0.0]]))
     z = pos[:, 2] if len(pos) else np.array([0.0])
     return {
-        "max_sm": int(sm.max()) if len(sm) else 0,
+        "max_stage": int(stages.max()) if len(stages) else 0,
         "z_min": float(z.min()),
         "z_max": float(z.max()),
         "z_end": float(z[-1]),

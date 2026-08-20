@@ -6,7 +6,7 @@ alwaysApply: true
 # Own the stack (G0 lesson)
 
 ## What went wrong
-Gate G0 failed (~40% flat across 0–40 cm/s) while wrapping DynamicVLA's `PickStateMachine` / `simulate`. Their SM + `object_picked` latch has holes we cannot patch from outside. **Do not resume that strategy.**
+Gate G0 failed (~40% flat across 0–40 cm/s) while wrapping DynamicVLA's `PickPlaceStateMachine` / `simulate`. Their SM + `object_picked` latch has holes we cannot patch from outside. **Do not resume that strategy.**
 
 ## Non-negotiables
 1. **`ppt.md` = Isaac Sim connect cookbook only** (AppLauncher order, `--headless --enable_cameras`, step loop). Not an architecture or state-machine guide.

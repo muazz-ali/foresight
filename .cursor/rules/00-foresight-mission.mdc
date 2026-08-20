@@ -11,7 +11,7 @@ alwaysApply: true
 
 ## Four jobs only
 1. **Where/when** → tracker + Kalman filter (~200 lines)
-2. **What/how** → small VLA + ~12-number future vector (~50 lines change)
+2. **What/how** → small VLA + 5-number live pack (Δ included; ~12 when filter is live) (~50 lines change)
 3. **Exactly when** → reflex PD + time-to-contact grasp (~150 lines)
 4. **Clock** → timestamped action buffer with overwrite (~150 lines)
 
@@ -21,13 +21,16 @@ Total bespoke budget ≈ **1000 lines**. If a change blows past its module budge
 Use this exact message for oracle and estimator (swap = config flag):
 `position, velocity, covariance, timestamp, valid`
 
+Phase-1 **live pack** into the policy is 5 numbers: `p_hat_x, p_hat_y, v_hat_x, v_hat_y, delta`. Do not sample Δ in train and omit it from the vector.
+
 ## Phase gates (stop on fail — do not build ahead)
-- **G0** expert ≥70% @ 0–40 cm/s; collection hundreds/hr
-- **G1** Model B beats A by ≥20 pts mid-speed; B loses <15 pts 0→30 cm/s *(hypothesis test — zero perception needed)*
+- **G0** expert ≥70% @ 0–20 cm/s (0 / 10 / 15 / 20); collection hundreds/hr
+- **G1** Model B beats A by ≥20 pts at 15 cm/s; B loses <15 pts 0→20 cm/s *(hypothesis test — zero perception needed)*. **n≥80 per bin** to claim; 20 is scout. Do not call G1 / the hypothesis dead while Δ is unpacked, eval glue unsticks on open, or labels are `{0,4}` vs expert stages.
 - **G2** pred RMSE @250 ms ≤1–2 cm; swap drop <10 pts
 - **G3** recover ≥half late/early failures; smoother paths
 - **G4** real ≥60–70% @ 10–20 cm/s
 
 ## Deliberately do NOT build
-No latent world model, no optical-flow net, no VLA-from-scratch, no 6D pose (centroid+velocity first), no 200K episodes, no off-table motion before Phase 5.
+No latent world model (including AHEAD / DynaWM / PhysMani modules), no optical-flow net, no VLA-from-scratch, no 6D pose (centroid+velocity first), no 200K episodes, no off-table motion before Phase 5.
 No DynamicVLA state machine / `object_picked` latch as the Phase-0 expert (G0 lesson — flat ~40%, unfixable holes).
+No unfreezing vision to “fix cameras” while B-zero already shows the vector is the channel.

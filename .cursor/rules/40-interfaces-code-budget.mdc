@@ -1,22 +1,24 @@
 ---
-description: Module code budgets and the ~12-D conditioning vector contract
+description: Module code budgets and the conditioning vector contract
 globs: "**/perception/**,**/filter/**,**/policy/**,**/control/**,**/executor/**,**/interfaces/**"
 alwaysApply: false
 ---
 
 # Interfaces & code budgets
 
-## Conditioning vector (~12 numbers, workspace-normalized)
+## Conditioning vector (Phase-1 live pack = **5** numbers)
+Logged / trained layout (`CONDITIONING_LAYOUT`):
 | Field | Dim | Meaning |
 |---|---|---|
-| `p_hat(t+Δ)` | 3 | Predicted object pos at action-landing time |
-| `v_hat` | 3 | Filtered velocity |
-| `delta` | 1 | Lookahead used (train delay-agnostic) |
-| `sigma_p` | 1–3 | Position uncertainty |
-| `valid / coast_time` | 1 | Track live vs coasting |
-| optional intercept | 3 | Hand–object meeting point |
+| `p_hat_x/y(t+Δ)` | 2 | Predicted object XY at action-landing time |
+| `v_hat_x/y` | 2 | Object XY velocity (post-step FD in sim) |
+| `delta` | 1 | Lookahead actually used (must be packed — G1 hole if omitted) |
 
-Oracle and filter **must** emit the same schema. Swapping them is a config flag, not a rewrite.
+Dropped as CONSTANT in oracle demos until G2: `p_hat_z`, `v_hat_z`, `sigma_*`, `valid`, `coast_time`.
+
+Train still samples Δ ∈ [0, 0.4] s from oracle state, but the net **sees** which Δ built p̂. Eval sets Δ = measured latency (0.25 s until measured). Full plan schema (~12) may return when filter uncertainty / coast are live. Oracle and filter **must** emit the same pack. Swapping them is a config flag, not a rewrite.
+
+Do not ship a 4-number pack and call G1 a hypothesis test.
 
 ## Budgets (glue, not frameworks)
 | Module | Budget |

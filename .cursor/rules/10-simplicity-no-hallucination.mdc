@@ -17,12 +17,15 @@ alwaysApply: true
 - Escalation ladder for tracking: HSV → CSRT → SAM2-tiny *only if needed*. Same idea everywhere: dumbest thing that works.
 
 ## Anti-patterns (block these)
-- Driving G0 through DynamicVLA `simulate` / `PickStateMachine` / `object_picked`
+- Driving G0 through DynamicVLA `simulate` / `PickPlaceStateMachine` / `object_picked`
 - "While we're here" refactors, speculative Phase-5 features during Phase 0–1
 - Silent `except: pass`, fake fallbacks that hide broken sensors/filters
 - Claiming a gate passed without logged metrics
 - Mixing sim conda env with training env
 - Taxonomy that collapses most failures to `off-table` via a loose `z_min` check without logging `max_sm` / lift height
+- Adding AHEAD / DynaWM / PhysMani (or any latent world model) to “fix G1” — steal habits, not nets
+- Calling G1 / the hypothesis dead while Δ is unpacked, eval unglues on open, or n=20
+- Unfreezing the vision encoder because B-zero failed — that is the vector-collapse check working
 
 ## When stuck
 Ask one concrete question or run one minimal experiment. Do not paper over uncertainty with more architecture.

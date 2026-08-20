@@ -17,8 +17,18 @@ env/
 .idea/
 .vscode/
 
-# Local run artifacts (keep out of git; source of truth is code + reports you choose)
+# Local run artifacts
 *.log
 
-# Old / intermediate episode dumps — only data/g0 (latest gate) is tracked
+# Dataset / run blobs — keep logic only; regenerate locally
+*.mp4
+*.h5
+*.hdf5
+*.parquet
+*.json
+!.cursor/hooks.json
+
+# Intermediate / debug dumps
 data/g0_*/
+data/g0_*.txt
+data/**/wrist_preview/

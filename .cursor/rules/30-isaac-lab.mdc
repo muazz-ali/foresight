@@ -18,7 +18,7 @@ Install: `~/Desktop/IsaacLab` → `muazzam/IsaacLab`. Connect cookbook: `ppt.md`
 
 ## Foresight specifics
 - Cameras mirror the real rig: static front RGB + wrist RGB-D.
-- Start with kinematic conveyor / scripted object motion; physics rolling later.
+- Start with scripted object motion; physics rolling later.
 - Expert: four-stage SM on GT `ObjectState` (plan §4), implemented under `sim/`.
 - Log the conditioning vector *exactly* as the policy will see it.
 - Prove **one** successful episode + shapes before scaling collection.

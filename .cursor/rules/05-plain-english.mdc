@@ -1,0 +1,16 @@
+---
+description: Explain in plain English; avoid jargon
+alwaysApply: true
+---
+
+# Plain English
+
+When talking to the user:
+
+- Prefer short, everyday words. Avoid academic / research jargon unless they ask for it.
+- If a technical term is needed, say it once, then explain it in one simple sentence.
+- Lead with the answer. Then give the short “why” if useful.
+- Prefer “what to run” and “what it means” over theory dumps.
+- Examples of tone:
+  - Bad: “The shebang invokes the interpreter via PATH resolution.”
+  - Good: “Line 1 tells the computer: run this file with bash.”

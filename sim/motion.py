@@ -1,6 +1,6 @@
-"""Scripted on-table object motion + lead aiming (plan §4).
+"""Scripted on-table object motion + lead aiming.
 
-Kinematic conveyor-style motion keeps speed pinned for Gate G0.
+Kinematic on-table motion keeps speed pinned for Gate G0.
 Velocity lead is clamped so PhysX contact jitter cannot corrupt grasp aim.
 """
 
@@ -12,13 +12,14 @@ import numpy as np
 def clamp_lead_velocity(
     velocity: np.ndarray,
     *,
-    v_static: float = 0.05,
-    lead_max: float = 0.08,
-    lookahead_s: float = 0.25,
+    v_static: float,
+    lead_max: float,
+    lookahead_s: float,
     near_contact: bool = False,
 ) -> np.ndarray:
     """Return lead offset ``clamp(v) * lookahead`` (meters).
 
+    Pass yaml ``state_machine_params`` (no hidden defaults).
     - ``‖v‖ < v_static`` or ``near_contact`` → zero lead (static / contact gate).
     - else clamp lead vector length to ``lead_max``.
     """
@@ -37,14 +38,17 @@ def aim_position(
     position: np.ndarray,
     velocity: np.ndarray,
     *,
-    hover_z: float = 0.10,
-    lookahead_s: float = 0.25,
-    v_static: float = 0.05,
-    lead_max: float = 0.08,
+    hover_z: float,
+    lookahead_s: float,
+    v_static: float,
+    lead_max: float,
     near_contact: bool = False,
     z_mode: str = "hover",
 ) -> np.ndarray:
-    """World aim point for approach (hover) or descend (object height)."""
+    """World aim point for approach (hover) or descend (object height).
+
+    Pass yaml ``state_machine_params`` (no hidden defaults).
+    """
     p = np.asarray(position, dtype=np.float64).reshape(3).copy()
     lead = clamp_lead_velocity(
         velocity,
@@ -80,4 +84,29 @@ def kinematic_advance(
         if pos[1] < ymin or pos[1] > ymax:
             vel[1] = -vel[1]
             pos[1] = float(np.clip(pos[1], ymin, ymax))
+    return pos, vel
+
+
+def kinematic_forecast(
+    position: np.ndarray,
+    velocity: np.ndarray,
+    horizon_s: float,
+    dt: float,
+    *,
+    xy_bounds: tuple[tuple[float, float], tuple[float, float]] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Roll scripted motion forward ``horizon_s`` (same bounce rules as the sim)."""
+    pos = np.asarray(position, dtype=np.float64).reshape(3).copy()
+    vel = np.asarray(velocity, dtype=np.float64).reshape(3).copy()
+    h = float(horizon_s)
+    step = float(dt)
+    if h <= 0.0 or step <= 0.0:
+        return pos, vel
+    # Exact step count; leftover fractional dt so horizon matches wall clock.
+    n_full = int(h // step)
+    rem = h - n_full * step
+    for _ in range(n_full):
+        pos, vel = kinematic_advance(pos, vel, step, xy_bounds=xy_bounds)
+    if rem > 1e-12:
+        pos, vel = kinematic_advance(pos, vel, rem, xy_bounds=xy_bounds)
     return pos, vel

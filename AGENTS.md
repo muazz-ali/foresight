@@ -1,34 +1,34 @@
 # AGENTS.md — Foresight lab contract
 
-Multi-agent operating manual for this repo. Humans and Cursor agents both follow it.
+How humans and Cursor agents work in this repo. Plain words: `WORDS.md`.
 
 ## Project in one line
-Explicit-future dynamic manipulation: Kalman-predicted object state → small VLA → reflex grasp. Plan: `foresight_plan.md`. Isaac connect: `ppt.md` (launch/cameras/step loop only).
+Tell a small policy where a moving object will be (physics prediction) → grasp. Plan: `foresight_plan.md`. Isaac tips: `ppt.md` (launch / cameras / step loop only).
 
-## Ownership (post-G0)
-**Sim scene, scripted expert SM, success criterion, and collection run from this repo (`sim/`, `scripts/`).** DynamicVLA is not a runtime dependency. Wrapping their SM for G0 produced a flat ~40% ceiling — do not resume that path.
+## Ownership (after Gate G0)
+**Scene, scripted expert, success rules, and demo recording live in this repo (`sim/`, `scripts/`).** Do not depend on DynamicVLA at runtime. Wrapping their pick state machine for G0 topped out ~40% — do not go back to that.
 
 ## External dependencies
 | Path | Role |
 |---|---|
 | `~/Desktop/IsaacLab` | Symlink → `muazzam/IsaacLab`. Editable Isaac Lab install. Verify APIs here. |
 | `ppt.md` | Headless AppLauncher / camera / step-loop facts only. |
-| `~/Desktop/muazzam/{objects,scenes}` | USD assets (read). |
-| `~/Desktop/muazzam/DynamicVLA` | Optional *read-only* reference for launch patterns. **Not** expert SM / termination / latch. |
+| `~/Desktop/muazzam/{objects,scenes}` | USD meshes (read). |
+| `~/Desktop/muazzam/DynamicVLA` | Optional *read-only* tips for launch. **Not** our expert or success latch. |
 | `~/Desktop/muazzam/IsaacLab` | Canonical Isaac Lab tree. |
 
-Conda: `dynamicVLA_isaac` for sim; separate env for LeRobot/training. Never mix.
+Conda: `dynamicVLA_isaac` for sim; separate env for training. Never mix.
 
-**Import rule:** smoke-test any external module once before wiring it into Foresight. Fix breaks first.
+**Import rule:** try any outside module once before wiring it in. Fix breaks first.
 
 ## Suggested layout (create only when needed)
 ```
-interfaces/     # frozen state + conditioning schemas
-sim/            # Isaac scene, OUR expert SM, collection
-perception/     # detector, tracker, Kalman, 3D lift
+interfaces/     # shared object message + future-number helper
+sim/            # Isaac scene, OUR scripted expert, recording
+perception/     # detect, track, predict (later)
 policy/         # SmolVLA / LeRobot glue
-control/        # executor buffer + reflex
-eval/           # sweeps, gates, taxonomy
+control/        # action queue + fast grasp helper (later)
+eval/           # speed tests and pass/fail scores
 ```
 Do not invent extra top-level packages.
 
@@ -37,11 +37,11 @@ Tag every subagent Task with `WORKSTREAM: <tag>`.
 
 | Tag | Deliverable | Gate focus |
 |---|---|---|
-| `sim-scene` | In-repo scene + Foresight expert SM + logging | G0 |
+| `sim-scene` | In-repo scene + Foresight expert + logging | G0 |
 | `perception` | Track → filter → predict | G2 |
-| `policy` | A vs B training + Δ/noise aug | G1 |
+| `policy` | A vs B training + look-ahead / noise aug. Pack **Δ**. No latent WM. | G1 |
 | `control` | Buffer + reflex + coast/safety | G3 |
-| `eval` | Speed curve, RMSE, taxonomy | all gates |
+| `eval` | Speed curve, RMSE, **policy** labels (`never-glued / glued-no-lift / …`). n=20 scout; n≥80 to claim G1. | all gates |
 | `explore` | Read-only investigation | — |
 
 ### Handoff checklist

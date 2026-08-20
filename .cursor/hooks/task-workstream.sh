@@ -24,9 +24,9 @@ fi
 
 # Hard block: proposals to re-wrap DynamicVLA SM as the Phase-0 expert.
 if printf '%s\n%s' "$prompt" "$desc" | grep -Eiq \
-  'wrap.*(DynamicVLA|PickStateMachine)|PickStateMachine.*(expert|G0)|sys\.path.*DynamicVLA.*(expert|simulate)|vendor.*(pick_sm|PlaceStateMachine)'; then
+  'wrap.*(DynamicVLA|PickPlaceStateMachine)|PickPlaceStateMachine.*(expert|G0)|sys\.path.*DynamicVLA.*(expert|simulate)|vendor.*(pick_sm|PlaceStateMachine)'; then
   msg="Blocked: DynamicVLA SM is not the Phase-0 expert."
-  agent="G0 lesson: DynamicVLA PickStateMachine/simulate is a dead end (~40% flat). Implement the four-stage expert in foresight/sim/ per foresight_plan.md §4. ppt.md is Isaac connect only. See .cursor/rules/15-own-the-stack.mdc."
+  agent="G0 lesson: DynamicVLA PickPlaceStateMachine/simulate is a dead end (~40% flat). Implement the four-stage expert in foresight/sim/ per foresight_plan.md §4. ppt.md is Isaac connect only. See .cursor/rules/15-own-the-stack.mdc."
   jq -n --arg m "$msg" --arg a "$agent" \
     '{permission:"deny", user_message:$m, agent_message:$a}'
   exit 0

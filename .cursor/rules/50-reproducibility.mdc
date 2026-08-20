@@ -18,8 +18,10 @@ Strict on numerical correctness; lenient on style.
 
 ## Failure discipline
 - No bare `except: pass`. Log context; re-raise or handle explicitly.
-- Log failure taxonomy every episode from day one: `never-engaged | too-late | early-close | wrong-object | grasp-slip | off-table | safety-abort`.
+- Expert logs: `never-engaged | too-late | early-close | wrong-object | grasp-slip | off-table | safety-abort`.
+- **Policy eval** logs glue `{0,4}` only — do **not** run the expert classifier on that. Report `never-glued | glued-no-lift | lifted-no-place | success` plus `z_max` / glue frames. `early-close` / `grasp-slip` are unreachable until stages are real.
 - Do not claim a gate passed without the metric table from `foresight_plan.md` §8.
+- **G1 sample:** 20 trials/bin is scout. **n≥80** to claim pass/fail. Print Wilson intervals. 20 cannot resolve a 20-point margin.
 
 ## Long jobs
 Prove one iteration (shapes + one episode / one train step), then scale. Background long GPU runs; hard-cap steps/time.

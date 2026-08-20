@@ -1,4 +1,4 @@
-# Foresight Phase 0 — Franka-only in-repo scene (no DynamicVLA SM).
+# Foresight Phase 0 — Franka-only in-repo scene.
 camera:
   clip:
     far: 100.0
@@ -11,15 +11,18 @@ camera:
   height: 360
   horizontal_aperture: 4.6
   width: 480
+  # Wrist RGB on panda_hand (offset m, quat wxyz, near/far m).
+  wrist_pos: [0.065, 0.0, 0.0]
+  wrist_quat_wxyz: [0.0, 0.7071068, 0.7071068, 0.0]
+  wrist_clipping_range: [0.01, 2.0]
 robot:
   name: franka
   # TCP offset from panda_hand (Isaac Lab Franka DiffIK default)
   tcp_offset: [0.0, 0.0, 0.107]
   gripper_open: 0.04
   gripper_close: 0.0
-  # EE pose: pos(3) + quat wxyz(4)
+  # EE pose: pos(3) + quat wxyz(4). Place XY/Z come from the container.
   init_pose: [0.45, 0.0, 0.40, 0.0, 1.0, 0.0, 0.0]
-  place_pose: [0.35, 0.25, 0.25, 0.0, 1.0, 0.0, 0.0]
   max_reach_dist: 0.85
 scene:
   table_height: 0.0
@@ -27,36 +30,65 @@ scene:
   table_pos: [0.50, 0.0, -0.01]
   object_mass: 0.05
   object_friction: 2.0
-  # Primitive sphere for reliable G0 physics; set false to use USD household assets.
-  use_primitive: true
-  object_radius: 0.03
+  # Household USDs from paths.object_dir (DynamicVLA asset tree). true = sphere G0 debug.
+  use_primitive: false
+  object_radius: 0.03 # sphere radius when use_primitive is true
+  container_mass: 0.1
+  n_containers: 1
+  place_hover_above_container: 0.08
+  spawn_xy_pad: 0.03 # inset object spawn from bounce walls (m)
+  container_jitter_xy: 0.02 # per-episode container XY jitter (m)
+  container_xy_clip: [[0.45, 0.58], [0.26, 0.34]] # clip jitter so bowl stays off play band
+  attach_z_offset_max: -0.005 # weld object at most this far below EE (m)
+  # Object bounce box: in front of Franka, clear of base (~origin) and bowl (+Y).
+  object_xy_bounds: [[0.48, 0.72], [-0.20, 0.10]]
+  # Reachable side pocket (~0.58 m from base); robot drops here without crowding play.
+  container_xy: [0.50, 0.30]
   object_categories:
   - apple
-  - cup
-  - can
+  - avocado
+  # - beer
+  # - bottle
+  # - can
+  # - cup
+  - egg
+  - kiwi
+  - lemon
+  - lime
+  - onion
   - orange
+  - peach
+  - potato
+  - tangerine
   - tomato
+  container_categories:
+  - bowl
+  - box
+  # - plate
+  # - placemat
+  # - tray
   cameras:
+  # Third-person RGB (primary tracking view). Wrist cam uses camera.wrist_*.
   - name: static_cam
     position: [1.0, 0.0, 0.60]
     rotation_deg: [0.0, 60.0, 90.0]
-  - name: side_cam
-    position: [0.50, 1.0, 0.35]
-    rotation_deg: [-90.0, 0.0, 180.0]
-expert:
-  lookahead_s: 0.25
-  hover_z: 0.10
-  v_static: 0.05
-  lead_max: 0.08
-  approach_xy_tol: 0.04
-  approach_z_tol: 0.04
-  grasp_xy_tol: 0.03
-  grasp_z_tol: 0.03
-  settle_steps: 5
-  close_steps: 12
-  lift_height: 0.15
-  drop_ee_dist: 0.15
-  episode_steps: 300
+
+    
+state_machine_params:
+  lookahead_s: 0.25 # approach prediction only (s). Descend/settle aim at the object now.
+  hover_z: 0.08 # meters above object top during approach
+  v_static: 0.05 # still only if object speed is below this (m/s). At exactly 5 cm/s the object is moving, so the look-ahead stays on.
+  lead_max: 0.10 # cap on XY look-ahead offset (m) so fast objects don't overshoot aim
+  approach_xy_tol: 0.03 # max XY error (m) to leave hover and start descend
+  approach_z_tol: 0.03 # max Z error (m) at hover height to leave approach
+  home_z_tol: 0.03 # max Z error (m) to count the arm as home (IK sits ~2 cm off init Z)
+  grasp_xy_tol: 0.01 # max XY error (m) to enter wait-still / confirm grasp
+  grasp_z_tol: 0.01 # max Z error (m) at object height to enter wait-still; also rim clearance for drop Z
+  settle_s: 0.2 # seconds to pause the object before closing fingers
+  close_gripper_s: 0.15 # seconds fingers stay closed before we lift
+  lift_height: 0.12 # meters to raise the hand after a good close
+  drop_z_gap: 0.04 # extra height above object rest pose inside the box (m)
+  inference_window_s: 10 # max seconds per demo run; timeout = failure
 paths:
   object_dir: /home/gpuadmin/Desktop/muazzam/objects
   scene_dir: /home/gpuadmin/Desktop/muazzam/scenes

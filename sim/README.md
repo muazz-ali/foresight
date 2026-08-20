@@ -1,37 +1,37 @@
-# Phase 0 — Environment + oracle (Franka, in-repo)
+# Sim — table scene + scripted expert
+
+Plain words: [`../WORDS.md`](../WORDS.md).
 
 ## Status
-**G0 PASS (2026-07-26):** Franka in-repo expert, 99% overall @ 0–40 cm/s, ~2790 eps/h.
-DynamicVLA `PickStateMachine` wrap abandoned (~40% flat). Runtime lives here.
+**Gate G0 (recheck 2026-08-02):** household object + container, short sweep → pass. See `data/g0/gate_g0_report.json`.
 
-## Gate G0
-Expert ≥70% success at each of 0/10/20/30/40 cm/s; collection ≥100 episodes/hour.
-
-| speed | succ | rate | eps/h |
-|---|---|---|---|
-| 0.00 | 20/20 | 100% | 3690 |
-| 0.10 | 20/20 | 100% | 3694 |
-| 0.20 | 20/20 | 100% | 3187 |
-| 0.30 | 20/20 | 100% | 2546 |
-| 0.40 | 19/20 | 95% | 1842 |
-
-## Layout
-| Path | Role |
+## Files
+| Path | What it does |
 |---|---|
-| `interfaces/state.py` | Frozen `position, velocity, covariance, timestamp, valid` |
-| `sim/phase0_cfg.yaml` | Franka-only scene + expert + asset roots |
-| `sim/scene.py` | Isaac Lab Franka + table + object + cameras + DiffIK |
-| `sim/motion.py` | Lead clamp + kinematic on-table motion |
-| `sim/expert.py` | Four-stage pick expert (plan §4) |
-| `sim/success.py` | Lift+hold success + taxonomy |
-| `sim/collect.py` | Episode loop + oracle/conditioning log |
-| `scripts/run_phase0.py` | G0 harness (no DynamicVLA) |
+| `phase0_cfg.yaml` | Scene, cameras, expert timings, mesh folders |
+| `scene.py` | Franka + table + object + container + cameras |
+| `motion.py` | On-table sliding motion |
+| `state_machine.py` | Scripted pick stages (see [`WORDS.md`](../WORDS.md) for names) |
+| `state_machine_logs.py` | Plain-English log lines (banners, stage lines, results) |
+| `success.py` | Did we succeed? + failure label |
+| `collect.py` | One episode loop; saves robot pose, images, future numbers |
+| `video.py` | Debug MP4 (static \| wrist + text) |
+
+Shared object message: `interfaces/state.py`.
+
+## Meshes
+| Root | Use |
+|---|---|
+| `/home/gpuadmin/Desktop/muazzam/objects` | Grasp objects + place containers |
+| `/home/gpuadmin/Desktop/muazzam/scenes` | Unused for now |
+
+Object + container meshes are chosen **once per process** (`--seed` / `--object-usd` / `--container-usd`). For more variety, run several workers with different seeds or category names.
 
 ## Run
 ```bash
 conda activate dynamicVLA_isaac
-bash scripts/run_g0.sh smoke   # one static episode
-bash scripts/run_g0.sh         # full G0 sweep
+bash scripts/run_g0.sh smoke
+bash scripts/run_g0.sh            # full Gate G0 → data/g0/
 ```
 
-Assets (read-only): `~/Desktop/muazzam/{objects,scenes}`. Default object is a primitive sphere (`use_primitive: true`); set false for USD household assets. IsaacLab: `~/Desktop/IsaacLab`. Connect facts only: `ppt.md`.
+Isaac launch tips: [`../ppt.md`](../ppt.md).
