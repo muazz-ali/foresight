@@ -64,9 +64,9 @@ scene:
   container_categories:
   - bowl
   - box
-  # - plate
+  - plate
   # - placemat
-  # - tray
+  - tray
   cameras:
   # Third-person RGB (primary tracking view). Wrist cam uses camera.wrist_*.
   - name: static_cam
@@ -75,20 +75,35 @@ scene:
 
     
 state_machine_params:
-  lookahead_s: 0.25 # approach prediction only (s). Descend/settle aim at the object now.
-  hover_z: 0.08 # meters above object top during approach
-  v_static: 0.05 # still only if object speed is below this (m/s). At exactly 5 cm/s the object is moving, so the look-ahead stays on.
-  lead_max: 0.10 # cap on XY look-ahead offset (m) so fast objects don't overshoot aim
-  approach_xy_tol: 0.03 # max XY error (m) to leave hover and start descend
-  approach_z_tol: 0.03 # max Z error (m) at hover height to leave approach
-  home_z_tol: 0.03 # max Z error (m) to count the arm as home (IK sits ~2 cm off init Z)
-  grasp_xy_tol: 0.01 # max XY error (m) to enter wait-still / confirm grasp
-  grasp_z_tol: 0.01 # max Z error (m) at object height to enter wait-still; also rim clearance for drop Z
-  settle_s: 0.2 # seconds to pause the object before closing fingers
-  close_gripper_s: 0.15 # seconds fingers stay closed before we lift
+  lookahead_s: 0.25 # robot arm lookahead time
+  conditioning_delta_s: 0.25 # policy live-pack Δ (s); separate from aiming
+  hover_z: 0.08 # meters above object top at the start of intercept
+  ee_settle_tol: 0.05 # treat speed below this as still (m/s)
+  servo_xy_tol: 0.03 # XY servo gate for carry/lower/home (m)
+  place_xy_tol: 0.12 # container XY gate only; match success container_xy_tol (m)
+  approach_z_tol: 0.03 # max Z error (m) for servo height gates
+  home_z_tol: 0.05 # max Z error (m) to count the arm as home (IK sits ~2–5 cm off init Z)
+  settle_s: 0.2 # seconds at start before intercept begins
+  close_gripper_s: 0.15 # seconds fingers stay closed before we lift / open before home
   lift_height: 0.12 # meters to raise the hand after a good close
   drop_z_gap: 0.04 # extra height above object rest pose inside the box (m)
+  drop_rim_clear_m: 0.01 # drop Z stays this far below container rim (m)
   inference_window_s: 10 # max seconds per demo run; timeout = failure
+  # intercept-servo knobs
+  servo_lag_s: 0.16 # EE command->motion lag (s). CALIBRATE with tools/diag/calibrate_servo_lag.py
+  ee_speed_max: 0.90 # usable TCP speed (m/s) for the rendezvous solve. MEASURE, do not guess
+  intercept_iters: 3 # fixed-point steps for the travel-time solve
+  track_xy_tol: 0.02 # XY error to the object *now* that counts as "riding it" (m)
+  track_hold_s: 0.08 # must stay locked this long before committing to descend (s)
+  bounce_guard_s: 0.10 # floor on straight-line time before a wall reversal (s)
+  z_release_radius: 0.12 # XY error (m) at which the hand starts walking Z down onto the object
+  grasp_tol_step_k: 0.6 # grasp gate floor = k * speed * dt (one step of object travel)
+  grasp_xy_tol: 0.02 # base XY grasp gate (m); floors up with speed
+  grasp_z_tol: 0.02 # base Z grasp gate (m)
+  stage_timeout_s: 1.5 # per-stage stall cap (s) for post-grasp stages
+  grasp_stage_timeout_s: 3.0 # longer cap for intercept/descend (needs bounce windows)
+  max_retries: 3 # re-intercept attempts before giving up
+
 paths:
   object_dir: /home/gpuadmin/Desktop/muazzam/objects
   scene_dir: /home/gpuadmin/Desktop/muazzam/scenes

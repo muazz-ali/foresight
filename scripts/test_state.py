@@ -117,52 +117,21 @@ def test_kinematic_forecast_bounces_unlike_cv():
 def test_sm_stage_order_and_success_latch():
     from sim.state_machine import (
         STAGE_APPROACH,
-        STAGE_DESCEND,
+        STAGE_CARRY,
+        STAGE_CLOSE,
         STAGE_DONE,
-        STAGE_HOLD_IN_BOX,
         STAGE_LIFT,
-        STAGE_OPEN_GRIPPER,
-        STAGE_RETRACT,
-        STAGE_RETURN_HOME,
+        STAGE_OPEN,
+        STAGE_SCHEMA,
         PickPlaceStateMachine,
     )
     from sim.success import episode_success
 
-    assert (
-        STAGE_LIFT
-        < STAGE_RETRACT
-        < STAGE_HOLD_IN_BOX
-        < STAGE_OPEN_GRIPPER
-        < STAGE_RETURN_HOME
-        < STAGE_DONE
-    )
-    cfg = {
-        "state_machine_params": {
-            "lookahead_s": 0.25,
-            "hover_z": 0.08,
-            "v_static": 0.05,
-            "lead_max": 0.10,
-            "approach_xy_tol": 0.03,
-            "approach_z_tol": 0.03,
-            "home_z_tol": 0.03,
-            "grasp_xy_tol": 0.01,
-            "grasp_z_tol": 0.01,
-            "settle_s": 0.2,
-            "close_gripper_s": 0.15,
-            "lift_height": 0.12,
-            "inference_window_s": 10.0,
-        },
-        "robot": {
-            "init_pose": [0.45, 0.0, 0.40, 0.0, 1.0, 0.0, 0.0],
-        },
-    }
-    sm = PickPlaceStateMachine(cfg, dt=0.04)
-    assert sm.settle_steps == 5
-    assert sm.close_steps == 4
-    assert sm.stage == 0
+    assert STAGE_APPROACH < STAGE_CLOSE < STAGE_LIFT < STAGE_CARRY < STAGE_OPEN < STAGE_DONE
+    assert STAGE_SCHEMA.done == STAGE_DONE == 9
     T = 8
     ep = {
-        "stage": np.array([0, 1, 2, 5, 6, 7, 8, 11], dtype=np.int64),
+        "stage": np.array([0, 1, 2, 4, 5, 6, 7, 9], dtype=np.int64),
         "object_pos": np.zeros((T, 3)),
         "container_pos": np.tile([0.50, 0.30, 0.05], (T, 1)),
     }
@@ -170,22 +139,9 @@ def test_sm_stage_order_and_success_latch():
     ep["object_pos"][-1, :2] = [0.50, 0.30]
     assert episode_success(ep) is True
     ep_miss = dict(ep)
-    ep_miss["stage"] = np.array([0, 1, 2, 5, 5, 5, 5, 5], dtype=np.int64)
+    ep_miss["stage"] = np.array([0, 1, 2, 4, 4, 4, 4, 4], dtype=np.int64)
     assert episode_success(ep_miss) is False
 
-    # Descend only when EE is at the 0.25 s lead hover — not at the object now.
-    obj = np.array([0.50, 0.0, 0.05])
-    vel = np.array([0.20, 0.0, 0.0])
-    st = oracle_from_gt(obj, vel, timestamp=0.0)
-    sm.reset()
-    sm.stage = STAGE_APPROACH
-    behind = obj + np.array([0.0, 0.0, 0.08])
-    cmd = sm.step(st, behind, sm._down_quat)
-    assert cmd.stage == STAGE_APPROACH
-    ahead = obj + vel * 0.25 + np.array([0.0, 0.0, 0.08])
-    cmd = sm.step(st, ahead, sm._down_quat)
-    assert cmd.stage == STAGE_DESCEND
-    np.testing.assert_allclose(cmd.position[:2], ahead[:2], atol=1e-9)
 
 
 if __name__ == "__main__":

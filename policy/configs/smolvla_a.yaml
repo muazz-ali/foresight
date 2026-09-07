@@ -1,0 +1,12 @@
+# Model A — images + robot pose + text only (no future numbers).
+model: A
+repo_id: foresight/p1
+dataset_root: null  # set at CLI
+pretrained: lerobot/smolvla_base
+steps: 20000
+batch_size: 8
+lr: 1.0e-4
+delta_min: 0.0
+delta_max: 0.40
+pos_noise_std: 0.015
+vel_noise_std: 0.03

@@ -1,18 +1,17 @@
 # Sim — table scene + scripted expert
 
-Plain words: [`../WORDS.md`](../WORDS.md).
+How the expert works (plain words + code links): [`STATE_MACHINE.md`](STATE_MACHINE.md).
 
-## Status
-**Gate G0 (recheck 2026-08-02):** household object + container, short sweep → pass. See `data/g0/gate_g0_report.json`.
 
 ## Files
 | Path | What it does |
 |---|---|
 | `phase0_cfg.yaml` | Scene, cameras, expert timings, mesh folders |
 | `scene.py` | Franka + table + object + container + cameras |
-| `motion.py` | On-table sliding motion |
-| `state_machine.py` | Scripted pick stages (see [`WORDS.md`](../WORDS.md) for names) |
-| `state_machine_logs.py` | Plain-English log lines (banners, stage lines, results) |
+| `motion.py` | On-table sliding motion + bounce-aware forecast |
+| `state_machine.py` | Intercept-servo pick stages (0–9) |
+| `STATE_MACHINE.md` | Simple full walkthrough with links into the code |
+| `state_machine_logs.py` | Plain log lines (banners, stage lines, results) |
 | `success.py` | Did we succeed? + failure label |
 | `collect.py` | One episode loop; saves robot pose, images, future numbers |
 | `video.py` | Debug MP4 (static \| wrist + text) |

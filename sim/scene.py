@@ -494,7 +494,9 @@ class Phase0Scene:
         rim_z = float(self._container_pos[2] + self._container_half_height)
         sit_z = floor_z + float(self._object_half_height)
         gap = float(_require(self.cfg, "state_machine_params", "drop_z_gap"))
-        rim_clear = float(_require(self.cfg, "state_machine_params", "grasp_z_tol"))
+        # Prefer drop_rim_clear_m; fall back to grasp_z_tol until yaml adds the key.
+        sm = _require(self.cfg, "state_machine_params")
+        rim_clear = float(sm.get("drop_rim_clear_m", sm["grasp_z_tol"]))
         hover_clear = float(_require(self.cfg, "state_machine_params", "approach_z_tol"))
         drop_z = sit_z + gap
         if rim_z > sit_z:
@@ -632,8 +634,16 @@ class Phase0Scene:
         return oracle_from_gt(pos, vel, timestamp=self._sim_time, valid=True)
 
     def _refresh_object_vel_obs(self) -> None:
-        """Set ``_obj_vel_obs`` from pose FD after solver integration."""
+        """Set ``_obj_vel_obs`` from pose FD after solver integration.
+
+        While attached, force zeros so EE teleports do not spike logged velocity.
+        Still refresh ``_prev_obj_pos`` so release does not FD-spike either.
+        """
         pos = self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
+        if self._attached:
+            self._obj_vel_obs = np.zeros(3, dtype=np.float64)
+            self._prev_obj_pos = pos.copy()
+            return
         if self._prev_obj_pos is not None and self.dt > 0.0:
             self._obj_vel_obs = (pos - self._prev_obj_pos) / float(self.dt)
         else:

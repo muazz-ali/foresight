@@ -74,7 +74,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--delta",
         type=float,
         default=None,
-        help="look-ahead seconds for the future-XY pack; default is yaml lookahead_s",
+        help=(
+            "conditioning look-ahead (s) for the future-XY pack; "
+            "default is expert.conditioning_delta_s (else lookahead_s)"
+        ),
     )
     return parser
 
@@ -163,10 +166,17 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
                 delta=(
                     float(args.delta)
                     if args.delta is not None
-                    else float(expert.lookahead_s)
+                    else float(
+                        getattr(expert, "conditioning_delta_s", expert.lookahead_s)
+                    )
                 ),
             )
-            success = episode_success(episode)
+            success = episode_success(
+                episode,
+                z_lift_min=float(expert.lift_height),
+                container_xy_tol=float(expert.place_xy_tol),
+                place_stage=int(expert.stage_schema.done),
+            )
         except Exception as ex:
             logging.exception("Episode crashed (seed=%s): %s", seed, ex)
             err = str(ex)
@@ -176,13 +186,17 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
         if success:
             successes += 1
 
-        diag = episode_diagnostics(episode)
+        diag = episode_diagnostics(
+            episode, z_lift_min=float(expert.lift_height)
+        )
         failure = classify_failure(
             success=success,
             max_stage=diag["max_stage"],
             object_z_min=diag["z_min"],
             object_z_max=diag["z_max"],
             object_z_end=diag["z_end"],
+            z_lift_min=float(expert.lift_height),
+            schema=expert.stage_schema,
         )
         if err:
             failure = "safety-abort"
@@ -199,6 +213,10 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
             "z_max": diag["z_max"],
             "z_end": diag["z_end"],
             "z_min": diag["z_min"],
+            "grasp_err_xy": meta.get("grasp_err_xy"),
+            "grasp_err_z": meta.get("grasp_err_z"),
+            "grasp_speed_m_s": meta.get("grasp_speed_m_s"),
+            "retries": meta.get("retries"),
         }
 
         video_path = None
@@ -224,7 +242,18 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
                     "seed": np.asarray([int(seed)], dtype=np.int64),
                     "success": np.asarray([int(bool(success))], dtype=np.int8),
                     "delta": np.asarray(
-                        [float(meta.get("delta", expert.lookahead_s))],
+                        [
+                            float(
+                                meta.get(
+                                    "delta",
+                                    getattr(
+                                        expert,
+                                        "conditioning_delta_s",
+                                        expert.lookahead_s,
+                                    ),
+                                )
+                            )
+                        ],
                         dtype=np.float32,
                     ),
                 },
@@ -244,6 +273,7 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
             z_end=diag["z_end"],
             n_frames=record["n_frames"],
             video=video_path,
+            names=expert.stage_schema.names,
         )
 
         with open(metrics_path, "a") as fp:
@@ -392,7 +422,8 @@ def main() -> None:
 
     # Isaac / foresight imports only after AppLauncher.
     from sim.scene import Phase0Scene, load_cfg
-    from sim.state_machine import PickPlaceStateMachine
+
+    from sim.state_machine import PickPlaceStateMachine as ExpertClass
 
     cfg = load_cfg(args.sim_cfg_file)
     if getattr(args, "device", None):
@@ -405,9 +436,20 @@ def main() -> None:
         container_usd=args.container_usd,
         asset_seed=int(args.seed),
     )
-    expert = PickPlaceStateMachine(cfg, dt=scene.dt)
-    log_event(log, f"Step time {expert.dt:.3f} s. Look-ahead {expert.lookahead_s:.2f} s.")
-    log_how_to_read(log, lookahead_s=float(expert.lookahead_s))
+    expert = ExpertClass(cfg, dt=scene.dt)
+    log_event(log, f"Expert intercept-servo. Step time {expert.dt:.3f} s. Look-ahead {expert.lookahead_s:.2f} s.")
+    log_event(
+        log,
+        f"Servo lag {expert.servo_lag_s:.3f} s (tau {expert.tau:.3f} s), "
+        f"hand speed cap {expert.ee_speed_max:.2f} m/s, "
+        f"bounce guard {expert.bounce_guard_s:.2f} s.",
+    )
+    log_how_to_read(
+        log,
+        lookahead_s=float(expert.lookahead_s),
+        names=expert.stage_schema.names,
+        why=expert.stage_schema.why,
+    )
     log_blank(log)
     # Try block is responsible for running the expert and scene.
     try:

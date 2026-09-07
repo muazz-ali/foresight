@@ -9,10 +9,9 @@ from __future__ import annotations
 import numpy as np
 
 from sim.state_machine import (
-    STAGE_APPROACH,
     STAGE_DONE,
-    STAGE_HOLD_IN_BOX,
-    STAGE_LIFT,
+    STAGE_SCHEMA,
+    StageSchema,
 )
 
 FAILURE_LABELS = (
@@ -97,27 +96,33 @@ def classify_failure(
     object_z_end: float,
     table_z: float = 0.0,
     off_table_margin: float = 0.04,
+    z_lift_min: float = 0.12,
+    schema: StageSchema | None = None,
 ) -> str:
     """Why the expert run failed (or success).
 
     Order: success → never-engaged → too-late → grasp-slip → early-close →
     off-table (only if object fell below table) → timeout.
+    Pass ``z_lift_min=expert.lift_height`` when the expert is available.
+    ``schema`` maps stage ids to meaning; pass ``expert.stage_schema`` so the
+    Pass ``expert.stage_schema`` so numbering stays correct if stages change.
     """
+    sch = schema if schema is not None else STAGE_SCHEMA
     if success:
         return "success"
-    if max_stage <= STAGE_APPROACH:
+    if max_stage <= sch.engaged:
         return "never-engaged"
-    if max_stage < STAGE_LIFT:
+    if max_stage < sch.lift:
         return "too-late"
-    if max_stage < STAGE_HOLD_IN_BOX:
-        if object_z_max < 0.10:
+    if max_stage < sch.placed:
+        if object_z_max < float(z_lift_min):
             return "early-close"
         return "grasp-slip"
     if object_z_min < (table_z - off_table_margin):
         return "off-table"
-    if max_stage < STAGE_DONE:
+    if max_stage < sch.done:
         return "timeout"
-    if object_z_end < 0.10:
+    if object_z_end < float(z_lift_min):
         return "grasp-slip"
     return "timeout"
 
@@ -142,14 +147,22 @@ def classify_policy_failure(
     return "lifted-no-place"
 
 
-def episode_diagnostics(episode: dict | None) -> dict:
-    """Extract max_stage / z_max / z_end for logging."""
+def episode_diagnostics(
+    episode: dict | None,
+    *,
+    z_lift_min: float = 0.12,
+) -> dict:
+    """Extract max_stage / z_max / z_end for logging.
+
+    ``z_lift_min`` is echoed for gate logs; pass ``expert.lift_height`` when available.
+    """
     if episode is None:
         return {
             "max_stage": 0,
             "z_min": 0.0,
             "z_max": 0.0,
             "z_end": 0.0,
+            "z_lift_min": float(z_lift_min),
         }
     stages = _stages(episode)
     pos = np.asarray(episode.get("object_pos", [[0.0, 0.0, 0.0]]))
@@ -159,4 +172,5 @@ def episode_diagnostics(episode: dict | None) -> dict:
         "z_min": float(z.min()),
         "z_max": float(z.max()),
         "z_end": float(z[-1]),
+        "z_lift_min": float(z_lift_min),
     }

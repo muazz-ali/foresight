@@ -1,68 +1,12 @@
-"""Scripted on-table object motion + lead aiming.
+"""Scripted on-table object motion + bounce-aware forecast.
 
 Kinematic on-table motion keeps speed pinned for Gate G0.
-Velocity lead is clamped so PhysX contact jitter cannot corrupt grasp aim.
+``kinematic_forecast`` rolls the same bounce rules the scene uses.
 """
 
 from __future__ import annotations
 
 import numpy as np
-
-
-def clamp_lead_velocity(
-    velocity: np.ndarray,
-    *,
-    v_static: float,
-    lead_max: float,
-    lookahead_s: float,
-    near_contact: bool = False,
-) -> np.ndarray:
-    """Return lead offset ``clamp(v) * lookahead`` (meters).
-
-    Pass yaml ``state_machine_params`` (no hidden defaults).
-    - ``‖v‖ < v_static`` or ``near_contact`` → zero lead (static / contact gate).
-    - else clamp lead vector length to ``lead_max``.
-    """
-    v = np.asarray(velocity, dtype=np.float64).reshape(3)
-    speed = float(np.linalg.norm(v))
-    if near_contact or speed < float(v_static):
-        return np.zeros(3, dtype=np.float64)
-    lead = v * float(lookahead_s)
-    lead_norm = float(np.linalg.norm(lead))
-    if lead_norm > float(lead_max) and lead_norm > 1e-9:
-        lead = lead * (float(lead_max) / lead_norm)
-    return lead
-
-
-def aim_position(
-    position: np.ndarray,
-    velocity: np.ndarray,
-    *,
-    hover_z: float,
-    lookahead_s: float,
-    v_static: float,
-    lead_max: float,
-    near_contact: bool = False,
-    z_mode: str = "hover",
-) -> np.ndarray:
-    """World aim point for approach (hover) or descend (object height).
-
-    Pass yaml ``state_machine_params`` (no hidden defaults).
-    """
-    p = np.asarray(position, dtype=np.float64).reshape(3).copy()
-    lead = clamp_lead_velocity(
-        velocity,
-        v_static=v_static,
-        lead_max=lead_max,
-        lookahead_s=lookahead_s,
-        near_contact=near_contact,
-    )
-    aim = p + lead
-    if z_mode == "hover":
-        aim[2] = p[2] + float(hover_z)
-    else:
-        aim[2] = p[2]
-    return aim
 
 
 def kinematic_advance(

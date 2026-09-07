@@ -132,11 +132,12 @@ def run_episode(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run one scripted episode. Returns (episode_arrays, meta).
 
-    ``delta`` is the look-ahead used to pack future XY. Default is yaml
-    ``state_machine_params.lookahead_s`` (same number the expert aims at).
+    ``delta`` is the conditioning look-ahead for packing future XY — not the
+    expert's aiming ``lookahead_s``. Default is ``conditioning_delta_s`` when
+    present, else ``lookahead_s`` (getattr race-safe).
     """
     if delta is None:
-        delta = float(expert.lookahead_s)
+        delta = float(getattr(expert, "conditioning_delta_s", expert.lookahead_s))
     meta = scene.reset_episode(seed=seed, speed=speed)
     meta["language"] = default_language(meta.get("category"), meta.get("container_category"))
     expert.reset()
@@ -146,6 +147,7 @@ def run_episode(
         drop_pos=scene.get_drop_target(),
     )
 
+    done_stage = int(getattr(expert, "stage_done", STAGE_DONE))
     n_steps = inference_window_steps(scene.cfg, scene.dt)
     state0 = scene.get_object_state()
     ee0, _ = scene.get_ee_pose()
@@ -194,6 +196,9 @@ def run_episode(
 
         # Log post-step state (world after action).
         state2 = scene.get_object_state()
+        # Attached: zero vel for conditioning/logs (scene should already; belt+suspenders).
+        if cmd.attach_object:
+            state2.velocity = np.zeros(3, dtype=np.float64)
         ee_pos2, ee_quat2 = scene.get_ee_pose()
         cond = conditioning_vector(state2, delta=delta)
 
@@ -222,8 +227,8 @@ def run_episode(
             if "wrist_cam" in imgs:
                 log["wrist_cam_rgb"].append(imgs["wrist_cam"])
 
-        # Early stop once retract-after-place completed.
-        if cmd.stage >= STAGE_DONE and t > 20:
+        # Early stop once retract-after-place completed (done stage = 9).
+        if cmd.stage >= done_stage and t > 20:
             break
 
     episode = {k: np.asarray(v) for k, v in log.items() if len(v)}
@@ -236,4 +241,6 @@ def run_episode(
     assert episode["oracle_state"].shape == (t_len, 14), episode["oracle_state"].shape
     meta["n_frames"] = int(t_len)
     meta["delta"] = float(delta)
+    if hasattr(expert, "grasp_report"):
+        meta.update(expert.grasp_report())
     return episode, meta

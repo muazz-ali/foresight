@@ -20,15 +20,60 @@ env/
 # Local run artifacts
 *.log
 
-# Dataset / run blobs — keep logic only; regenerate locally
+# Images (episode frames, previews, plots)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tiff
+*.tif
+
+# Video / media
 *.mp4
+*.avi
+*.mkv
+*.mov
+*.webm
+
+# Dataset / run blobs — keep logic only; regenerate locally
 *.h5
 *.hdf5
 *.parquet
+*.arrow
+*.npzrecord
+*.npy
+*.npz
+*.pkl
+*.pickle
 *.json
 !.cursor/hooks.json
 
+# Model weights / checkpoints
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.bin
+*.pb
+*.gguf
+
+# Archives / USD assets (keep out of the repo)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.usd
+*.usda
+*.usdc
+*.usdz
+
+# Whole local data + training output trees
+data/
+runs/
+
 # Intermediate / debug dumps
-data/g0_*/
-data/g0_*.txt
-data/**/wrist_preview/
+tools/diag/out/
