@@ -42,6 +42,10 @@ scene:
   attach_z_offset_max: -0.005 # weld object at most this far below EE (m)
   # Object bounce box: in front of Franka, clear of base (~origin) and bowl (+Y).
   object_xy_bounds: [[0.48, 0.72], [-0.20, 0.10]]
+  # Bad home-reach / stage-8 stall meshes (diag: onion+bowl OK; these fail).
+  usd_exclude:
+  - plate02
+  - tray08
   # Reachable side pocket (~0.58 m from base); robot drops here without crowding play.
   container_xy: [0.50, 0.30]
   object_categories:

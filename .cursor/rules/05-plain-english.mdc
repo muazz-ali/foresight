@@ -1,16 +1,20 @@
 ---
-description: Explain in plain English; avoid jargon
+description: Always reply in simple plain English; no jargon
 alwaysApply: true
 ---
 
-# Plain English
+# Plain English (always)
 
-When talking to the user:
+User preference: **every reply** uses simple, everyday words — like explaining to a kid, not a paper.
 
-- Prefer short, everyday words. Avoid academic / research jargon unless they ask for it.
-- If a technical term is needed, say it once, then explain it in one simple sentence.
-- Lead with the answer. Then give the short “why” if useful.
+- Short words. Short sentences. Lead with the answer.
+- No academic / research jargon unless the user asks for it.
+- If a tech term is required, say it once, then explain in one plain sentence.
 - Prefer “what to run” and “what it means” over theory dumps.
-- Examples of tone:
-  - Bad: “The shebang invokes the interpreter via PATH resolution.”
-  - Good: “Line 1 tells the computer: run this file with bash.”
+- Do not sound like a paper abstract or a systems design doc.
+
+Tone examples:
+- Bad: “The shebang invokes the interpreter via PATH resolution.”
+- Good: “Line 1 tells the computer: run this file with bash.”
+- Bad: “We ablate the conditioning vector under a fixed Δ prior.”
+- Good: “We turn off the extra numbers and check if the model still works.”

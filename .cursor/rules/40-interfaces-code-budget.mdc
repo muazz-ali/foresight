@@ -6,19 +6,31 @@ alwaysApply: false
 
 # Interfaces & code budgets
 
-## Conditioning vector (Phase-1 live pack = **5** numbers)
+## Conditioning vector (live pack = **4** numbers, Phases 1–2)
 Logged / trained layout (`CONDITIONING_LAYOUT`):
 | Field | Dim | Meaning |
 |---|---|---|
 | `p_hat_x/y(t+Δ)` | 2 | Predicted object XY at action-landing time |
-| `v_hat_x/y` | 2 | Object XY velocity (post-step FD in sim) |
-| `delta` | 1 | Lookahead actually used (must be packed — G1 hole if omitted) |
+| `v_hat_x/y` | 2 | Object XY velocity |
 
-Dropped as CONSTANT in oracle demos until G2: `p_hat_z`, `v_hat_z`, `sigma_*`, `valid`, `coast_time`.
+**Δ is fixed** from `sim/phase0_cfg.yaml` → `state_machine_params.conditioning_delta_s`
+(collect / train / eval must agree). It is **not** packed while it is constant.
+Train noise comes from `policy/configs/smolvla_b.yaml`. Pack Δ as a 5th number
+only when deploy latency genuinely varies (Phase 3 latency sweep / Phase 4 real arm).
 
-Train still samples Δ ∈ [0, 0.4] s from oracle state, but the net **sees** which Δ built p̂. Eval sets Δ = measured latency (0.25 s until measured). Full plan schema (~12) may return when filter uncertainty / coast are live. Oracle and filter **must** emit the same pack. Swapping them is a config flag, not a rewrite.
+With fixed Δ, clean `[p̂, v̂]` is an invertible transform of `[p, v]` — phrase
+G1 as “explicit object state helps,” and use a Δ=0 ablation if you need to
+isolate *future* vs *current*.
 
-Do not ship a 4-number pack and call G1 a hypothesis test.
+**G2 does not change the pack.** The G2 swap feeds filter-made `[p̂, v̂]` to the
+**unchanged** G1 Model B (12-D state). Oracle and filter must emit the same pack,
+built by the same `interfaces.state.conditioning_vector` (plain constant-velocity
+predict — no bounce-aware forecast, B never trained on one).
+
+Still dropped: `p_hat_z`, `v_hat_z`, `sigma_*`, `valid`, `coast_time`. The filter
+already fills `covariance` / `valid` in `ObjectState`; packing them needs a retrain,
+so do it only **after** the G2 swap result, and only if the swap drop is ≥10 points
+and retraining B on filter-made vectors did not fix it (`foresight_plan.md` §11).
 
 ## Budgets (glue, not frameworks)
 | Module | Budget |

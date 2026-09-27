@@ -17,9 +17,10 @@ Detector → tracker → Kalman → 3D lift. Same interface as oracle. Gate G2.
 Budget: ~430 lines total across detector/tracker/lift/filter.
 
 ## policy
-SmolVLA/LeRobot: Model A vs B; Δ randomization + filter noise. Gate G1.
-Do not rewrite the backbone — append the conditioning vector (**5 numbers, including Δ**).
-Do not add a latent world model. G1 scout holes: unpacked Δ, unglue-on-open, `{0,4}` labels, n=20.
+SmolVLA/LeRobot: Model A vs B; fixed Δ from yaml + filter noise. Gate G1.
+Do not rewrite the backbone — append the **4-number** pack (XY p̂, XY v̂).
+Δ stays in yaml (`conditioning_delta_s`), not in the vector, while it is constant.
+Do not add a latent world model. G1 scout holes: unglue-on-open, `{0,4}` labels, n=20.
 
 ## control
 Timestamped action buffer, reflex PD, coast/safety. Gate G3.

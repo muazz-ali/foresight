@@ -31,11 +31,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-attempts", type=int, default=None, help="Safety cap (default 3x target)")
     p.add_argument(
         "--speed-mode",
-        choices=["stratified", "continuous", "fixed"],
+        choices=["stratified", "continuous", "fixed", "list"],
         default="stratified",
-        help="stratified: equal mass in 0/10/15/20 cm/s bins; continuous: U[0,0.2]; fixed: --speed",
+        help="stratified: G1 bins; continuous: U[0,speed-max]; fixed: --speed; list: --speed-list",
     )
     p.add_argument("--speed", type=float, default=MID_M_S, help="Used when --speed-mode fixed")
+    p.add_argument(
+        "--speed-list",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Exact speeds (m/s) for successive successes; implies --speed-mode list",
+    )
     p.add_argument("--speed-max", type=float, default=HIGH_M_S)
     p.add_argument("-c", "--sim_cfg_file", default=str(DEFAULT_CFG))
     p.add_argument("-o", "--output_dir", default=str(DEFAULT_OUT))
@@ -80,8 +87,20 @@ def _setup_logging(output_dir: Path, *, debug: bool = False) -> None:
     logging.info("Logging to %s", log_path)
 
 
-def _sample_speed(mode: str, rng: np.random.Generator, *, fixed: float, speed_max: float) -> float:
-    """Draw object speed: fixed, uniform, or G1 bins with small jitter."""
+def _sample_speed(
+    mode: str,
+    rng: np.random.Generator,
+    *,
+    fixed: float,
+    speed_max: float,
+    speed_list: list[float] | None = None,
+    success_idx: int = 0,
+) -> float:
+    """Draw object speed: fixed, uniform, G1 bins, or exact list entry."""
+    if mode == "list":
+        if not speed_list:
+            raise ValueError("speed-mode list requires --speed-list")
+        return float(speed_list[int(success_idx) % len(speed_list)])
     if mode == "fixed":
         return float(fixed)
     if mode == "continuous":
@@ -104,7 +123,14 @@ def run_collection(args, scene, expert) -> dict:
     out_root.mkdir(parents=True, exist_ok=True)
     metrics_path = out_root / "metrics.jsonl"
 
+    speed_mode = str(args.speed_mode)
+    speed_list = list(args.speed_list) if args.speed_list else None
+    if speed_list is not None:
+        speed_mode = "list"
+
     target = int(args.target_successes)
+    if speed_mode == "list" and speed_list is not None:
+        target = max(target, len(speed_list))
     max_attempts = int(args.max_attempts or max(3 * target, target + 50))
     rng = np.random.default_rng(int(args.seed))
     seed = int(args.seed)
@@ -116,7 +142,12 @@ def run_collection(args, scene, expert) -> dict:
 
     while successes < target and attempts < max_attempts:
         speed = _sample_speed(
-            args.speed_mode, rng, fixed=float(args.speed), speed_max=float(args.speed_max)
+            speed_mode,
+            rng,
+            fixed=float(args.speed),
+            speed_max=float(args.speed_max),
+            speed_list=speed_list,
+            success_idx=successes,
         )
         logging.info(
             "P1 collect attempt=%d success=%d/%d seed=%d speed=%.3f",
@@ -252,7 +283,8 @@ def run_collection(args, scene, expert) -> dict:
         "elapsed_s": elapsed,
         "episodes_per_hour": attempts / elapsed * 3600 if elapsed > 0 else 0.0,
         "output_dir": str(out_root),
-        "speed_mode": args.speed_mode,
+        "speed_mode": speed_mode,
+        "speed_list": speed_list,
         "seed_start": int(args.seed),
         "seed_end": seed - 1,
     }

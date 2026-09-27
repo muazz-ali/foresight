@@ -63,17 +63,27 @@ def _euler_deg_to_wxyz(rotation_deg: list[float]) -> list[float]:
     return [float(q[3]), float(q[0]), float(q[1]), float(q[2])] # wxyz
 
 
-def list_category_usds(object_dir: Path, categories: list[str]) -> list[Path]:
+def list_category_usds(
+    object_dir: Path,
+    categories: list[str],
+    *,
+    exclude: set[str] | None = None,
+) -> list[Path]:
     """List ``*.usd`` under ``paths.object_dir`` / each category name."""
+    ban = {s.lower().removesuffix(".usd") for s in (exclude or set())}
     usds: list[Path] = []
     for cat in categories:
         cat_dir = object_dir / cat
         if not cat_dir.is_dir():
             continue
-        usds.extend(sorted(cat_dir.glob("*.usd")))
+        for p in sorted(cat_dir.glob("*.usd")):
+            if p.stem.lower() in ban:
+                continue
+            usds.append(p)
     if not usds:
         raise FileNotFoundError(
-            f"No USD objects under {object_dir} for categories={categories}"
+            f"No USD objects under {object_dir} for categories={categories} "
+            f"(exclude={sorted(ban)})"
         )
     return usds
 
@@ -135,10 +145,13 @@ def pick_usd(
     if object_dir is not None:
         cat_dir = object_dir / raw
         if cat_dir.is_dir():
-            cat_usds = sorted(cat_dir.glob("*.usd"))
-            if not cat_usds:
+            # Prefer catalog (already exclude-filtered) when it covers this category.
+            pool = [p for p in catalog if p.parent.resolve() == cat_dir.resolve()]
+            if not pool:
+                pool = sorted(cat_dir.glob("*.usd"))
+            if not pool:
                 raise FileNotFoundError(f"No .usd files in category dir: {cat_dir}")
-            return cat_usds[int(rng.integers(0, len(cat_usds)))]
+            return pool[int(rng.integers(0, len(pool)))]
 
     stem = path.stem if raw.endswith(".usd") else raw
     matches = [p for p in catalog if p.stem == stem or p.name == raw]
@@ -219,13 +232,21 @@ class Phase0Scene:
         self._attach_z_offset_max = float(_require(cfg, "scene", "attach_z_offset_max"))
 
         asset_rng = np.random.default_rng(self._asset_seed)
+        self._usd_exclude = {
+            str(x).lower().removesuffix(".usd")
+            for x in (cfg.get("scene", {}).get("usd_exclude") or [])
+        }
         self._object_usds: list[Path] = []
         self._active_usd: Path | None = None
         self._object_size: np.ndarray | None = None
         self._object_half_height = self._object_radius
 
         if not self._use_primitive:
-            self._object_usds = list_category_usds(self._object_dir, self._categories)
+            if self._usd_exclude:
+                logger.info("USD exclude stems: %s", sorted(self._usd_exclude))
+            self._object_usds = list_category_usds(
+                self._object_dir, self._categories, exclude=self._usd_exclude
+            )
             self._active_usd = pick_usd(
                 self._object_usds,
                 asset_rng,
@@ -268,7 +289,11 @@ class Phase0Scene:
         )
 
         if (not self._use_primitive) and self._n_containers >= 1 and self._container_categories:
-            ctr_usds = list_category_usds(self._object_dir, self._container_categories)
+            ctr_usds = list_category_usds(
+                self._object_dir,
+                self._container_categories,
+                exclude=getattr(self, "_usd_exclude", set()),
+            )
             self._container_usd = pick_usd(
                 ctr_usds,
                 asset_rng,
@@ -347,9 +372,13 @@ class Phase0Scene:
         self._sim_time = 0.0
         self._gripper_open = float(_require(cfg, "robot", "gripper_open"))
         self._gripper_close = float(_require(cfg, "robot", "gripper_close"))
+        # Last commanded open∈[0,1]. Attach grasp snaps fingers to this (no squeeze).
+        self._last_gripper_open = 1.0
         self._meta: dict[str, Any] = {}
         self._attached = False
         self._attach_offset = np.zeros(3, dtype=np.float64)
+        self._freeze_pose: tuple[np.ndarray, np.ndarray] | None = None
+        self._was_frozen = False
 
     def _spawn_cameras(self) -> None:
         """Spawn static cams from ``scene.cameras`` plus wrist from ``camera.wrist_*``."""
@@ -586,7 +615,10 @@ class Phase0Scene:
         self._obj_kinematic = True
         self._attached = False
         self._attach_offset = np.zeros(3, dtype=np.float64)
+        self._freeze_pose: tuple[np.ndarray, np.ndarray] | None = None
+        self._was_frozen = False
         self._sim_time = 0.0
+        self._last_gripper_open = 1.0
         self.ik.reset()
 
         tag = "sphere" if self._use_primitive else (
@@ -627,10 +659,14 @@ class Phase0Scene:
         )
 
     def get_object_state(self) -> ObjectState:
-        pos = self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
-        # Post-step pose FD. With kinematic_enabled, this should match the
-        # scripted motion command (constant velocity + wall bounce).
-        vel = self._obj_vel_obs.copy()
+        if self._was_frozen and self._freeze_pose is not None and not self._attached:
+            pos = self._freeze_pose[0].copy()
+            vel = np.zeros(3, dtype=np.float64)
+        else:
+            pos = self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
+            # Post-step pose FD. With kinematic_enabled, this should match the
+            # scripted motion command (constant velocity + wall bounce).
+            vel = self._obj_vel_obs.copy()
         return oracle_from_gt(pos, vel, timestamp=self._sim_time, valid=True)
 
     def _refresh_object_vel_obs(self) -> None:
@@ -639,6 +675,10 @@ class Phase0Scene:
         While attached, force zeros so EE teleports do not spike logged velocity.
         Still refresh ``_prev_obj_pos`` so release does not FD-spike either.
         """
+        if self._was_frozen and self._freeze_pose is not None and not self._attached:
+            self._obj_vel_obs = np.zeros(3, dtype=np.float64)
+            self._prev_obj_pos = self._freeze_pose[0].copy()
+            return
         pos = self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
         if self._attached:
             self._obj_vel_obs = np.zeros(3, dtype=np.float64)
@@ -670,6 +710,33 @@ class Phase0Scene:
 
     def get_proprio(self) -> np.ndarray:
         return self.robot.data.joint_pos[0].detach().cpu().numpy().astype(np.float64)
+
+    def get_gripper_open(self) -> float:
+        """Commanded gripper open∈[0,1] (matches collect ``gripper`` / LeRobot state[7])."""
+        return float(self._last_gripper_open)
+
+    def _finger_width(self, gripper_open: float) -> float:
+        g = float(np.clip(gripper_open, 0.0, 1.0))
+        return self._gripper_close + g * (self._gripper_open - self._gripper_close)
+
+    def _snap_fingers(self, gripper_open: float) -> None:
+        """Teleport finger joints to the command.
+
+        Grasp is attach/weld, not contact squeeze — PD alone stalls ~0.03 m open
+        against the object, so eval's finger-width read never saw ``closed``.
+        """
+        finger = self._finger_width(gripper_open)
+        n = len(self._finger_idx)
+        pos = torch.full(
+            (1, n), finger, device=self.robot.device, dtype=torch.float32
+        )
+        vel = torch.zeros((1, n), device=self.robot.device, dtype=torch.float32)
+        self.robot.write_joint_position_to_sim(pos, joint_ids=self._finger_idx)
+        self.robot.write_joint_velocity_to_sim(vel, joint_ids=self._finger_idx)
+        target = self.robot.data.joint_pos_target.clone()
+        for fi in self._finger_idx:
+            target[0, fi] = finger
+        self.robot.set_joint_position_target(target)
 
     def get_images(self) -> dict[str, np.ndarray]:
         out: dict[str, np.ndarray] = {}
@@ -716,7 +783,16 @@ class Phase0Scene:
             self._attach_offset = np.array([0.0, 0.0, z_off], dtype=np.float64)
             self._attached = True
             self._obj_kinematic = False
+            self._freeze_pose = None
+            self._was_frozen = False
+            # Held ⇒ fingers closed (command + measured), so eval latch/obs agree.
+            self._last_gripper_open = 0.0
+            self._snap_fingers(0.0)
         elif not attach and self._attached:
+            # Snapshot weld pose before clearing — place freeze must pin this.
+            ee_pos, ee_quat = self.get_ee_pose()
+            pin = (ee_pos + self._attach_offset).astype(np.float64)
+            self._freeze_pose = (pin.copy(), np.asarray(ee_quat, dtype=np.float64).copy())
             self._attached = False
             self._attach_offset = np.zeros(3, dtype=np.float64)
 
@@ -753,10 +829,12 @@ class Phase0Scene:
         target = self.robot.data.joint_pos.clone()
         target[:, self._arm_idx] = new_joint_pos
         g = float(np.clip(gripper_open, 0.0, 1.0))
-        finger = self._gripper_close + g * (self._gripper_open - self._gripper_close)
+        finger = self._finger_width(g)
         for fi in self._finger_idx:
             target[0, fi] = finger
         self.robot.set_joint_position_target(target)
+        self._last_gripper_open = g
+        self._snap_fingers(g)
 
     def step(
         self,
@@ -765,23 +843,39 @@ class Phase0Scene:
         attach_object: bool = False,
         freeze_object: bool = False,
     ) -> None:
+        # Releasing+freezing same frame: snapshot weld pose before clearing attach.
+        if (not attach_object) and self._attached and freeze_object:
+            ee_pos, ee_quat = self.get_ee_pose()
+            pin = (ee_pos + self._attach_offset).astype(np.float64)
+            self._freeze_pose = (pin.copy(), np.asarray(ee_quat, dtype=np.float64).copy())
         self.set_attach(bool(attach_object))
         if freeze_object:
-            # Pin + zero vel even while attached (close must not slide).
             self._obj_velocity[:] = 0.0
-            pos = self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
-            quat = self.object.data.root_quat_w[0].detach().cpu().numpy().astype(np.float64)
+            if self._freeze_pose is None:
+                pos = self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
+                quat = self.object.data.root_quat_w[0].detach().cpu().numpy().astype(np.float64)
+                self._freeze_pose = (pos.copy(), quat.copy())
+            pos, quat = self._freeze_pose
             self._write_object_pose(pos, quat, self._obj_velocity)
             self._obj_kinematic = True
+            self._was_frozen = True
         elif self._attached:
+            self._freeze_pose = None
+            self._was_frozen = False
             self._write_attached_object()
         else:
-            # Resume commanded motion velocity after a freeze window.
-            self._obj_velocity = self._obj_speed_cmd.copy()
-            self._obj_kinematic = bool(kinematic_object)
-            if self._obj_kinematic:
-                self._write_kinematic_object()
-                self._obj_speed_cmd = self._obj_velocity.copy()
+            # After place, keep pinning — never resume table-slide / bounce bounds.
+            if self._was_frozen and self._freeze_pose is not None:
+                self._obj_velocity[:] = 0.0
+                pos, quat = self._freeze_pose
+                self._write_object_pose(pos, quat, self._obj_velocity)
+                self._obj_kinematic = True
+            else:
+                self._obj_velocity = self._obj_speed_cmd.copy()
+                self._obj_kinematic = bool(kinematic_object)
+                if self._obj_kinematic:
+                    self._write_kinematic_object()
+                    self._obj_speed_cmd = self._obj_velocity.copy()
         self.robot.write_data_to_sim()
         self.object.write_data_to_sim()
         if self.container is not None:
@@ -798,6 +892,18 @@ class Phase0Scene:
         self.object.update(self.dt)
         if self.container is not None:
             self.container.update(self.dt)
+        # Attach grasp: fingers are scripted. Re-snap after PhysX so object contact
+        # cannot leave them jammed ~0.03 m open (breaks eval closed threshold).
+        if self._attached:
+            self._last_gripper_open = 0.0
+        self._snap_fingers(self._last_gripper_open)
+        # Re-assert freeze after PhysX so contacts cannot kick the placed object.
+        if (freeze_object or self._was_frozen) and self._freeze_pose is not None and not self._attached:
+            pos, quat = self._freeze_pose
+            self._obj_velocity[:] = 0.0
+            self._write_object_pose(pos, quat, self._obj_velocity)
+            self.object.write_data_to_sim()
+            self.object.update(self.dt)  # buffers must match pin (else 1-frame flicker)
         for cam in self.cameras.values():
             cam.update(self.dt)
         self._refresh_object_vel_obs()

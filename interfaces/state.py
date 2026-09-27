@@ -91,8 +91,9 @@ def oracle_from_gt(
     return ObjectState(position, velocity, diag, timestamp, valid)
 
 
-# Phase-1 live layout only. Dropped as CONSTANT / dead in oracle demos:
-# p_hat_z, v_hat_z, delta (rebuilt at train via random Δ), sigma_*, valid, coast_time.
+# Phase-1 live pack = 4 numbers. Δ is fixed from yaml (conditioning_delta_s) at
+# collect / train / eval — not packed. Dropped until G2: p_hat_z, v_hat_z,
+# sigma_*, valid, coast_time. Pack Δ (5th) only when deploy latency genuinely varies.
 CONDITIONING_DIM = 4
 CONDITIONING_LAYOUT = ("p_hat_x", "p_hat_y", "v_hat_x", "v_hat_y")
 
@@ -103,10 +104,10 @@ def conditioning_vector(
     *,
     workspace_scale: float = 1.0,
 ) -> np.ndarray:
-    """4 live numbers for the policy: future XY place + XY speed.
+    """4 live numbers: future XY place + XY speed (workspace-scaled).
 
-    Layout: [p_hat_x, p_hat_y, v_hat_x, v_hat_y] (workspace-scaled).
-    ``delta`` still drives the CV predict; it is not packed (train samples Δ).
+    ``delta`` drives the CV predict (``p̂ = p + v·Δ``); it is not in the vector.
+    Keep train/eval Δ equal via ``state_machine_params.conditioning_delta_s``.
     """
     future = state.predict(delta)
     return pack_conditioning(future, delta, valid=state.valid, workspace_scale=workspace_scale)

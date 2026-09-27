@@ -1,7 +1,8 @@
-"""Training helpers: random look-ahead time + noise; pack Model A vs B inputs.
+"""Training helpers: fixed look-ahead + sensor noise; pack Model A vs B inputs.
 
 “Conditioning” = the 4 live future numbers (XY p̂, XY v̂).
-“Oracle state” = perfect sim pose saved each frame (still 14-D; Δ rebuild uses it).
+“Oracle state” = perfect sim pose saved each frame (14-D; Δ rebuild uses it).
+Δ defaults come from yaml (``conditioning_delta_s`` / ``smolvla_b.yaml``).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from interfaces.config import policy_aug_defaults
 from interfaces.state import ObjectState, conditioning_vector
 from policy.features import CONDITIONING_DIM, PROPRIO_DIM, STATE_DIM_B
 
@@ -24,13 +26,29 @@ class _SizedMapDataset(Protocol):
     def __getitem__(self, index: int) -> Any: ...
 
 
+try:
+    _AUG_YAML = policy_aug_defaults()
+except OSError:
+    _AUG_YAML = {
+        "delta_min": 0.25,
+        "delta_max": 0.25,
+        "pos_noise_std": 0.015,
+        "vel_noise_std": 0.03,
+    }
+
+
 @dataclass
 class AugConfig:
-    """Δ randomization + noise for Model B."""
-    delta_min: float = 0.0
-    delta_max: float = 0.40
-    pos_noise_std: float = 0.015  # ~1.5 cm
-    vel_noise_std: float = 0.03  # ~3 cm/s
+    """Fixed Δ + sensor noise for Model B (values from ``smolvla_b.yaml``).
+
+    Keep ``delta_min == delta_max`` while Δ is not packed — a spread only smears p̂. 
+    Widen / pack Δ as a 5th number when deploy latency varies.
+    """
+
+    delta_min: float = _AUG_YAML["delta_min"]
+    delta_max: float = _AUG_YAML["delta_max"]
+    pos_noise_std: float = _AUG_YAML["pos_noise_std"]
+    vel_noise_std: float = _AUG_YAML["vel_noise_std"]
     seed: int = 0
     zero_conditioning: bool = False  # eval sanity for B
 
@@ -54,7 +72,7 @@ def augment_conditioning(
     rng: np.random.Generator,
     cfg: AugConfig,
 ) -> np.ndarray:
-    """Rebuild 4-D live conditioning with random Δ and Gaussian noise on XY p̂/v̂."""
+    """Rebuild 4-D live conditioning at cfg Δ with Gaussian noise on XY p̂/v̂."""
     if cfg.zero_conditioning:
         return np.zeros(CONDITIONING_DIM, dtype=np.float64)
 
@@ -84,7 +102,6 @@ class PolicyDataset(Dataset):
         self.model = model
         self.aug = aug or AugConfig()
         self.apply_aug = bool(apply_aug)
-        self._rng = np.random.default_rng(self.aug.seed)
 
     def __len__(self) -> int:
         return len(self.base)
@@ -96,7 +113,12 @@ class PolicyDataset(Dataset):
             state = state.detach().cpu().float()
         else:
             state = torch.as_tensor(state, dtype=torch.float32)
-        rng = np.random.default_rng(self.aug.seed + int(idx) * 1009)
+        # torch.initial_seed() differs per DataLoader worker and is redrawn each
+        # epoch, so noise is fresh on every visit yet reproducible from --seed.
+        # With num_workers=0 nothing varies it and the draw stays frozen.
+        rng = np.random.default_rng(
+            [self.aug.seed, int(idx), int(torch.initial_seed()) & 0xFFFFFFFF]
+        )
 
         # LeRobot delta_timestamps may yield state as (T, D) — use last frame for proprio/cond.
         if state.ndim == 2:

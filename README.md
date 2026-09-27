@@ -4,7 +4,7 @@ Teach a small robot policy to catch **moving** objects by telling it **where the
 
 **Idea in one line:** predict the object’s future place with a simple physics tracker → give those numbers to a small policy → close the gripper at the right time.
 
-Full write-up: [`foresight_plan.md`](foresight_plan.md) · How we work: [`AGENTS.md`](AGENTS.md) · Isaac Sim tips: [`ppt.md`](ppt.md) · Word list: [`WORDS.md`](WORDS.md)
+Full write-up: [`foresight_plan.md`](foresight_plan.md) · How we work: [`AGENTS.md`](AGENTS.md) · Isaac Sim tips: `~/Desktop/muazzam/ppt.md` (outside this repo)
 
 ---
 
@@ -12,11 +12,14 @@ Full write-up: [`foresight_plan.md`](foresight_plan.md) · How we work: [`AGENTS
 
 | Checkpoint | What “pass” means | Status |
 |---|---|---|
-| **G0** | Scripted expert works ≥70% from still → 20 cm/s (bins 0 / 10 / 15 / 20); we can record hundreds of demos per hour | **PASS** on the older 0–40 sweep — see `data/g0/gate_g0_report.json` |
-| G1 | Policy **with** future numbers (B) beats policy **without** (A) at 15 cm/s; B stays flat 0 → 20 cm/s | not started (recollect/eval on the slower sweep) |
-| G2 | Camera-based prediction error small; swap sim-truth → camera track without big drop | not started |
+| **G0** | Scripted expert works ≥70% from still → 20 cm/s (bins 0 / 10 / 15 / 20); we can record hundreds of demos per hour | **PASS** on the older 0–40 cm/s sweep (report file not in this checkout) |
+| **G1** | Policy **with** future numbers (B) beats policy **without** (A) at 15 cm/s; B stays flat 0 → 20 cm/s; B with numbers zeroed collapses | **PASS** (Sep 13 2026). B 84 / 70 / 71% at 0 / 15 / 20 cm/s; A 9% still, 0% moving; B-zero 2%. n = 100 per B bin. Details: plan §7 |
+| G2a | Camera + filter numbers close to sim truth: at 20 cm/s, median ≤ 1 cm and RMSE ≤ 2 cm vs the sim-truth p̂ | **PASS** (Sep 18 2026, offline). 0.34 / 1.14 cm on demos, 0.31 / 1.26 cm on B's eval runs. Report: `data/eval/p2_perception_report/REPORT.md` |
+| G2b | Swap sim truth → camera numbers in B, same seeds: success drops < 10 points at 15 and 20 cm/s | next |
 | G3 | Fast grasp helper fixes many “too late / early close” fails | not started |
 | G4 | Real arm works well at 10–20 cm/s | not started |
+
+“Success” before Phase 3 = the policy's grasp holds under the eval latch, then a script places the object (`--force-place`).
 
 Lesson from G0: do **not** wrap DynamicVLA’s pick state machine. Our expert and scene live in this repo under `sim/`.
 
@@ -26,8 +29,8 @@ Lesson from G0: do **not** wrap DynamicVLA’s pick state machine. Our expert an
 
 | Job | What it does | Where |
 |---|---|---|
-| Where / when | Track object + predict a bit ahead | `perception/` (later) |
-| What / how | Small policy + ~12 future numbers | `policy/` |
+| Where / when | Track object + predict a bit ahead | `perception/` |
+| What / how | Small policy + 4 future numbers today (~12 later) | `policy/` |
 | Exactly when | Fast last-cm grasp close | `control/` (later) |
 | Clock | Time-stamped action queue | `control/` (later) |
 
@@ -37,7 +40,7 @@ Lesson from G0: do **not** wrap DynamicVLA’s pick state machine. Our expert an
 position, velocity, covariance, timestamp, valid
 ```
 
-The policy’s ~12 future numbers are built from that message (`interfaces/state.py`).
+The policy’s future numbers are built from that message (`interfaces/state.py`). Today that is **4 numbers**: where the object will be in 0.25 s (x, y) and its speed (x, y). Δ = 0.25 s is fixed in `sim/phase0_cfg.yaml`.
 
 ---
 
@@ -46,12 +49,16 @@ The policy’s ~12 future numbers are built from that message (`interfaces/state
 ```text
 interfaces/   shared object state + future-number helper
 sim/          Isaac table scene, scripted expert, recording
+perception/   static camera → blob tracker → Kalman filter → object state (Phase 2)
 policy/       turn demos into LeRobot data; train Model A vs B
-scripts/      run collection, convert, train, eval
+scripts/      run collection, convert, train, eval, G2 perception report
 eval/         checkpoint score helpers (G0 / G1)
-data/g0/      Gate G0 scores
-data/p1/      Phase 1 demos (~2K successes)
-WORDS.md      plain-language glossary
+tests/        Isaac-free tests (expert, perception)
+data/         local only (git-ignored):
+  p1-retrain/        Phase 1 demos (3,718 episodes, with camera frames)
+  lerobot/p1-retrain LeRobot copy used for training
+  eval/              eval runs + reports (p1_r4k_report, p2_perception_report)
+runs/         local only: trained checkpoints (p1_r4k_a / p1_r4k_b = G1 models)
 ```
 
 ---
@@ -90,6 +97,8 @@ No Isaac needed for:
 
 ```bash
 python scripts/test_state.py
+pytest tests/test_perception.py              # perception unit tests
+python scripts/g2_perception_report.py       # G2a report from recorded episodes (~25 s)
 ```
 
 ---
@@ -113,11 +122,18 @@ Failure labels each episode:
 
 ---
 
-## Phase 1 (next)
+## Phase 1 — done (G1 pass)
 
-We already recorded **2000** successful demos in `data/p1/` and converted them to `data/lerobot/p1/`.
+Models A and B were trained on 3,718 recorded demos (`runs/p1_r4k_a|b`, commands in [`policy/README.md`](policy/README.md)). B (with the 4 numbers) beats A by 70 points at 15 cm/s and drops 13 points from still to 20 cm/s. Zeroing B's numbers drops it to 2%, so B really uses them. So far this shows “knowing where the object *is* helps”. Splitting that from “knowing where it *will be*” needs a model trained with Δ = 0 (plan §11).
 
-**Next:** train Model A (no future numbers) and Model B (with future numbers), then run the speed test. Commands: [`policy/README.md`](policy/README.md).
+---
+
+## Phase 2 — now
+
+Replace sim truth with what the static camera sees: blob tracker → pixel-to-table → Kalman filter → the same 4 numbers. B is **not** retrained.
+
+- **Done — G2a (offline):** `perception/` + `python scripts/g2_perception_report.py`. At 20 cm/s the camera numbers sit 0.3 cm (median) from sim truth, and every fruit is tracked, including the white egg.
+- **Next — G2b (Isaac):** add `--cond-source oracle|filter` to `scripts/eval_policy.py`, then rerun B on the G1 seeds and count how many runs flip from success to fail. Steps: plan §11.
 
 ---
 

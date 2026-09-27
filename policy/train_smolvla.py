@@ -2,7 +2,7 @@
 """Train SmolVLA Model A or B on a Foresight LeRobot dataset.
 
 Model A = images + robot pose + text.
-Model B = A + 4 live future numbers (XY p̂/v̂; random look-ahead + noise).
+Model B = A + 4 live future numbers (XY p̂/v̂; fixed Δ from yaml + noise).
 
 Conda: dynamicVLA_training
 """
@@ -202,10 +202,16 @@ def main() -> None:
     p.add_argument("--save-freq", type=int, default=1000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default=None)
-    p.add_argument("--delta-min", type=float, default=0.0)
-    p.add_argument("--delta-max", type=float, default=0.40)
-    p.add_argument("--pos-noise-std", type=float, default=0.015)
-    p.add_argument("--vel-noise-std", type=float, default=0.03)
+    p.add_argument(
+        "--policy-cfg",
+        type=str,
+        default=str(FORESIGHT_ROOT / "policy" / "configs" / "smolvla_b.yaml"),
+        help="YAML for Δ / noise defaults (CLI flags override when set)",
+    )
+    p.add_argument("--delta-min", type=float, default=None)
+    p.add_argument("--delta-max", type=float, default=None)
+    p.add_argument("--pos-noise-std", type=float, default=None)
+    p.add_argument("--vel-noise-std", type=float, default=None)
     p.add_argument(
         "--chunk-size",
         type=int,
@@ -213,6 +219,29 @@ def main() -> None:
         help="SmolVLA action chunk length (must match delta_timestamps)",
     )
     args = p.parse_args()
+    from interfaces.config import policy_aug_defaults
+
+    aug = policy_aug_defaults(args.policy_cfg)
+    if args.delta_min is None:
+        args.delta_min = aug["delta_min"]
+    if args.delta_max is None:
+        args.delta_max = aug["delta_max"]
+    if args.pos_noise_std is None:
+        args.pos_noise_std = aug["pos_noise_std"]
+    if args.vel_noise_std is None:
+        args.vel_noise_std = aug["vel_noise_std"]
+    if abs(float(args.delta_min) - float(args.delta_max)) > 1e-12:
+        raise SystemExit(
+            "delta_min must equal delta_max while Δ is not packed "
+            f"(got {args.delta_min} / {args.delta_max})"
+        )
+    logger.info(
+        "aug from %s: delta=%.3f pos_noise=%.4f vel_noise=%.4f",
+        args.policy_cfg,
+        args.delta_min,
+        args.pos_noise_std,
+        args.vel_noise_std,
+    )
     torch.manual_seed(args.seed)
     train(args)
 
