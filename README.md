@@ -15,7 +15,7 @@ Full write-up: [`foresight_plan.md`](foresight_plan.md) · How we work: [`AGENTS
 | **G0** | Scripted expert works ≥70% from still → 20 cm/s (bins 0 / 10 / 15 / 20); we can record hundreds of demos per hour | **PASS** on the older 0–40 cm/s sweep (report file not in this checkout) |
 | **G1** | Policy **with** future numbers (B) beats policy **without** (A) at 15 cm/s; B stays flat 0 → 20 cm/s; B with numbers zeroed collapses | **PASS** (Sep 13 2026). B 84 / 70 / 71% at 0 / 15 / 20 cm/s; A 9% still, 0% moving; B-zero 2%. n = 100 per B bin. Details: plan §7 |
 | G2a | Camera + filter numbers close to sim truth: at 20 cm/s, median ≤ 1 cm and RMSE ≤ 2 cm vs the sim-truth p̂ | **PASS** (Sep 18 2026, offline). 0.34 / 1.14 cm on demos, 0.31 / 1.26 cm on B's eval runs. Report: `data/eval/p2_perception_report/REPORT.md` |
-| G2b | Swap sim truth → camera numbers in B, same seeds: success drops < 10 points at 15 and 20 cm/s | next |
+| G2b | Swap sim truth → camera numbers in B, same seeds: success drops < 10 points at 15 and 20 cm/s | **PASS** (Sep 29 2026). Filter 92 / 65 / 65 of 100 at 0 / 15 / 20 cm/s. Drop vs oracle is 5 points at 15 cm/s and 6 at 20. Logs: `data/eval/g2b_n100/` |
 | G3 | Fast grasp helper fixes many “too late / early close” fails | not started |
 | G4 | Real arm works well at 10–20 cm/s | not started |
 
@@ -58,7 +58,7 @@ data/         local only (git-ignored):
   p1-retrain/        Phase 1 demos (3,718 episodes, with camera frames)
   lerobot/p1-retrain LeRobot copy used for training
   eval/              eval runs + reports (p1_r4k_report, p2_perception_report)
-runs/         local only: trained checkpoints (p1_r4k_a / p1_r4k_b = G1 models)
+runs/         local only: trained checkpoint (p1_r4k_b = the B model)
 ```
 
 ---
@@ -124,7 +124,7 @@ Failure labels each episode:
 
 ## Phase 1 — done (G1 pass)
 
-Models A and B were trained on 3,718 recorded demos (`runs/p1_r4k_a|b`, commands in [`policy/README.md`](policy/README.md)). B (with the 4 numbers) beats A by 70 points at 15 cm/s and drops 13 points from still to 20 cm/s. Zeroing B's numbers drops it to 2%, so B really uses them. So far this shows “knowing where the object *is* helps”. Splitting that from “knowing where it *will be*” needs a model trained with Δ = 0 (plan §11).
+Models A and B were trained on 3,718 recorded demos (commands in [`policy/README.md`](policy/README.md)). The B weights still on disk are `runs/p1_r4k_b`. B (with the 4 numbers) beats A by 70 points at 15 cm/s and drops 13 points from still to 20 cm/s. Zeroing B's numbers drops it to 2%, so B really uses them. So far this shows “knowing where the object *is* helps”. Splitting that from “knowing where it *will be*” needs a model trained with Δ = 0 (plan §11).
 
 ---
 
@@ -133,7 +133,8 @@ Models A and B were trained on 3,718 recorded demos (`runs/p1_r4k_a|b`, commands
 Replace sim truth with what the static camera sees: blob tracker → pixel-to-table → Kalman filter → the same 4 numbers. B is **not** retrained.
 
 - **Done — G2a (offline):** `perception/` + `python scripts/g2_perception_report.py`. At 20 cm/s the camera numbers sit 0.3 cm (median) from sim truth, and every fruit is tracked, including the white egg.
-- **Next — G2b (Isaac):** add `--cond-source oracle|filter` to `scripts/eval_policy.py`, then rerun B on the G1 seeds and count how many runs flip from success to fail. Steps: plan §11.
+- **Done — G2b (Isaac):** `--cond-source filter` on the G1 seeds. Grasp rate dropped 5 points at 15 cm/s and 6 points at 20 cm/s (both under the 10-point bar). Flips: `data/eval/g2b_n100/flips.json`.
+- **Next — the throw:** leave the box. Throw from a random direction. Catch before it falls off the table. New demos, then a new train of B. Plan §5.
 
 ---
 

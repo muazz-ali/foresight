@@ -29,6 +29,10 @@ JSON_TRACE_KEYS = (
     "action_pos",
     "gripper",
     "conditioning",
+    "truth_pack",
+    "filter_pack",
+    "filter_valid",
+    "filter_redetect_counts",
     "policy_replan",
 )
 _JSON_NDIGITS = 4

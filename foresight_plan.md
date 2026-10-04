@@ -17,8 +17,8 @@
 1. Grasp success stays nearly flat from still to 20 cm/s.
 2. Zero the 4 numbers at eval. Success collapses. That shows B is using the numbers.
 
-**Where we are (Sep 27 2026).** G1 passed on oracle numbers. G2a passed (camera + filter vs sim truth, offline). 
-**Next job is G2b:** close the loop and feed those filter numbers to the same Model B. Details: §7 and §11.
+**Where we are (Sep 29 2026).** G1 passed on oracle numbers. G2a passed (camera + filter vs sim truth, offline). G2b passed (same Model B, numbers from the camera). 
+**Next job is the throw:** leave the box, throw from a random direction, catch before it falls off the table. Details: §5, after G2b.
 
 ---
 
@@ -95,9 +95,19 @@ The 10 cm/s bin was not run. With Δ fixed, the 4 numbers mix "where it is" and 
 
 **G2a — filter vs the numbers B trained on. PASS (Sep 18 2026).** Offline, no Isaac. At 20 cm/s, filter p̂ vs sim-truth p̂: median / RMSE **0.34 / 1.14 cm** on 609 demos, **0.31 / 1.26 cm** on 100 B eval runs. Bars were median ≤ 1 cm and RMSE ≤ 2 cm. Every fruit is tracked, including the white egg (bright blob). Most of the remaining error is the first frame (filter starts at speed 0) and a few frames after each wall hit. Full table: `data/eval/p2_perception_report/REPORT.md`.
 
-**G2b — the next job. Closed-loop swap.**
+**G2b — closed-loop swap. PASS (Sep 29 2026).** Same Model B, checkpoint `runs/p1_r4k_b`, Δ = 0.25 s, replan 8, `--force-place`, seeds matching G1. Logs: `data/eval/g2b_n100/`, flips in `flips.json`.
 
-Goal: the same Model B, with the 4 numbers coming from the camera and the filter instead of the simulator.
+| Speed | Oracle | Filter | Drop |
+|---|---|---|---|
+| 0 cm/s | 84/100 | 92/100 | −8 points (went up) |
+| 15 cm/s | 70/100 | 65/100 | 5 points |
+| 20 cm/s | 71/100 | 65/100 | 6 points |
+
+Before the grasp, filter place vs sim-truth place: median about 0.23 / 0.29 / 0.32 cm at 0 / 15 / 20 cm/s.
+
+Seeds that flipped success → fail: 4 at still (all `other`), 19 at 15 cm/s (all `other`, wall hits noted), 17 at 20 cm/s (15 `other`, 2 `hand hid the fruit`). No flip was "filter not warmed up" or "track lost".
+
+The bar that was used:
 
 Pass when all of this is true:
 - Scene, checkpoint, Δ, replan (8 steps), `--force-place`, and **seeds** match the G1 oracle runs.
@@ -134,6 +144,8 @@ No second policy whose only role is "B minus that policy." No latent world model
 ---
 
 ## 8. Next steps (G2b only)
+
+Done on Sep 29 2026. The numbers are in §5. Do not rerun this gate unless the checkpoint or the seeds change.
 
 1. Add `scripts/eval_policy.py --cond-source oracle|filter`. Default stays oracle.
 2. Build the filter with `StaticCamEstimator.from_cfg(scene.cfg)`. Feed it the same static frame B sees, at that frame's sim time.

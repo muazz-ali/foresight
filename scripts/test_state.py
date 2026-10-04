@@ -48,6 +48,7 @@ def test_episode_for_json_is_light():
         "ee_pos": np.zeros((T, 3)),
         "gripper": np.ones(T),
         "conditioning": np.tile([0.45, 0.0, 0.2, 0.0], (T, 1)),
+        "filter_redetect_counts": np.array([0, 0, 1, 1, 2], dtype=np.int64),
         "static_cam_rgb": np.zeros((T, 8, 8, 3), dtype=np.uint8),
     }
     d = episode_for_json(episode)
@@ -57,10 +58,11 @@ def test_episode_for_json_is_light():
     assert d["cond0"] == [0.45, 0.0, 0.2, 0.0]
     assert "static_cam_rgb" not in d["trace"]
     assert d["arrays"]["static_cam_rgb"]["shape"] == [T, 8, 8, 3]
-    for k in ("stage", "holding", "object_vel", "ee_pos", "gripper"):
+    for k in ("stage", "holding", "object_vel", "ee_pos", "gripper", "filter_redetect_counts"):
         assert k in JSON_TRACE_KEYS
         assert k in d["trace"]
         assert len(d["trace"][k]) == T
+    assert d["trace"]["filter_redetect_counts"] == [0, 0, 1, 1, 2]
 
 
 def test_write_episode_h5_is_4d_not_12():

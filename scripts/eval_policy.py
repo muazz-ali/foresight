@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Test a trained policy in Isaac (Gate G1 speed sweep).
+"""Test a trained policy in Isaac (Gate G1 speed sweep, Gate G2b filter swap).
 
 Model A = no future numbers. Model B = with future numbers (constant-velocity).
 `--zero-conditioning` turns B's future numbers off (sanity check).
-`--oracle-conditioning` kept for P5 CLI; same CV pack as Model B (not bounce).
+`--cond-source oracle|filter` picks where those numbers come from. Default is
+oracle (simulator truth). `filter` uses the static camera + Kalman filter.
 """
 
 from __future__ import annotations
@@ -56,9 +57,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", choices=["A", "B"], default="B")
     p.add_argument("--zero-conditioning", action="store_true", help="B sanity: zero vector")
     p.add_argument(
-        "--oracle-conditioning",
-        action="store_true",
-        help="B_oracle CLI flag; same constant-velocity pack as Model B",
+        "--cond-source",
+        choices=["oracle", "filter"],
+        default="oracle",
+        help="Where Model B's 4 numbers come from. oracle = sim truth (default). "
+        "filter = static camera + Kalman. Filter runs warm up 2 frames before the first plan.",
     )
     p.add_argument(
         "--delta",
@@ -188,6 +191,63 @@ def load_policy(
     return policy
 
 
+def _rgb_frame(img: np.ndarray) -> np.ndarray:
+    """Static-camera frame as the tracker expects (RGB, no alpha)."""
+    frame = np.ascontiguousarray(img)
+    if frame.ndim == 3 and frame.shape[-1] == 4:
+        frame = np.ascontiguousarray(frame[..., :3])
+    return frame
+
+
+def _hold_slide(scene) -> None:
+    """One sim step with the hand held and the object still sliding."""
+    ee, quat = scene.get_ee_pose()
+    scene.set_ee_target(ee, quat, float(scene.get_gripper_open()))
+    scene.step(kinematic_object=True, attach_object=False, freeze_object=False)
+
+
+def warm_filter(scene, est) -> int:
+    """Show the filter a few frames before Model B plans.
+
+    The filter's first guess has speed 0. Two frames go in before the frame B
+    uses, so that first 8-step chunk is not off by speed × 0.25 s.
+    Returns how many frames were fed before that planning frame.
+    """
+    from eval.cond_source import FILTER_WARMUP_BEFORE
+
+    seen_before = 0
+    for i in range(FILTER_WARMUP_BEFORE + 1):
+        _hold_slide(scene)
+        state = scene.get_object_state()
+        rgb = _rgb_frame(scene.get_images()["static_cam"])
+        if i == 0:
+            cam = scene.cfg.get("camera", {})
+            want_h, want_w = int(cam["height"]), int(cam["width"])
+            if rgb.shape[0] != want_h or rgb.shape[1] != want_w:
+                raise RuntimeError(
+                    f"static frame is {rgb.shape[:2]}, camera config is {want_h}x{want_w}"
+                )
+            logging.info("filter warmup static frame %s", tuple(rgb.shape))
+            # Spawn pose stands in for the one-shot detector (estimator.start).
+            if not est.start(rgb, state.position):
+                logging.warning(
+                    "filter did not find the object on the first frame (seed=%s)",
+                    getattr(scene, "_meta", {}).get("seed"),
+                )
+        est.step(rgb, float(state.timestamp))
+        if i < FILTER_WARMUP_BEFORE:
+            seen_before += 1
+    return seen_before
+
+
+def _filter_state_for_frame(est, rgb: np.ndarray, t: float):
+    """Update the filter on this frame once. Same time ⇒ already warmed."""
+    t = float(t)
+    if est.kf.started and abs(float(est.kf.t) - t) <= 1e-8:
+        return est.kf.state(est.plane_z)
+    return est.step(rgb, t)
+
+
 def build_obs_batch(
     scene,
     *,
@@ -196,27 +256,36 @@ def build_obs_batch(
     language: str,
     device: str,
     zero_conditioning: bool,
-    oracle_conditioning: bool = False,  # unused: same CV pack as Model B
-) -> tuple[dict, np.ndarray | None]:
-    """One SmolVLA observation dict + 4-D cond (Model B) or None (A)."""
-    from interfaces.state import CONDITIONING_DIM, conditioning_vector
+    cond_source: str = "oracle",
+    images: dict | None = None,
+    oracle_state=None,
+    filter_state=None,
+) -> tuple[dict, dict]:
+    """One SmolVLA observation dict + the packs we logged.
+
+    Aux keys: cond (what B sees, or None for model A), truth, filter, valid.
+    """
+    from eval.cond_source import choose_pack
     from policy.convert_h5 import pack_proprio
 
-    imgs = scene.get_images()
+    imgs = scene.get_images() if images is None else images
     ee_pos, ee_quat = scene.get_ee_pose()
     # Same channel as collect/convert: commanded open∈{0,1}, not raw finger width.
     # (Fingers are snapped to this command on attach; see Phase0Scene._snap_fingers.)
     grip_cmd = float(scene.get_gripper_open())
     state = pack_proprio(ee_pos, ee_quat, grip_cmd)
-    cond: np.ndarray | None = None
+    aux: dict = {"cond": None, "truth": None, "filter": None, "valid": None}
 
     if model == "B":
-        if zero_conditioning:
-            cond = np.zeros(CONDITIONING_DIM, dtype=np.float32)
-        else:
-            obj = scene.get_object_state()
-            cond = conditioning_vector(obj, delta=delta).astype(np.float32)
-        state = np.concatenate([state, cond], axis=0).astype(np.float32)
+        obj = scene.get_object_state() if oracle_state is None else oracle_state
+        aux = choose_pack(
+            source=cond_source,
+            oracle_state=obj,
+            filter_state=filter_state,
+            delta=delta,
+            zero=zero_conditioning,
+        )
+        state = np.concatenate([state, aux["cond"]], axis=0).astype(np.float32)
 
     batch = {
         "observation.state": torch.as_tensor(state, device=device).unsqueeze(0),
@@ -224,7 +293,7 @@ def build_obs_batch(
         "observation.images.wrist_cam": _as_chw_float(imgs["wrist_cam"]).unsqueeze(0).to(device),
         "task": [language if language.endswith("\n") else language + "\n"],
     }
-    return batch, cond
+    return batch, aux
 
 
 def action_to_ee(action: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
@@ -254,21 +323,34 @@ def run_episode_policy(
     zero_conditioning: bool,
     n_steps: int,
     save_images: bool = False,
-    oracle_conditioning: bool = False,
+    cond_source: str = "oracle",
+    checkpoint: str = "",
+    n_action_steps: int | None = None,
     no_attach: bool = False,
     force_place: bool = False,
 ) -> tuple[dict, dict]:
     """Closed-loop policy rollout. Logs the same arrays as expert collect."""
     from policy.features import default_language
 
-    if zero_conditioning and oracle_conditioning:
-        raise ValueError("Pass only one of --zero-conditioning / --oracle-conditioning")
+    if zero_conditioning and cond_source == "filter":
+        raise ValueError("Pass only one of --zero-conditioning / --cond-source filter")
 
     meta = scene.reset_episode(seed=seed, speed=speed)
     language = default_language(meta.get("category"), meta.get("container_category"))
     meta["language"] = language
     meta["no_attach"] = bool(no_attach)
     meta["force_place"] = bool(force_place)
+    meta["cond_source"] = cond_source
+    meta["checkpoint"] = checkpoint
+    meta["n_action_steps"] = None if n_action_steps is None else int(n_action_steps)
+    meta["delta"] = float(delta)
+
+    est = None
+    if cond_source == "filter":
+        from perception.estimator import StaticCamEstimator
+
+        est = StaticCamEstimator.from_cfg(scene.cfg)
+        meta["filter_warmup_frames"] = warm_filter(scene, est)
 
     log: dict[str, list] = {
         "holding": [],
@@ -282,6 +364,10 @@ def run_episode_policy(
         "gripper": [],
         "oracle_state": [],
         "conditioning": [],
+        "truth_pack": [],
+        "filter_pack": [],
+        "filter_valid": [],
+        "filter_redetect_counts": [],
         "timestamp": [],
         "container_pos": [],
         "policy_replan": [],
@@ -318,15 +404,28 @@ def run_episode_policy(
 
     for t in range(n_steps):
         will_replan = len(policy._queues[ACTION]) == 0
-        batch, cond = build_obs_batch(
+        imgs = scene.get_images()
+        oracle_now = scene.get_object_state()
+        filt_state = None
+        if est is not None:
+            filt_state = _filter_state_for_frame(
+                est,
+                _rgb_frame(imgs["static_cam"]),
+                float(oracle_now.timestamp),
+            )
+        batch, aux = build_obs_batch(
             scene,
             model=model,
             delta=delta,
             language=language,
             device=device,
             zero_conditioning=zero_conditioning,
-            oracle_conditioning=oracle_conditioning,
+            cond_source=cond_source,
+            images=imgs,
+            oracle_state=oracle_now,
+            filter_state=filt_state,
         )
+        cond = aux["cond"]
         with torch.inference_mode():
             act = policy.select_action(batch)
         act_np = act[0].detach().cpu().numpy()
@@ -508,7 +607,15 @@ def run_episode_policy(
         )
         log["policy_replan"].append(1 if will_replan else 0)
         if cond is not None:
-            log["conditioning"].append(cond.astype(np.float64).copy())
+            log["conditioning"].append(np.asarray(cond, dtype=np.float64).copy())
+        if aux["truth"] is not None and est is not None:
+            log["truth_pack"].append(np.asarray(aux["truth"], dtype=np.float64).copy())
+            filt = aux["filter"]
+            log["filter_pack"].append(
+                np.asarray(filt if filt is not None else cond, dtype=np.float64).copy()
+            )
+            log["filter_valid"].append(float(aux["valid"] if aux["valid"] is not None else 0.0))
+            log["filter_redetect_counts"].append(int(est.n_redetects))
         if save_images:
             imgs = scene.get_images()
             log["static_cam_rgb"].append(imgs["static_cam"])
@@ -523,6 +630,17 @@ def run_episode_policy(
         assert episode["conditioning"].shape == (t_len, CONDITIONING_DIM), episode[
             "conditioning"
         ].shape
+        for pack_key in ("truth_pack", "filter_pack"):
+            if pack_key in episode:
+                assert episode[pack_key].shape == (t_len, CONDITIONING_DIM), episode[
+                    pack_key
+                ].shape
+        if "filter_valid" in episode:
+            assert episode["filter_valid"].shape == (t_len,), episode["filter_valid"].shape
+        if "filter_redetect_counts" in episode:
+            assert episode["filter_redetect_counts"].shape == (t_len,), episode[
+                "filter_redetect_counts"
+            ].shape
     if "oracle_state" in episode:
         assert episode["oracle_state"].shape == (t_len, 14), episode["oracle_state"].shape
     meta["n_frames"] = t_len
@@ -536,7 +654,7 @@ def run_episode_policy(
         meta["conditioning_debug"] = {
             "layout": list(CONDITIONING_LAYOUT),
             "zero_conditioning": bool(zero_conditioning),
-            "oracle_conditioning": bool(oracle_conditioning),
+            "cond_source": cond_source,
             "first": c[0].tolist(),
             "first_replan": c_replan[0].tolist(),
             "mean": c.mean(axis=0).tolist(),
@@ -545,6 +663,44 @@ def run_episode_policy(
             "l2_mean_replan": float(np.linalg.norm(c_replan, axis=1).mean()),
             "all_zero": bool(np.allclose(c, 0.0)),
         }
+    if est is not None and "filter_pack" in episode and "truth_pack" in episode:
+        err_m = np.linalg.norm(
+            episode["filter_pack"][:, :2] - episode["truth_pack"][:, :2], axis=1
+        )
+        # G2a scored frames before the first grasp. After that the fruit is in
+        # the hand or the bowl, off the table plane the filter assumes.
+        held = episode["holding"] > 0.5
+        if np.any(held):
+            before = np.arange(err_m.shape[0]) < int(np.argmax(held))
+        else:
+            before = np.ones(err_m.shape[0], dtype=bool)
+        replan = episode["policy_replan"].astype(bool)
+
+        def _err_stats(mask: np.ndarray) -> dict | None:
+            e = err_m[mask]
+            if e.size == 0:
+                return None
+            return {
+                "n": int(e.size),
+                "p_median_cm": float(np.median(e) * 100.0),
+                "p_rmse_cm": float(np.sqrt(np.mean(np.square(e))) * 100.0),
+            }
+
+        meta["filter_redetects"] = int(est.n_redetects)
+        meta["filter_valid_rate"] = float(np.mean(episode["filter_valid"][before]))
+        meta["filter_vs_truth"] = {
+            "before_hold": _err_stats(before),
+            "before_hold_replan": _err_stats(before & replan),
+        }
+        before_stats = meta["filter_vs_truth"]["before_hold"] or {}
+        logging.info(
+            "filter vs truth (before grasp) p̂ median %.2f cm  rmse %.2f cm  n=%s  valid %.2f  redetects %d",
+            float(before_stats.get("p_median_cm", float("nan"))),
+            float(before_stats.get("p_rmse_cm", float("nan"))),
+            before_stats.get("n"),
+            meta["filter_valid_rate"],
+            meta["filter_redetects"],
+        )
     return episode, meta
 
 
@@ -571,7 +727,6 @@ def _save_conditioning_trace(
     episode: dict,
     meta: dict,
     zero_conditioning: bool,
-    oracle_conditioning: bool,
     success: bool,
     failure: str,
 ) -> Path | None:
@@ -583,8 +738,13 @@ def _save_conditioning_trace(
         "speed_m_s": np.asarray([float(speed)], dtype=np.float32),
         "seed": np.asarray([int(seed)], dtype=np.int64),
         "zero_conditioning": np.asarray([int(bool(zero_conditioning))], dtype=np.int8),
-        "oracle_conditioning": np.asarray([int(bool(oracle_conditioning))], dtype=np.int8),
         "success": np.asarray([int(bool(success))], dtype=np.int8),
+        "cond_source": np.asarray(str(meta.get("cond_source", "oracle")).encode("ascii")),
+        "n_action_steps": np.asarray(
+            [-1 if meta.get("n_action_steps") is None else int(meta["n_action_steps"])],
+            dtype=np.int64,
+        ),
+        "force_place": np.asarray([int(bool(meta.get("force_place")))], dtype=np.int8),
     }
     h5_path = out_dir / f"eval_{model}_v{speed:.2f}_s{seed}_cond.h5"
     write_episode_h5(h5_path, episode, extra=extra)
@@ -600,7 +760,14 @@ def _save_conditioning_trace(
         "n_frames": n_frames,
         "delta": float(meta["delta"]),
         "zero_conditioning": bool(zero_conditioning),
-        "oracle_conditioning": bool(oracle_conditioning),
+        "cond_source": meta.get("cond_source", "oracle"),
+        "checkpoint": meta.get("checkpoint", ""),
+        "n_action_steps": meta.get("n_action_steps"),
+        "force_place": bool(meta.get("force_place")),
+        "filter_warmup_frames": meta.get("filter_warmup_frames"),
+        "filter_redetects": meta.get("filter_redetects"),
+        "filter_valid_rate": meta.get("filter_valid_rate"),
+        "filter_vs_truth": meta.get("filter_vs_truth"),
         "h5": str(h5_path),
         **{k: meta[k] for k in ("max_stage", "z_max", "z_end", "z_min") if k in meta},
         **episode_for_json(episode),
@@ -631,6 +798,9 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
     for i in range(n):
         logging.info("eval model=%s speed=%.2f trial %d/%d seed=%d", args.model, speed, i + 1, n, seed)
         try:
+            n_act = args.n_action_steps
+            if n_act is None:
+                n_act = int(policy.config.n_action_steps)
             episode, meta = run_episode_policy(
                 scene,
                 policy,
@@ -640,7 +810,9 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
                 delta=float(args.delta),
                 device=device,
                 zero_conditioning=bool(args.zero_conditioning),
-                oracle_conditioning=bool(args.oracle_conditioning),
+                cond_source=str(args.cond_source),
+                checkpoint=str(args.checkpoint),
+                n_action_steps=int(n_act),
                 n_steps=n_steps,
                 save_images=save_images,
                 no_attach=bool(getattr(args, "no_attach", False)),
@@ -674,7 +846,6 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
                 episode=episode,
                 meta=meta,
                 zero_conditioning=bool(args.zero_conditioning),
-                oracle_conditioning=bool(args.oracle_conditioning),
                 success=ok,
                 failure=tax,
             )
@@ -685,9 +856,16 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
             "failure": tax,
             "model": args.model,
             "zero_conditioning": bool(args.zero_conditioning),
-            "oracle_conditioning": bool(args.oracle_conditioning),
+            "cond_source": str(args.cond_source),
+            "checkpoint": str(args.checkpoint),
+            "n_action_steps": meta.get("n_action_steps"),
+            "delta": meta.get("delta", float(args.delta)),
             "no_attach": bool(getattr(args, "no_attach", False)),
             "force_place": bool(getattr(args, "force_place", False)),
+            "filter_warmup_frames": meta.get("filter_warmup_frames"),
+            "filter_redetects": meta.get("filter_redetects"),
+            "filter_valid_rate": meta.get("filter_valid_rate"),
+            "filter_vs_truth": meta.get("filter_vs_truth"),
             "placed_released": meta.get("placed_released"),
             "n_replans": meta.get("n_replans"),
             **diag,
@@ -750,10 +928,12 @@ def build_g1_report(summaries: list[dict], args, wall: float) -> dict:
 
     # Zero-out sanity is a separate run; recorded via flag.
     report = {
-        "gate": "G1",
+        "gate": "G2b" if args.cond_source == "filter" else "G1",
         "model": args.model,
         "zero_conditioning": bool(args.zero_conditioning),
-        "oracle_conditioning": bool(args.oracle_conditioning),
+        "cond_source": args.cond_source,
+        "delta": float(args.delta) if args.delta is not None else None,
+        "force_place": bool(args.force_place),
         "checkpoint": args.checkpoint,
         "criterion": {
             "B_beats_A_mid_ge": HIGH_M_S,
@@ -771,7 +951,7 @@ def build_g1_report(summaries: list[dict], args, wall: float) -> dict:
             else None
         ),
     }
-    if args.model == "B" and not args.zero_conditioning and not args.oracle_conditioning:
+    if args.model == "B" and not args.zero_conditioning:
         report["gate_g1_partial"] = {
             "flat_pass": flat_ok,
             "margin_pass": margin_ok,
@@ -791,8 +971,10 @@ def main() -> None:
     if unknown:
         print(f"[foresight] Ignoring unknown args: {unknown}", flush=True)
 
-    if bool(args.zero_conditioning) and bool(args.oracle_conditioning):
-        raise SystemExit("Choose only one of --zero-conditioning / --oracle-conditioning")
+    if args.cond_source == "filter" and bool(args.zero_conditioning):
+        raise SystemExit("Choose only one of --zero-conditioning / --cond-source filter")
+    if args.cond_source == "filter" and args.model != "B":
+        raise SystemExit("--cond-source filter is for model B")
 
     args.enable_cameras = True
     app_launcher = AppLauncher(args)
