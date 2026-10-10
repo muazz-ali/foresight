@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scratch diag: does Model B conditioning reach the policy input tensor?
+"""Scratch diag: does live conditioning reach the policy input tensor?
 
 No Isaac. Reconstructs eval_policy.build_obs_batch conditioning hops and
 checks runs/p1_b checkpoint input dim vs a fake batch's observation.state.
@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from interfaces.state import ObjectState, conditioning_vector  # noqa: E402
-from policy.features import CONDITIONING_DIM, PROPRIO_DIM, STATE_DIM_B  # noqa: E402
+from policy.features import CONDITIONING_DIM, PROPRIO_DIM, STATE_DIM  # noqa: E402
 from policy.convert_h5 import pack_proprio  # noqa: E402
 
 
@@ -125,59 +125,51 @@ def try_one_forward(ckpt: Path, state: np.ndarray, device: str = "cpu") -> dict:
 
 
 def main() -> None:
-    print("CONST PROPRIO_DIM=", PROPRIO_DIM, "CONDITIONING_DIM=", CONDITIONING_DIM, "STATE_DIM_B=", STATE_DIM_B)
-    b = report_arm("B", build_cond(zero=False))
-    bz = report_arm("B_zero", build_cond(zero=True))
+    print("CONST PROPRIO_DIM=", PROPRIO_DIM, "CONDITIONING_DIM=", CONDITIONING_DIM, "STATE_DIM=", STATE_DIM)
+    model = report_arm("model", build_cond(zero=False))
+    model_zero = report_arm("model_zero", build_cond(zero=True))
 
-    ckpt_b = ROOT / "runs" / "p1_b" / "pretrained_model"
-    ckpt_a = ROOT / "runs" / "p1_a" / "pretrained_model"
-    meta_b = load_ckpt_meta(ckpt_b)
-    meta_a = load_ckpt_meta(ckpt_a)
-    print("[ckpt A]", json.dumps(meta_a))
-    print("[ckpt B]", json.dumps(meta_b))
+    ckpt = ROOT / "runs" / "p1_b" / "pretrained_model"
+    meta = load_ckpt_meta(ckpt)
+    print("[ckpt model]", json.dumps(meta))
 
-    train_dim_b = int(meta_b["input_features.observation.state.shape"][0])
-    eval_dim_b = int(b["state_shape"][0])
-    print(f"[dim] train_B={train_dim_b} eval_B_state={eval_dim_b} match={train_dim_b == eval_dim_b}")
-    print(
-        f"[dim] train_A={meta_a['input_features.observation.state.shape'][0]} "
-        f"model_type A/B={meta_a['model_type.txt']}/{meta_b['model_type.txt']}"
-    )
+    train_dim = int(meta["input_features.observation.state.shape"][0])
+    eval_dim = int(model["state_shape"][0])
+    print(f"[dim] train={train_dim} eval_state={eval_dim} match={train_dim == eval_dim}")
 
-    # Mid5 logged evidence (no Isaac re-run).
-    mid5_b = ROOT / "data/p1/reeval_n8_mid5/eval_b/eval_B_v0.20_s9200_conditioning.json"
-    mid5_bz = ROOT / "data/p1/reeval_n8_mid5/eval_b_zero/eval_B_v0.20_s9200_conditioning.json"
-    if mid5_b.is_file():
-        jb = json.loads(mid5_b.read_text())
+    # Mid5 logged evidence (no Isaac re-run); paths follow legacy eval_b layout on disk.
+    mid5_model = ROOT / "data/p1/reeval_n8_mid5/eval_b/eval_B_v0.20_s9200_conditioning.json"
+    mid5_zero = ROOT / "data/p1/reeval_n8_mid5/eval_b_zero/eval_B_v0.20_s9200_conditioning.json"
+    if mid5_model.is_file():
+        jb = json.loads(mid5_model.read_text())
         print(
-            f"[mid5 B] zero_flag={jb['zero_conditioning']} "
+            f"[mid5 model] zero_flag={jb['zero_conditioning']} "
             f"l2_mean_replan={jb['l2_mean_replan']:.6g} all_zero={jb['all_zero']} "
             f"first_replan_len={len(jb['first_replan'])}"
         )
-    if mid5_bz.is_file():
-        jz = json.loads(mid5_bz.read_text())
+    if mid5_zero.is_file():
+        jz = json.loads(mid5_zero.read_text())
         print(
-            f"[mid5 B_zero] zero_flag={jz['zero_conditioning']} "
+            f"[mid5 model_zero] zero_flag={jz['zero_conditioning']} "
             f"l2_mean_replan={jz['l2_mean_replan']:.6g} all_zero={jz['all_zero']} "
             f"first_replan_len={len(jz['first_replan'])}"
         )
 
     forward = None
     try:
-        forward = try_one_forward(ckpt_b, build_state(build_cond(zero=False)), device="cpu")
-        print("[forward B ok]", json.dumps(forward))
-        forward_z = try_one_forward(ckpt_b, build_state(build_cond(zero=True)), device="cpu")
-        print("[forward B_zero ok]", json.dumps(forward_z))
+        forward = try_one_forward(ckpt, build_state(build_cond(zero=False)), device="cpu")
+        print("[forward model ok]", json.dumps(forward))
+        forward_z = try_one_forward(ckpt, build_state(build_cond(zero=True)), device="cpu")
+        print("[forward model_zero ok]", json.dumps(forward_z))
     except Exception as ex:
         print(f"[forward] SKIPPED/FAILED: {type(ex).__name__}: {ex}")
         forward = {"error": str(ex)}
 
     out = {
-        "B": b,
-        "B_zero": bz,
-        "ckpt_A": meta_a,
-        "ckpt_B": meta_b,
-        "train_eval_dim_match": train_dim_b == eval_dim_b,
+        "model": model,
+        "model_zero": model_zero,
+        "ckpt": meta,
+        "train_eval_dim_match": train_dim == eval_dim,
         "forward": forward,
     }
     out_path = ROOT / "tools" / "diag" / "p1_conditioning_wiring_out.json"

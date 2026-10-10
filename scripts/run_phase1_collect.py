@@ -2,6 +2,12 @@
 """Record Phase 1 demos with the scripted expert (for policy training).
 
 Always saves camera images + a text instruction. Speeds vary 0-20 cm/s.
+
+What it does: runs our expert over many episodes, keeps the ones that succeed,
+and saves them (images, hand moves, the 4 policy numbers) for training.
+It runs by hand, in the sim conda env, before the training step.
+It must NOT use DynamicVLA code, and it does not train. Training lives in a
+separate env. Speed bins match G1 so train and eval see the same speeds.
 """
 
 from __future__ import annotations
@@ -21,12 +27,16 @@ FORESIGHT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CFG = FORESIGHT_ROOT / "sim" / "phase0_cfg.yaml"
 DEFAULT_OUT = FORESIGHT_ROOT / "data" / "p1-retrain"
 
+# So `import sim...` / `import eval...` work when run as a script.
 sys.path.insert(0, str(FORESIGHT_ROOT))
+# Reuse the G1 speed bins so collected demos cover the same speeds the gate tests.
 from eval.gate_g1 import G1_SPEEDS, HIGH_M_S, MID_M_S  # noqa: E402
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """Command-line flags (Isaac's own flags are added later in main)."""
     p = argparse.ArgumentParser(description="Foresight Phase 1 oracle collection")
+    # We stop at N successful demos, not N tries. Failures are skipped for training.
     p.add_argument("--target-successes", type=int, default=20)
     p.add_argument("--max-attempts", type=int, default=None, help="Safety cap (default 3x target)")
     p.add_argument(
@@ -52,6 +62,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save", action="store_true", default=True)
     p.add_argument("--no-save", action="store_false", dest="save")
     p.add_argument("--save-failures", action="store_true", default=False)
+    # Debug is ON by default here: it also saves failed runs and an MP4 per run.
     p.add_argument("--debug", action="store_true", default=True)
     p.add_argument("--no-debug", action="store_false", dest="debug")
     p.add_argument(
@@ -68,6 +79,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _setup_logging(output_dir: Path, *, debug: bool = False) -> None:
+    """Log to the screen and to ``phase1_collect.log`` (appended). Quiet Isaac unless debug."""
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "phase1_collect.log"
     level = logging.DEBUG if debug else logging.INFO
@@ -96,10 +108,16 @@ def _sample_speed(
     speed_list: list[float] | None = None,
     success_idx: int = 0,
 ) -> float:
-    """Draw object speed: fixed, uniform, G1 bins, or exact list entry."""
+    """Draw object speed: fixed, uniform, G1 bins, or exact list entry.
+
+    Why: the policy must see many speeds in training. Default "stratified" picks
+    a G1 bin at random, so each bin gets about the same share of demos.
+    ``rng`` is seeded by the caller, so the speed list is repeatable.
+    """
     if mode == "list":
         if not speed_list:
             raise ValueError("speed-mode list requires --speed-list")
+        # Walk the list by number of successes so far; wrap around at the end.
         return float(speed_list[int(success_idx) % len(speed_list)])
     if mode == "fixed":
         return float(fixed)
@@ -108,6 +126,7 @@ def _sample_speed(
     # Stratified bins matching plan §8 (0 / 10 / 15 / 20 cm/s).
     bins = [b for b in G1_SPEEDS if b <= speed_max + 1e-9]
     base = float(rng.choice(bins))
+    # The 0 bin stays exactly 0 (no jitter): "object sits still" must be truly still.
     if base <= 1e-9:
         return 0.0
     # Small jitter inside the 5 cm/s bin, clipped to speed_max.
@@ -116,6 +135,12 @@ def _sample_speed(
 
 
 def run_collection(args, scene, expert) -> dict:
+    """Keep running episodes until enough succeed (or the try cap hits). Returns a report.
+
+    Each try is judged by OUR success rule (sim/success.py) and labelled with a
+    failure code. Every try gets a line in metrics.jsonl, so the real success
+    rate is on record even though training only uses the wins.
+    """
     from sim.collect import episode_for_json, run_episode, write_episode_h5
     from sim.success import classify_failure, episode_diagnostics, episode_success
 
@@ -129,9 +154,13 @@ def run_collection(args, scene, expert) -> dict:
         speed_mode = "list"
 
     target = int(args.target_successes)
+    # In list mode, make sure every listed speed gets at least one success.
     if speed_mode == "list" and speed_list is not None:
         target = max(target, len(speed_list))
+    # Safety cap so a broken expert cannot loop forever. Default is the larger
+    # of 3x target and target+50 (small targets still get room to retry).
     max_attempts = int(args.max_attempts or max(3 * target, target + 50))
+    # Seeded: the same --seed gives the same speed draws.
     rng = np.random.default_rng(int(args.seed))
     seed = int(args.seed)
 
@@ -140,6 +169,7 @@ def run_collection(args, scene, expert) -> dict:
     # Always save images for policy training.
     save_images = True
 
+    # Loop on successes, not attempts: a failed try does not count toward the target.
     while successes < target and attempts < max_attempts:
         speed = _sample_speed(
             speed_mode,
@@ -176,6 +206,7 @@ def run_collection(args, scene, expert) -> dict:
                     )
                 ),
             )
+            # OUR success rule (sim/success.py), not DynamicVLA's object_picked.
             success = episode_success(
                 episode,
                 z_lift_min=float(expert.lift_height),
@@ -183,6 +214,7 @@ def run_collection(args, scene, expert) -> dict:
                 place_stage=int(expert.stage_schema.done),
             )
         except Exception as ex:
+            # Log the full error and score this try as a failure (not a skip).
             logging.exception("episode failed seed=%s: %s", seed, ex)
             err = str(ex)
             success = False
@@ -191,9 +223,12 @@ def run_collection(args, scene, expert) -> dict:
         if success:
             successes += 1
 
+        # Facts (farthest stage, object height low/high/end) kept so a failure
+        # label can be double-checked later.
         diag = episode_diagnostics(
             episode, z_lift_min=float(expert.lift_height)
         )
+        # Why it failed: never-engaged | too-late | early-close | ... or "success".
         failure = classify_failure(
             success=success,
             max_stage=diag["max_stage"],
@@ -202,10 +237,14 @@ def run_collection(args, scene, expert) -> dict:
             object_z_end=diag["z_end"],
             z_lift_min=float(expert.lift_height),
             schema=expert.stage_schema,
+            off_table=bool(meta.get("off_table", False)),
+            abort_reason=meta.get("abort_reason"),
         )
+        # A crash overrides any other label: no trustworthy data to classify.
         if err:
             failure = "safety-abort"
 
+        # language/category tell us which instruction text + objects each demo used.
         record = {
             "speed_m_s": speed,
             "seed": seed,
@@ -225,6 +264,8 @@ def run_collection(args, scene, expert) -> dict:
         with open(metrics_path, "a") as fp:
             fp.write(json.dumps(record) + "\n")
 
+        # Wins are always saved. Failures only with --save-failures or --debug
+        # (so debug-on-by-default means failures are kept unless --no-debug).
         if episode is not None and args.save and (success or args.save_failures or args.debug):
             speed_dir = out_root / f"speed_{speed:.2f}"
             speed_dir.mkdir(parents=True, exist_ok=True)
@@ -266,11 +307,18 @@ def run_collection(args, scene, expert) -> dict:
                 },
             )
             if args.debug:
-                from sim.video import write_debug_mp4
+                from sim.video import gates_from_expert, write_debug_mp4
 
-                fps = int(scene.cfg.get("camera", {}).get("fps", 25))
-                write_debug_mp4(episode, speed_dir / f"{ep_name}.mp4", fps=fps)
+                fps = int(scene.cfg.get("static_camera", {}).get("fps", 25))
+                write_debug_mp4(
+                    episode,
+                    speed_dir / f"{ep_name}.mp4",
+                    fps=fps,
+                    gates=gates_from_expert(expert),
+                )
 
+        # New seed each try: different start, still repeatable. seed_start/seed_end
+        # in the report tell you exactly which seeds this run used.
         seed += 1
 
     elapsed = time.time() - t0
@@ -297,6 +345,11 @@ def run_collection(args, scene, expert) -> dict:
 
 
 def main() -> None:
+    """Start Isaac (cameras forced on), build scene + expert, collect, then exit.
+
+    Isaac's AppLauncher must start BEFORE any isaaclab / omni import, so the
+    sim imports sit inside this function.
+    """
     print("[foresight] Phase1 collect — starting AppLauncher…", flush=True)
     from isaaclab.app import AppLauncher
 
@@ -307,7 +360,7 @@ def main() -> None:
     if unknown:
         print(f"[foresight] Ignoring unknown args: {unknown}", flush=True)
 
-    # Force cameras for policy RGB.
+    # Force cameras for policy RGB. Without --enable_cameras the frames are black.
     if not getattr(args, "enable_cameras", False):
         print("[foresight] enabling cameras for Phase1 collection", flush=True)
         args.enable_cameras = True
@@ -342,6 +395,8 @@ def main() -> None:
         logging.exception("Phase1 collect failed")
         raise
     finally:
+        # Hard exit: Isaac's normal close often hangs when headless. Safe here
+        # because metrics and the report are already written to disk.
         logging.info("exiting (skip app.close hang)")
         os._exit(0)
 

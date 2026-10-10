@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
-"""Train SmolVLA Model A or B on a Foresight LeRobot dataset.
+"""Train SmolVLA on a Foresight LeRobot dataset.
 
-Model A = images + robot pose + text.
-Model B = A + 4 live future numbers (XY p̂/v̂; fixed Δ from yaml + noise).
+Images + robot pose + text + 4 live future numbers (XY p̂/v̂; fixed Δ from yaml + noise).
+
+Step 2 of 3 (convert -> train -> infer).
+
+What the model reads each step:
+  * 2 camera images (front + wrist) and a text task.
+  * 12 state numbers = 8 robot numbers + 4 object numbers
+    (where the object will be in XY, and its XY speed).
+    Layout lives in policy/features.py. Eval / infer must build it the same way.
+What it learns: the next chunk of robot actions.
+
+Each batch, policy/transforms.py rebuilds the 4 object numbers from perfect
+sim data and adds small noise. This is meant to make training less sensitive
+to small tracker errors.
+
+Only the small action part (the "expert") trains. Vision stays as it was
+shipped. If results are bad, fix data or the 4 numbers first.
 
 Conda: dynamicVLA_training
 """
@@ -26,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 def _collate(batch: list[dict]) -> dict:
     """Stack tensor fields; keep task as list[str]."""
+    # Text is not a tensor, so it stays a plain list of strings.
     keys = batch[0].keys()
     out: dict = {}
     for k in keys:
@@ -40,7 +56,6 @@ def _collate(batch: list[dict]) -> dict:
 
 
 def build_policy(
-    model: str,
     ds_meta,
     device: str,
     pretrained: str | None,
@@ -54,11 +69,14 @@ def build_policy(
 
     from policy.transforms import expand_state_stats, policy_features_for_model
 
-    features = policy_features_for_model(ds_meta.features, model)
-    stats = expand_state_stats(ds_meta.stats, model)
+    # Tell the model its state is 12 numbers wide (8 robot + 4 object),
+    # and give it matching scaling stats. Skip this and shapes will not fit.
+    features = policy_features_for_model(ds_meta.features)
+    stats = expand_state_stats(ds_meta.stats)
 
     policy_features = dataset_to_policy_features(features)
     cfg = SmolVLAConfig()
+    # Chunk = how many future actions the model predicts at once.
     if chunk_size:
         cfg.chunk_size = int(chunk_size)
         cfg.n_action_steps = int(chunk_size)
@@ -76,11 +94,14 @@ def build_policy(
     cfg.output_features = {
         k: ft for k, ft in policy_features.items() if ft.type is FeatureType.ACTION
     }
-    # DynamicVLA recipe: load full SmolVLA checkpoint (VLM already inside).
+    # Inputs = images + 12-number state. Output = action chunk.
+    # Load the full public SmolVLA checkpoint (vision language model is already inside).
+    # Vision is frozen on purpose. Only the action expert learns.
     cfg.freeze_vision_encoder = True
     cfg.train_expert_only = True
     cfg.load_vlm_weights = False
 
+    # Start from the public SmolVLA weights when given; else random start.
     if pretrained:
         policy = SmolVLAPolicy.from_pretrained(
             pretrained_name_or_path=pretrained,
@@ -109,6 +130,7 @@ def train(args: argparse.Namespace) -> Path:
     if args.chunk_size:
         probe_cfg.chunk_size = int(args.chunk_size)
         probe_cfg.n_action_steps = int(args.chunk_size)
+    # Peek at episode 0 just to read dataset meta (fps, features).
     meta_ds = LeRobotDataset(repo_id=args.repo_id, root=root, episodes=[0])
     delta_timestamps = resolve_delta_timestamps(probe_cfg, meta_ds.meta)
     base = LeRobotDataset(
@@ -117,6 +139,8 @@ def train(args: argparse.Namespace) -> Path:
         delta_timestamps=delta_timestamps,
     )
 
+    # Look-ahead Δ + noise sizes for the 4 object numbers. Δ must match what
+    # the sim logged and what eval will use. Noise is for robustness only.
     aug = AugConfig(
         delta_min=args.delta_min,
         delta_max=args.delta_max,
@@ -124,7 +148,8 @@ def train(args: argparse.Namespace) -> Path:
         vel_noise_std=args.vel_noise_std,
         seed=args.seed,
     )
-    ds = PolicyDataset(base, model=args.model, aug=aug, apply_aug=True)
+    # Wrapper builds the 12-number state (with fresh noise) on every read.
+    ds = PolicyDataset(base, aug=aug, apply_aug=True)
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -135,12 +160,12 @@ def train(args: argparse.Namespace) -> Path:
     )
 
     policy, cfg = build_policy(
-        args.model,
         base.meta,
         device=device,
         pretrained=args.pretrained,
         chunk_size=args.chunk_size,
     )
+    # Only train weights that are not frozen.
     optim = torch.optim.AdamW(
         [p for p in policy.parameters() if p.requires_grad],
         lr=args.lr,
@@ -149,11 +174,11 @@ def train(args: argparse.Namespace) -> Path:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "model_type.txt").write_text(args.model)
+    (out_dir / "model_type.txt").write_text("model")  # small tag file, read by tools/diag
 
     step = 0
     running = 0.0
-    pbar = tqdm(total=args.steps, desc=f"train-{args.model}")
+    pbar = tqdm(total=args.steps, desc="train-smolvla")
     while step < args.steps:
         for batch in loader:
             batch = {
@@ -163,6 +188,7 @@ def train(args: argparse.Namespace) -> Path:
             loss, _ = policy.forward(batch)
             optim.zero_grad(set_to_none=True)
             loss.backward()
+            # Cap big jumps so one bad batch cannot wreck the weights.
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
             optim.step()
             running += float(loss.detach())
@@ -189,7 +215,6 @@ def train(args: argparse.Namespace) -> Path:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     p = argparse.ArgumentParser()
-    p.add_argument("--model", choices=["A", "B"], required=True)
     p.add_argument("--repo-id", type=str, required=True)
     p.add_argument("--dataset-root", type=str, required=True)
     p.add_argument("--output-dir", type=str, required=True)
@@ -205,7 +230,7 @@ def main() -> None:
     p.add_argument(
         "--policy-cfg",
         type=str,
-        default=str(FORESIGHT_ROOT / "policy" / "configs" / "smolvla_b.yaml"),
+        default=str(FORESIGHT_ROOT / "policy" / "configs" / "smolvla.yaml"),
         help="YAML for Δ / noise defaults (CLI flags override when set)",
     )
     p.add_argument("--delta-min", type=float, default=None)
@@ -221,6 +246,7 @@ def main() -> None:
     args = p.parse_args()
     from interfaces.config import policy_aug_defaults
 
+    # Any Δ / noise flag left empty is filled from the yaml.
     aug = policy_aug_defaults(args.policy_cfg)
     if args.delta_min is None:
         args.delta_min = aug["delta_min"]
@@ -230,6 +256,8 @@ def main() -> None:
         args.pos_noise_std = aug["pos_noise_std"]
     if args.vel_noise_std is None:
         args.vel_noise_std = aug["vel_noise_std"]
+    # Δ is not one of the packed numbers yet. A spread of Δ would blur the
+    # position the model sees and it could not know which Δ was used.
     if abs(float(args.delta_min) - float(args.delta_max)) > 1e-12:
         raise SystemExit(
             "delta_min must equal delta_max while Δ is not packed "

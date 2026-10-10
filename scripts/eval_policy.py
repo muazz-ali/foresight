@@ -1,18 +1,66 @@
 #!/usr/bin/env python3
-"""Test a trained policy in Isaac (Gate G1 speed sweep, Gate G2b filter swap).
+"""Test a trained policy in Isaac.
 
-Model A = no future numbers. Model B = with future numbers (constant-velocity).
-`--zero-conditioning` turns B's future numbers off (sanity check).
-`--cond-source oracle|filter` picks where those numbers come from. Default is
-oracle (simulator truth). `filter` uses the static camera + Kalman filter.
+WHAT THIS FILE DOES
+  Load a trained SmolVLA checkpoint. Drop a moving object in the sim at a few
+  belt speeds (default 0 / 10 / 15 / 20 cm/s). Let the policy try to pick it up
+  and put it in the bowl. Count how often it works at each speed.
+
+WHAT THE POLICY SEES
+  Two camera images, the hand state, and a 4-number pack: where the object
+  will be (x, y) and how fast it moves (vx, vy), looked ahead by delta seconds
+  (constant-velocity guess).
+
+  `--cond-source oracle|filter` picks where those 4 numbers come from.
+    oracle = simulator truth (default). This is Gate G1.
+    filter = static camera + Kalman filter. This is Gate G2b (filter swap).
+  `--zero-conditioning` sets the 4 numbers to all zeros. It is the sanity
+    check: if the policy really uses the numbers, success should drop a lot.
+    It cannot be mixed with `--cond-source filter`.
+
+WHAT SUCCESS LOOKS LIKE (see foresight_plan.md for the real gate text)
+  G1 needs two runs of this script on the same checkpoint:
+    (a) normal run: success stays flat from 0 to 20 cm/s (drop < 15 points).
+    (b) `--zero-conditioning` run: success at mid speed falls by >= 15 points.
+  This script only writes the per-speed table (gate_g1_report.json) and one
+  line per episode (metrics.jsonl). The pass/fail verdict is made by
+  eval/gate_g1.py, which merges the (a) and (b) reports.
+  Sample size: 20 trials per speed is a SCOUT only. You need n >= 80 per speed
+  before you claim G1 passed or failed.
+
+FAILURE LABELS (policy only)
+  The code currently stores: never-held | held-no-lift | lifted-no-place |
+  success. The plan calls the first two never-glued and glued-no-lift.
+  "Held" means welded to the hand, or the diagnostic finger hold with
+  --no-attach. Labels use the 0/1 holding log and max object height via
+  sim.success.classify_policy_failure.
+  We do not use the expert stage labels here.
+  Physics-grasp (house / throw) episodes also get a timing label
+  (eval/timing_labels.py): never-closed | off-table | aim | early | late |
+  short-close | success. Gate G3 scores those with eval/gate_g3.py.
+
+SEEDING
+  Every episode seeds python/numpy/torch from the episode seed, and the
+  SmolVLA flow-matching noise is drawn from its own seeded generator. Same
+  seed + same flags = same rollout (see --torch-deterministic for GPU kernels).
+
+TIMING OVERLAYS (Phase 3, eval-time only; all default off = old behaviour)
+  --reflex on            ReflexClose steers XY + closes in the last ~10 cm.
+                         Close time = robot.gripper_close_time_s in the config.
+  --action-buffer on     timestamped ActionBuffer: stale chunk slots are dropped.
+  --inject-latency-s L   the policy plans from an observation L s old. Buffer
+                         off: its chunk still plays from the first action (late
+                         by L). Buffer on: slots already in the past are skipped.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import inspect
 import logging
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -26,9 +74,14 @@ DEFAULT_CFG = FORESIGHT_ROOT / "sim" / "phase0_cfg.yaml"
 sys.path.insert(0, str(FORESIGHT_ROOT))
 from eval.gate_g1 import G1_SPEEDS, HIGH_M_S, MID_M_S  # noqa: E402
 
+# Default trials per speed. 20 is a scout (quick look). Use n >= 80 per speed
+# (--trials-per-speed 80) before claiming G1 pass or fail.
 G1_TRIALS = 20
 
-# --force-place scripted stages (mirrors expert carry→lower→open→home).
+# --force-place is a DEBUG helper, not part of the G1 score. After the policy
+# picks the object, a simple script (not the policy) carries it to the bowl and
+# lets go. It tests "does release/drop work?" on its own.
+# These are the script's steps (mirrors expert carry→lower→open→home).
 _FP_IDLE = 0
 _FP_CARRY = 1
 _FP_LOWER = 2
@@ -52,15 +105,15 @@ def _step_toward(current: np.ndarray, target: np.ndarray, max_step: float) -> np
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """All CLI flags. Isaac's own launcher flags (--headless etc.) are added in main()."""
     p = argparse.ArgumentParser(description="Foresight G1 closed-loop policy eval")
-    p.add_argument("--checkpoint", type=str, default="runs/p1_b/pretrained_model")
-    p.add_argument("--model", choices=["A", "B"], default="B")
-    p.add_argument("--zero-conditioning", action="store_true", help="B sanity: zero vector")
+    p.add_argument("--checkpoint", type=str, default="runs/p1/pretrained_model")
+    p.add_argument("--zero-conditioning", action="store_true", help="Sanity: zero conditioning vector")
     p.add_argument(
         "--cond-source",
         choices=["oracle", "filter"],
         default="oracle",
-        help="Where Model B's 4 numbers come from. oracle = sim truth (default). "
+        help="Where the 4 conditioning numbers come from. oracle = sim truth (default). "
         "filter = static camera + Kalman. Filter runs warm up 2 frames before the first plan.",
     )
     p.add_argument(
@@ -72,7 +125,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trials-per-speed", type=int, default=G1_TRIALS)
     p.add_argument("--speeds", type=float, nargs="+", default=list(G1_SPEEDS))
     p.add_argument("-c", "--sim_cfg_file", default=str(DEFAULT_CFG))
-    p.add_argument("-o", "--output_dir", default=str(FORESIGHT_ROOT / "data" / "p1" / "eval_b_zero"))
+    p.add_argument("-o", "--output_dir", default=str(FORESIGHT_ROOT / "data" / "p1" / "eval"))
     p.add_argument("--seed", type=int, default=9000)
     p.add_argument("--object-usd", default=None)
     p.add_argument("--container-usd", default=None)
@@ -91,12 +144,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "(default: value in checkpoint, usually 50). Plan target ~5–8 (~200 ms).",
     )
     p.add_argument(
-        "--compare-report",
-        type=str,
-        default=None,
-        help="Optional path to Model A eval report JSON for G1 margin check",
-    )
-    p.add_argument(
         "--no-attach",
         action="store_true",
         help="Diagnostic: never weld/glue the object; rely on finger close + PhysX only",
@@ -106,10 +153,43 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Diagnostic: after lift, servo to drop pose then open+freeze (tests release/drop)",
     )
+    # Phase 3 timing overlays. Defaults = old eval behaviour.
+    p.add_argument("--reflex", choices=["on", "off"], default="off",
+                   help="ReflexClose overlay in the last ~10 cm (G3 arm). Default off.")
+    p.add_argument("--action-buffer", choices=["on", "off"], default="off",
+                   help="Timestamped ActionBuffer: drop chunk slots whose time has passed.")
+    p.add_argument("--inject-latency-s", type=float, default=0.0,
+                   help="Simulated inference delay (s): plan from an observation this old.")
+    p.add_argument("--torch-deterministic", action="store_true",
+                   help="torch.use_deterministic_algorithms + cuDNN deterministic (slower).")
     return p
 
 
+def seed_episode(seed: int) -> None:
+    """Seed python, numpy and torch (CPU + every GPU) from the episode seed."""
+    random.seed(int(seed))
+    np.random.seed(int(seed) % (2**32))
+    torch.manual_seed(int(seed))
+    torch.cuda.manual_seed_all(int(seed))
+
+
+def gripper_close_time(cfg: dict) -> tuple[float, str]:
+    """One gripper close time for the whole stack: robot.gripper_close_time_s.
+
+    Missing key: fall back to ReflexClose's default and say so in the log."""
+    val = (cfg.get("robot") or {}).get("gripper_close_time_s")
+    if val is not None:
+        return float(val), "robot.gripper_close_time_s"
+    from control.reflex import ReflexClose
+
+    default = float(inspect.signature(ReflexClose).parameters["close_time"].default)
+    logging.warning("robot.gripper_close_time_s missing in sim config; using ReflexClose default %.3f s",
+                    default)
+    return default, "control.reflex default"
+
+
 def _setup_logging(output_dir: Path, *, debug: bool = False) -> None:
+    """Send logs to the screen and to <output_dir>/eval_policy.log. Called once in main()."""
     output_dir.mkdir(parents=True, exist_ok=True)
     level = logging.DEBUG if debug else logging.INFO
     fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(message)s")
@@ -127,6 +207,8 @@ def _setup_logging(output_dir: Path, *, debug: bool = False) -> None:
 
 def _as_chw_float(img: np.ndarray) -> torch.Tensor:
     """HWC uint8/float → CHW float32 in [0,1] for SmolVLA."""
+    # Sim images can be CHW or HWC, 3 or 4 channels, 0-255 or 0-1.
+    # Make them all look the same as the training images did.
     arr = np.asarray(img)
     if arr.ndim == 3 and arr.shape[0] in (3, 4) and arr.shape[-1] not in (3, 4):
         arr = np.transpose(arr, (1, 2, 0))
@@ -153,11 +235,11 @@ def _lerobot_device_tag(device: str) -> str:
 
 def load_policy(
     checkpoint: str,
-    model: str,
     device: str,
     *,
     n_action_steps: int | None = None,
 ):
+    """Load the SmolVLA checkpoint onto the GPU in eval mode. Called once in main()."""
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
     # Training may have written device=cuda:N; rewrite so from_pretrained can parse.
@@ -172,6 +254,8 @@ def load_policy(
     policy = SmolVLAPolicy.from_pretrained(checkpoint)
     # chunk_size = how many actions the net predicts per forward.
     # n_action_steps = how many of those we execute before calling the net again.
+    # Smaller n = the net looks at fresh numbers more often (replans sooner).
+    # Only override when the user passed --n-action-steps.
     if n_action_steps is not None:
         n = int(n_action_steps)
         if n < 1:
@@ -200,32 +284,38 @@ def _rgb_frame(img: np.ndarray) -> np.ndarray:
 
 
 def _hold_slide(scene) -> None:
-    """One sim step with the hand held and the object still sliding."""
+    """One sim step with the hand held and the object still sliding.
+
+    Used only by warm_filter, so the filter can watch the object move while
+    the robot waits."""
     ee, quat = scene.get_ee_pose()
     scene.set_ee_target(ee, quat, float(scene.get_gripper_open()))
     scene.step(kinematic_object=True, attach_object=False, freeze_object=False)
 
 
 def warm_filter(scene, est) -> int:
-    """Show the filter a few frames before Model B plans.
+    """Show the filter a few frames before the policy plans.
 
-    The filter's first guess has speed 0. Two frames go in before the frame B
-    uses, so that first 8-step chunk is not off by speed × 0.25 s.
+    The filter's first guess has speed 0. Two frames go in before the planning
+    frame, so that first chunk is not off by speed × Δ.
     Returns how many frames were fed before that planning frame.
+
+    Called once per episode, only when --cond-source filter (G2b).
     """
     from eval.cond_source import FILTER_WARMUP_BEFORE
 
     seen_before = 0
+    # One extra loop turn: the last frame is the planning frame itself.
     for i in range(FILTER_WARMUP_BEFORE + 1):
         _hold_slide(scene)
         state = scene.get_object_state()
         rgb = _rgb_frame(scene.get_images()["static_cam"])
         if i == 0:
-            cam = scene.cfg.get("camera", {})
+            cam = scene.cfg.get("static_camera", {})
             want_h, want_w = int(cam["height"]), int(cam["width"])
             if rgb.shape[0] != want_h or rgb.shape[1] != want_w:
                 raise RuntimeError(
-                    f"static frame is {rgb.shape[:2]}, camera config is {want_h}x{want_w}"
+                    f"static frame is {rgb.shape[:2]}, static_camera config is {want_h}x{want_w}"
                 )
             logging.info("filter warmup static frame %s", tuple(rgb.shape))
             # Spawn pose stands in for the one-shot detector (estimator.start).
@@ -241,7 +331,10 @@ def warm_filter(scene, est) -> int:
 
 
 def _filter_state_for_frame(est, rgb: np.ndarray, t: float):
-    """Update the filter on this frame once. Same time ⇒ already warmed."""
+    """Update the filter on this frame once. Same time ⇒ already warmed.
+
+    The last warmup frame was already fed in warm_filter. If we fed it again
+    the filter would see the same time twice, so we just reuse its answer."""
     t = float(t)
     if est.kf.started and abs(float(est.kf.t) - t) <= 1e-8:
         return est.kf.state(est.plane_z)
@@ -251,7 +344,6 @@ def _filter_state_for_frame(est, rgb: np.ndarray, t: float):
 def build_obs_batch(
     scene,
     *,
-    model: str,
     delta: float,
     language: str,
     device: str,
@@ -263,7 +355,13 @@ def build_obs_batch(
 ) -> tuple[dict, dict]:
     """One SmolVLA observation dict + the packs we logged.
 
-    Aux keys: cond (what B sees, or None for model A), truth, filter, valid.
+    Aux keys: cond, truth, filter, valid.
+
+    Called every sim step from run_episode_policy. "observation.state" is
+    the hand state followed by the 4-number pack (cond). That is the same
+    layout training used, so the net reads the numbers from the same slots.
+    cond is what the net sees (truth, filter, or zeros). truth is the sim
+    answer, kept beside it for logs.
     """
     from eval.cond_source import choose_pack
     from policy.convert_h5 import pack_proprio
@@ -274,19 +372,20 @@ def build_obs_batch(
     # (Fingers are snapped to this command on attach; see Phase0Scene._snap_fingers.)
     grip_cmd = float(scene.get_gripper_open())
     state = pack_proprio(ee_pos, ee_quat, grip_cmd)
-    aux: dict = {"cond": None, "truth": None, "filter": None, "valid": None}
+    obj = scene.get_object_state() if oracle_state is None else oracle_state
+    # choose_pack decides the 4 numbers: sim truth (oracle), camera filter,
+    # or all zeros (--zero-conditioning). The images and hand state do not change
+    # in the zero path; only these 4 numbers are wiped.
+    aux = choose_pack(
+        source=cond_source,
+        oracle_state=obj,
+        filter_state=filter_state,
+        delta=delta,
+        zero=zero_conditioning,
+    )
+    state = np.concatenate([state, aux["cond"]], axis=0).astype(np.float32)
 
-    if model == "B":
-        obj = scene.get_object_state() if oracle_state is None else oracle_state
-        aux = choose_pack(
-            source=cond_source,
-            oracle_state=obj,
-            filter_state=filter_state,
-            delta=delta,
-            zero=zero_conditioning,
-        )
-        state = np.concatenate([state, aux["cond"]], axis=0).astype(np.float32)
-
+    # Add a batch dimension of 1. The task text ends with a newline, as in training.
     batch = {
         "observation.state": torch.as_tensor(state, device=device).unsqueeze(0),
         "observation.images.static_cam": _as_chw_float(imgs["static_cam"]).unsqueeze(0).to(device),
@@ -297,7 +396,10 @@ def build_obs_batch(
 
 
 def action_to_ee(action: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    """Unpack policy action → (pos3, quat_wxyz4, gripper_open01)."""
+    """Unpack policy action → (pos3, quat_wxyz4, gripper_open01).
+
+    Net output is 8 numbers: hand x,y,z, hand turn (4), gripper. Gripper above
+    0.5 means open, otherwise closed. Called once per sim step."""
     a = np.asarray(action, dtype=np.float64).reshape(-1)
     pos = a[0:3]
     quat = a[3:7]
@@ -317,7 +419,6 @@ def run_episode_policy(
     *,
     seed: int,
     speed: float,
-    model: str,
     delta: float,
     device: str,
     zero_conditioning: bool,
@@ -328,14 +429,30 @@ def run_episode_policy(
     n_action_steps: int | None = None,
     no_attach: bool = False,
     force_place: bool = False,
+    reflex_on: bool = False,
+    action_buffer_on: bool = False,
+    inject_latency_s: float = 0.0,
+    close_time: tuple[float, str] | None = None,
 ) -> tuple[dict, dict]:
-    """Closed-loop policy rollout. Logs the same arrays as expert collect."""
+    """Closed-loop policy rollout. Logs the same arrays as expert collect.
+
+    Called once per trial by eval_speed_bin. Returns (episode arrays, meta).
+    The policy supplies an action every step (often from its queued chunk).
+    This function only adds the
+    "glue" rules around it (see the attach comments in the loop).
+    """
     from policy.features import default_language
 
+    # Zero-out is an oracle-only check. Mixing it with the filter would mean
+    # nothing, so stop early.
     if zero_conditioning and cond_source == "filter":
         raise ValueError("Pass only one of --zero-conditioning / --cond-source filter")
 
+    # Same seed + same speed = same start. That makes runs repeatable.
     meta = scene.reset_episode(seed=seed, speed=speed)
+    # Same seed = same policy noise too (SmolVLA samples noise every replan).
+    seed_episode(seed)
+    meta["policy_seed"] = int(seed)
     language = default_language(meta.get("category"), meta.get("container_category"))
     meta["language"] = language
     meta["no_attach"] = bool(no_attach)
@@ -344,7 +461,54 @@ def run_episode_policy(
     meta["checkpoint"] = checkpoint
     meta["n_action_steps"] = None if n_action_steps is None else int(n_action_steps)
     meta["delta"] = float(delta)
+    # House / throw default: real PhysX grasp (attach frees the object, no weld).
+    physics_grasp = not bool(getattr(scene, "weld_grasp", True))
+    meta["grasp_mode"] = "physics" if physics_grasp else "weld"
+    # --force-place is a weld-era debug helper; skip it on physics grasps.
+    if physics_grasp and force_place:
+        logging.warning("physics grasp: ignoring --force-place (no weld to script-place)")
+        force_place = False
+        meta["force_place"] = False
 
+    # ----- Phase 3 overlays (explicit flags only; config use_reflex is for collect) -----
+    from collections import deque
+
+    from control import ActionBuffer, ReflexClose
+
+    dt = float(scene.dt)
+    lat_steps = int(round(float(inject_latency_s) / dt))
+    if abs(lat_steps * dt - float(inject_latency_s)) > 1e-6:
+        logging.warning("inject latency %.3f s rounded to %d steps (%.3f s)",
+                        inject_latency_s, lat_steps, lat_steps * dt)
+    if close_time is None:
+        close_time = gripper_close_time(scene.cfg)
+    reflex = None
+    if reflex_on:
+        if not physics_grasp:
+            logging.warning("--reflex on in weld mode: reflex close feeds the weld latch")
+        reflex = ReflexClose(close_time=float(close_time[0]), radius=0.10, vmax=0.5)
+        reflex.reset()
+    action_buf = ActionBuffer(max_age=0.20) if action_buffer_on else None
+    # Physics-rate reflex when the scene offers a per-substep hook.
+    substep_ok = "substep_cb" in inspect.signature(scene.step).parameters
+    meta["overlays"] = {
+        "reflex": bool(reflex_on),
+        "reflex_rate": (None if reflex is None else ("substep" if substep_ok else "control_step")),
+        "action_buffer": bool(action_buffer_on),
+        "inject_latency_s": float(inject_latency_s),
+        "latency_steps": lat_steps,
+        "gripper_close_time_s": float(close_time[0]),
+        "gripper_close_time_source": close_time[1],
+    }
+    meta["reflex"] = bool(reflex_on)
+    meta["action_buffer"] = bool(action_buffer_on)
+    reflex_close_t = None  # sim time the reflex first forced a close
+    reflex_owns_grip = False  # reflex closed; policy has not asked to close yet
+    reflex_engaged = False  # the current reflex close was already handled
+    reflex_close_t_list: list = []  # earlier reflex closes that slipped
+    n_hold_steps = 0  # buffer on: steps with no due action (held the last one)
+
+    # Only the filter arm (G2b) needs a camera tracker + Kalman filter.
     est = None
     if cond_source == "filter":
         from perception.estimator import StaticCamEstimator
@@ -352,6 +516,9 @@ def run_episode_policy(
         est = StaticCamEstimator.from_cfg(scene.cfg)
         meta["filter_warmup_frames"] = warm_filter(scene, est)
 
+    # One list per thing we record, one entry per sim step. Same names as the
+    # expert collect files so the same tools can read both.
+    # "holding" is the 0/1 glue flag. Failure labels are built from it.
     log: dict[str, list] = {
         "holding": [],
         "object_pos": [],
@@ -375,17 +542,26 @@ def run_episode_policy(
     if save_images:
         log["static_cam_rgb"] = []
         log["wrist_cam_rgb"] = []
+    # Clear the old action queue from the last trial.
     policy.reset()
-    attached = False
+    # Our own plan queue (replaces LeRobot's ACTION queue so we can delay and
+    # re-time chunks). With no overlays it plays exactly like select_action.
+    n_exec = int(policy.config.n_action_steps)
+    plan: deque = deque()  # buffer off: actions in play order
+    obs_hist: deque = deque(maxlen=lat_steps + 1)  # oldest = obs L seconds ago
+    noise_gen = torch.Generator(device=device).manual_seed(int(seed))
+    noise_shape = (1, int(policy.config.chunk_size), int(policy.config.max_action_dim))
+    last_act = None
+    # --- glue state (all reset each episode) ---
+    attached = False  # object is welded to the hand ("glued")
     gripping = False  # --no-attach: fingers closed near object (physics hold)
     placed = False  # opened after a hold (release/place done)
-    lift_frames = 0
+    lift_frames = 0  # steps spent holding the object above 12 cm
     close_dwell = 0  # frames closed+near before attach (smooth pick)
-    fp_stage = _FP_IDLE
+    fp_stage = _FP_IDLE  # --force-place step (debug only)
     fp_timer = 0
-    # LeRobot ACTION queue: empty ⇒ select_action runs a forward; else pops queued action.
-    from lerobot.constants import ACTION
-
+    # Fixed spots for the debug place script (bowl drop point, carry height, home).
+    # Unused unless --force-place.
     drop_pos = np.asarray(scene.get_drop_target(), dtype=np.float64).reshape(3)
     carry_pose = np.asarray(scene.get_carry_pose(), dtype=np.float64).reshape(-1)
     place_xy = carry_pose[:2].copy()
@@ -402,10 +578,21 @@ def run_episode_policy(
     if down_quat.size != 4:
         down_quat = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
 
+    # ===== MAIN EPISODE LOOP =====
+    # One turn = one sim step (25 Hz):
+    #   1. read cameras + object   
+    #   2. build the 4-number pack
+    #   3. ask the policy for an action   
+    #   4. apply glue rules
+    #   5. step the sim   
+    #   6. log everything
     for t in range(n_steps):
-        will_replan = len(policy._queues[ACTION]) == 0
+        # Empty plan means the net runs this step.
+        will_replan = (len(action_buf) == 0) if action_buf is not None else (len(plan) == 0)
         imgs = scene.get_images()
         oracle_now = scene.get_object_state()
+        # Filter arm: feed this frame to the camera filter so it can give us
+        # its guess. Oracle and zero arms skip this (filt_state stays None).
         filt_state = None
         if est is not None:
             filt_state = _filter_state_for_frame(
@@ -415,7 +602,6 @@ def run_episode_policy(
             )
         batch, aux = build_obs_batch(
             scene,
-            model=model,
             delta=delta,
             language=language,
             device=device,
@@ -425,23 +611,77 @@ def run_episode_policy(
             oracle_state=oracle_now,
             filter_state=filt_state,
         )
-        cond = aux["cond"]
-        with torch.inference_mode():
-            act = policy.select_action(batch)
-        act_np = act[0].detach().cpu().numpy()
-        pos, quat, grip = action_to_ee(act_np)
+        # Latency: the policy plans from the observation lat_steps ago
+        # (clamped to the first frame at episode start). L=0: this frame.
+        obs_hist.append((batch, aux))
+        batch_used, aux_used = obs_hist[0]
+        # cond = the 4 numbers the net sees (zeros in --zero-conditioning).
+        cond = aux_used["cond"]
+        now_k = t * dt  # step clock for the buffer (the plan's obs is lat_steps older)
+        if will_replan:
+            # Seeded flow-matching noise (else LeRobot draws torch.normal unseeded).
+            noise = torch.randn(noise_shape, generator=noise_gen, device=device)
+            with torch.inference_mode():
+                chunk = policy.predict_action_chunk(batch_used, noise=noise)
+            chunk = chunk[0, :n_exec].detach().cpu().numpy().astype(np.float64)
+            if action_buf is not None:
+                # Action i was meant for obs time + i*dt. Slots already past are dropped.
+                action_buf.push_chunk(chunk, t0=now_k - lat_steps * dt, dt=dt, now=now_k - 1e-6)
+            else:
+                plan.extend(chunk)  # play from the first action, however stale
+        if action_buf is not None:
+            act_np = action_buf.pop_due(now_k + 1e-6)
+            if act_np is None:  # everything was stale: hold the last command
+                n_hold_steps += 1
+                if last_act is None:
+                    ee0, q0 = scene.get_ee_pose()
+                    last_act = np.concatenate([ee0, q0, [float(scene.get_gripper_open())]])
+                act_np = last_act
+        else:
+            act_np = plan.popleft()
+        last_act = np.asarray(act_np, dtype=np.float64).reshape(-1)
+        now_t = float(oracle_now.timestamp)
+        pos, quat, grip = action_to_ee(last_act)
 
-        # Grasp latch: close near object → attach (or physics grip if --no-attach).
+        # ----- GLUE (grasp latch) -----
+        # Weld mode (G1/G2 bounce box): close near object → weld attach.
+        # Physics mode (Phase 3 throw): close near object → free to PhysX (no weld).
+        # --no-attach: never set attach; finger contact only.
         obj = scene.get_object_state()
         ee, ee_q = scene.get_ee_pose()
         dist = float(np.linalg.norm(ee - obj.position))
         want_close = grip < 0.5
 
+        # Reflex (control rate): steer XY at the meeting point, close on time-to-arrival.
+        # Uses the filter state when there is one, else sim truth. A close stays latched.
+        ref_state = filt_state if filt_state is not None else obj
+        reflex_live = reflex is not None and not attached and not placed
+        if reflex_live:
+            rout = reflex.step(ref_state, ee, max(now_t, float(ref_state.timestamp)))
+            if rout.active:
+                pos = np.asarray(pos, dtype=np.float64).reshape(3).copy()
+                pos[0], pos[1] = float(rout.target[0]), float(rout.target[1])
+        # Hand-over: the reflex holds the gripper shut until the policy itself
+        # asks to close once; then the policy owns the gripper again (so it can release).
+        if reflex is not None and reflex.closed and not reflex_engaged:
+            reflex_engaged = True
+            reflex_owns_grip = True
+            if reflex_close_t is None:
+                reflex_close_t = now_t
+        if reflex_owns_grip and want_close:
+            reflex_owns_grip = False
+        if reflex_owns_grip and not placed:
+            grip = 0.0
+            want_close = True
+
+        # Count steps where we hold it above 12 cm. Only --force-place uses
+        # this count, to know the lift is real before it starts carrying.
         holding_now = attached if not no_attach else gripping
         if holding_now and float(obj.position[2]) >= 0.12:
             lift_frames += 1
 
-        # Smooth pick: short closed+near dwell before welding (avoid instant snap).
+        # Smooth pick: short closed + near dwell before welding (avoid instant snap).
+        # Close within 5 cm for 1 step (3 steps in --force-place) to glue.
         attach_dist = 0.05
         attach_dwell_need = 3 if force_place else 1
         if want_close and dist < attach_dist and not attached and not placed:
@@ -449,7 +689,11 @@ def run_episode_policy(
         else:
             close_dwell = 0
 
-        # Scripted place: carry → lower → unglue → open → home.
+        # ----- DEBUG ONLY: --force-place -----
+        # Why: separates "can the policy pick?" from "does release work?".
+        # Once the policy has glued and lifted, a script takes over the hand
+        # and overrides pos/quat/grip. Steps: carry → lower → unglue → open → home.
+        # Not used in a normal G1 run.
         # Waypoints are full targets (DiffIK smooths). Soft-step only right after attach.
         if force_place and not no_attach:
             if fp_stage == _FP_IDLE and attached:
@@ -543,7 +787,14 @@ def run_episode_policy(
                         logging.info("force-place: done at home")
                     fp_stage = _FP_DONE
 
+        # ----- Turn the glue decision into 3 flags for the sim step -----
+        #   kin    = object slides on its belt path (not yet held, not placed)
+        #   attach = weld hand (legacy) OR free-to-PhysX close (physics grasp)
+        #   freeze = park object after release (weld mode only; physics ignores it)
+        # holding_log is the 0/1 value saved in log["holding"].
         if no_attach:
+            # Diagnostic path: never set attach. "gripping" = hand closed within 5 cm.
+            # Let go if the hand opens or the object slips >10 cm away.
             if (not placed) and (not gripping) and want_close and dist < attach_dist:
                 if close_dwell >= attach_dwell_need:
                     gripping = True
@@ -558,6 +809,8 @@ def run_episode_policy(
             kin = (not gripping) and (not freeze)
             holding_log = float(gripping)
         else:
+            # Close near the object → attach_flag. Weld mode glues; physics mode
+            # frees the object to PhysX with fingers closed (scene decides).
             if (
                 (not placed)
                 and (not attached)
@@ -572,22 +825,59 @@ def run_episode_policy(
             elif (not force_place) and attached and not want_close:
                 attached = False
                 placed = True
+            # Physics: slip if the object flees while we still command close.
+            if physics_grasp and attached and dist > 0.10 and want_close:
+                logging.info("physics slip at t=%d dist=%.3f m", t, dist)
+                attached = False
+                if reflex is not None:  # lost it: let the reflex try again
+                    reflex.reset()
+                    reflex_owns_grip = False
+                    reflex_engaged = False
+                    reflex_close_t_list.append(reflex_close_t)
+                    reflex_close_t = None
             attach_flag = bool(attached)
-            # Freeze once unglued/placed so the object stays in the bowl (no wobble).
             freeze = bool(
-                (placed and not attached)
-                or (force_place and fp_stage >= _FP_UNGLUE and not attached)
+                (not physics_grasp)
+                and (
+                    (placed and not attached)
+                    or (force_place and fp_stage >= _FP_UNGLUE and not attached)
+                )
             )
             kin = (not attached) and (not freeze)
             holding_log = float(attached)
 
+        # Send the hand target to the robot and advance the sim one step.
         scene.set_ee_target(pos, quat, grip)
+        step_kw = {}
+        if reflex_live and substep_ok:
+            # Physics-rate reflex: re-aim (and maybe close) before every physics substep.
+            # Contract (sim/scene.py): only set_ee_target / get_* / release_object here.
+            def _reflex_substep(sc, t_sim, _ref=ref_state, _pos=np.asarray(pos, dtype=np.float64),
+                                _quat=quat, _grip=grip):
+                nonlocal reflex_close_t
+                ee_now, _ = sc.get_ee_pose()
+                out = reflex.step(_ref, ee_now, max(float(t_sim), float(_ref.timestamp)))
+                if not out.active:
+                    return
+                p = _pos.reshape(3).copy()
+                p[0], p[1] = float(out.target[0]), float(out.target[1])
+                if out.close and reflex_close_t is None:
+                    reflex_close_t = float(t_sim)
+                sc.set_ee_target(p, _quat, 0.0 if out.close else _grip)
+                # Physics grasp: closing mid-step must also stop the scripted coast,
+                # else the object is teleported through the closing fingers.
+                if out.close and physics_grasp and hasattr(sc, "release_object"):
+                    sc.release_object()
+
+            step_kw["substep_cb"] = _reflex_substep
         scene.step(
             kinematic_object=kin,
             attach_object=attach_flag,
             freeze_object=freeze,
+            **step_kw,
         )
 
+        # ----- Record what happened this step (state AFTER the sim step) -----
         st = scene.get_object_state()
         ee, ee_quat = scene.get_ee_pose()
         log["holding"].append(holding_log)
@@ -606,8 +896,10 @@ def run_episode_policy(
             ctr[0].copy() if ctr is not None else np.full(3, np.nan)
         )
         log["policy_replan"].append(1 if will_replan else 0)
+        # Log the exact 4 numbers the net saw (so a zero run shows all zeros).
         if cond is not None:
             log["conditioning"].append(np.asarray(cond, dtype=np.float64).copy())
+        # Filter arm only: also log truth vs filter guess, to score the filter.
         if aux["truth"] is not None and est is not None:
             log["truth_pack"].append(np.asarray(aux["truth"], dtype=np.float64).copy())
             filt = aux["filter"]
@@ -616,11 +908,14 @@ def run_episode_policy(
             )
             log["filter_valid"].append(float(aux["valid"] if aux["valid"] is not None else 0.0))
             log["filter_redetect_counts"].append(int(est.n_redetects))
+        # Images are big. Only keep them in --debug (for the MP4).
         if save_images:
             imgs = scene.get_images()
             log["static_cam_rgb"].append(imgs["static_cam"])
             log["wrist_cam_rgb"].append(imgs["wrist_cam"])
 
+    # ----- After the loop: turn lists into arrays and check shapes -----
+    # A wrong shape here means a logging bug. Stop loudly instead of saving bad data.
     episode = {k: np.asarray(v) for k, v in log.items() if len(v)}
     t_len = int(episode["object_pos"].shape[0])
     assert episode["object_pos"].shape == (t_len, 3), episode["object_pos"].shape
@@ -647,7 +942,16 @@ def run_episode_policy(
     meta["delta"] = float(delta)
     meta["n_replans"] = int(episode["policy_replan"].sum())
     meta["placed_released"] = bool(placed)
-    if model == "B" and episode["conditioning"].size:
+    meta["reflex_close_t"] = reflex_close_t
+    meta["reflex_close_t_slipped"] = reflex_close_t_list
+    meta["n_hold_steps"] = int(n_hold_steps)
+    meta["off_table"] = bool(getattr(scene, "off_table", False))
+    meta["table_z"] = float(getattr(scene, "_table_z", 0.0))
+    meta["dt"] = dt
+    # Summary of the 4 numbers. "all_zero" is the quick proof that a
+    # --zero-conditioning run really fed zeros (and a normal run did not).
+    # "_replan" versions look only at steps where the net actually ran.
+    if episode.get("conditioning", np.array([])).size:
         c = episode["conditioning"]
         replan = episode["policy_replan"].astype(bool)
         c_replan = c[replan] if replan.any() else c
@@ -663,6 +967,8 @@ def run_episode_policy(
             "l2_mean_replan": float(np.linalg.norm(c_replan, axis=1).mean()),
             "all_zero": bool(np.allclose(c, 0.0)),
         }
+    # Filter arm only: how far was the filter's guess from sim truth (x,y, in cm)?
+    # This tells us if a G2b drop comes from a bad filter or from the policy.
     if est is not None and "filter_pack" in episode and "truth_pack" in episode:
         err_m = np.linalg.norm(
             episode["filter_pack"][:, :2] - episode["truth_pack"][:, :2], axis=1
@@ -705,7 +1011,12 @@ def run_episode_policy(
 
 
 def episode_success_policy(episode: dict, carry_pose: np.ndarray | None = None) -> bool:
-    """Policy success (no expert stages): lift + high z or near bowl."""
+    """Policy success (no expert stages): lift + high z or near bowl.
+
+    Plain words: the object went above 12 cm AND it ended either still above
+    10 cm or within 12 cm (x,y) of the bowl. Called once per trial.
+    When carry_pose is given, the final XY distance to it is also checked.
+    Whether the object was held is handled by the failure label, not here."""
     from sim.success import episode_diagnostics
 
     diag = episode_diagnostics(episode)
@@ -718,10 +1029,25 @@ def episode_success_policy(episode: dict, carry_pose: np.ndarray | None = None) 
     return bool(lifted and placed)
 
 
+def episode_timing(episode: dict, meta: dict, success: bool) -> dict:
+    """Timing label + closest approach + pre-grasp smoothness (eval/timing_labels.py)."""
+    from eval.timing_labels import timing_label
+
+    return timing_label(
+        ee_pos=episode["ee_pos"],
+        object_pos=episode["object_pos"],
+        gripper=episode["gripper"],
+        holding=episode.get("holding"),
+        success=bool(success),
+        dt=float(meta.get("dt", 0.04)),
+        table_z=float(meta.get("table_z", 0.0)),
+        off_table_flag=bool(meta.get("off_table", False)),
+    )
+
+
 def _save_conditioning_trace(
     out_dir: Path,
     *,
-    model: str,
     speed: float,
     seed: int,
     episode: dict,
@@ -730,7 +1056,10 @@ def _save_conditioning_trace(
     success: bool,
     failure: str,
 ) -> Path | None:
-    """Write lightweight JSON + H5 (same arrays as collect)."""
+    """Write lightweight JSON + H5 (same arrays as collect).
+
+    One pair of files per trial, so we can replay what the net saw and did.
+    Called by eval_speed_bin unless --no-save-conditioning."""
     from sim.collect import episode_for_json, write_episode_h5
 
     extra = {
@@ -746,7 +1075,7 @@ def _save_conditioning_trace(
         ),
         "force_place": np.asarray([int(bool(meta.get("force_place")))], dtype=np.int8),
     }
-    h5_path = out_dir / f"eval_{model}_v{speed:.2f}_s{seed}_cond.h5"
+    h5_path = out_dir / f"eval_model_v{speed:.2f}_s{seed}_cond.h5"
     write_episode_h5(h5_path, episode, extra=extra)
 
     n_frames = int(np.asarray(episode["object_pos"]).shape[0]) if "object_pos" in episode else 0
@@ -756,7 +1085,7 @@ def _save_conditioning_trace(
         "robot": "franka",
         "success": bool(success),
         "failure": failure,
-        "model": model,
+        "model": "model",
         "n_frames": n_frames,
         "delta": float(meta["delta"]),
         "zero_conditioning": bool(zero_conditioning),
@@ -769,24 +1098,42 @@ def _save_conditioning_trace(
         "filter_valid_rate": meta.get("filter_valid_rate"),
         "filter_vs_truth": meta.get("filter_vs_truth"),
         "h5": str(h5_path),
+        "grasp_mode": meta.get("grasp_mode"),
+        "policy_seed": meta.get("policy_seed"),
+        "overlays": meta.get("overlays"),
+        "reflex_close_t": meta.get("reflex_close_t"),
+        "reflex_close_t_slipped": meta.get("reflex_close_t_slipped"),
+        "n_hold_steps": meta.get("n_hold_steps"),
+        "off_table": meta.get("off_table"),
+        "timing": meta.get("timing"),
         **{k: meta[k] for k in ("max_stage", "z_max", "z_end", "z_min") if k in meta},
         **episode_for_json(episode),
     }
-    side_path = out_dir / f"eval_{model}_v{speed:.2f}_s{seed}_cond.json"
+    side_path = out_dir / f"eval_model_v{speed:.2f}_s{seed}_cond.json"
     side_path.write_text(json.dumps(side, indent=2, default=str))
     return h5_path
 
 
 def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dict:
+    """Run all trials for ONE belt speed. Called once per speed from main().
+
+    For each trial: run the episode, score it, give it the code's policy label
+    (never-held | held-no-lift | lifted-no-place | success), append one
+    line to metrics.jsonl. Returns the speed's success rate.
+    n = --trials-per-speed. 20 is a scout. Use n >= 80 to claim G1.
+    """
     from sim.success import classify_policy_failure, episode_diagnostics
 
     n = int(args.trials_per_speed)
+    # Each speed gets its own seed range, and each trial adds 1.
+    # Different speeds never reuse the same start. Reruns repeat exactly.
     seed = int(args.seed) + int(round(speed * 1000))
     successes = 0
     t0 = time.time()
     device = args._device
     from sim.state_machine import inference_window_steps
 
+    # Time limit per trial, in sim steps, from the config.
     n_steps = inference_window_steps(scene.cfg, scene.dt)
     if bool(getattr(args, "force_place", False)):
         # Carry→lower→unglue→open→home needs more than a pick-only window.
@@ -795,8 +1142,13 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
     save_cond = bool(getattr(args, "save_conditioning", True))
     out_dir = Path(args.output_dir)
 
+    # ===== TRIAL LOOP =====
+    # One turn = one trial at this speed. The same --zero-conditioning /
+    # --cond-source setting applies to every trial in the run.
     for i in range(n):
-        logging.info("eval model=%s speed=%.2f trial %d/%d seed=%d", args.model, speed, i + 1, n, seed)
+        logging.info("eval speed=%.2f trial %d/%d seed=%d", speed, i + 1, n, seed)
+        # A crashed trial counts as a failure (ok=False) and is logged with
+        # the full error. It still counts in n, so the rate is not inflated.
         try:
             n_act = args.n_action_steps
             if n_act is None:
@@ -806,7 +1158,6 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
                 policy,
                 seed=seed,
                 speed=speed,
-                model=args.model,
                 delta=float(args.delta),
                 device=device,
                 zero_conditioning=bool(args.zero_conditioning),
@@ -817,6 +1168,10 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
                 save_images=save_images,
                 no_attach=bool(getattr(args, "no_attach", False)),
                 force_place=bool(getattr(args, "force_place", False)),
+                reflex_on=getattr(args, "reflex", "off") == "on",
+                action_buffer_on=getattr(args, "action_buffer", "off") == "on",
+                inject_latency_s=float(getattr(args, "inject_latency_s", 0.0)),
+                close_time=getattr(args, "_close_time", None),
             )
             ok = episode_success_policy(episode, carry_pose=np.asarray(meta.get("carry_pose")))
         except Exception as ex:
@@ -827,20 +1182,26 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
 
         if ok:
             successes += 1
+        # diag = max/end/min object height etc., logged so a label can be checked.
         diag = episode_diagnostics(episode if episode else None)
         holding = None
         if episode:
             holding = episode.get("holding")
+        # Policy label from the 0/1 holding log + max object height:
+        #   never held → never-held; held but z_max < 12 cm → held-no-lift;
+        #   lifted but not in bowl → lifted-no-place; else success.
         tax = classify_policy_failure(
             success=ok,
             holding=holding,
             object_z_max=diag["z_max"],
         )
+        # Physics grasp (throw): timing label from the logged tracks.
+        if episode and meta.get("grasp_mode") == "physics":
+            meta["timing"] = episode_timing(episode, meta, ok)
         cond_path = None
         if save_cond and episode:
             cond_path = _save_conditioning_trace(
                 out_dir,
-                model=args.model,
                 speed=speed,
                 seed=seed,
                 episode=episode,
@@ -849,12 +1210,14 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
                 success=ok,
                 failure=tax,
             )
+        # One line per trial. Settings are stored with each line so a
+        # normal run and a zero-conditioning run can be told apart later.
         rec = {
             "speed_m_s": speed,
             "seed": seed,
             "success": ok,
             "failure": tax,
-            "model": args.model,
+            "model": "model",
             "zero_conditioning": bool(args.zero_conditioning),
             "cond_source": str(args.cond_source),
             "checkpoint": str(args.checkpoint),
@@ -868,25 +1231,36 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
             "filter_vs_truth": meta.get("filter_vs_truth"),
             "placed_released": meta.get("placed_released"),
             "n_replans": meta.get("n_replans"),
+            "grasp_mode": meta.get("grasp_mode"),
+            "policy_seed": meta.get("policy_seed"),
+            "overlays": meta.get("overlays"),
+            "reflex_close_t": meta.get("reflex_close_t"),
+            "n_hold_steps": meta.get("n_hold_steps"),
+            "off_table": meta.get("off_table"),
+            "timing": meta.get("timing"),
             **diag,
         }
         if meta.get("conditioning_debug"):
             rec["conditioning_debug"] = meta["conditioning_debug"]
         if cond_path is not None:
             rec["h5"] = str(cond_path)
+        # Append right away so a crash later does not lose finished trials.
         with open(metrics_path, "a") as fp:
             fp.write(json.dumps(rec) + "\n")
 
+        # --debug only: one stitched video per trial. File name has ok or the label.
         if save_images and episode:
             from sim.video import write_debug_mp4
 
-            fps = int(scene.cfg.get("camera", {}).get("fps", 25))
+            fps = int(scene.cfg.get("static_camera", {}).get("fps", 25))
             tag = "ok" if ok else tax
-            mp4 = out_dir / f"eval_{args.model}_v{speed:.2f}_s{seed}_{tag}.mp4"
+            mp4 = out_dir / f"eval_model_v{speed:.2f}_s{seed}_{tag}.mp4"
             write_debug_mp4(episode, mp4, fps=fps)
 
         seed += 1
 
+    # Summary row for this speed. These rows become the G1 table.
+    # Only a rate; no confidence range here. With n=20 it is a scout.
     elapsed = time.time() - t0
     rate = successes / n if n else 0.0
     return {
@@ -899,7 +1273,12 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
 
 
 def build_g1_report(summaries: list[dict], args, wall: float) -> dict:
-    """Partial G1 table for one arm (full pass/fail is eval/gate_g1.py)."""
+    """Partial G1 table for one arm (full pass/fail is eval/gate_g1.py).
+
+    "Arm" = one run of this script (normal, or --zero-conditioning, or filter).
+    Called once at the end of main(). With --cond-source filter the report
+    is tagged G2b instead of G1.
+    """
     by_speed = {s["speed_m_s"]: s for s in summaries}
     rate0 = by_speed.get(0.0, {}).get("success_rate")
     rate_hi = by_speed.get(HIGH_M_S, {}).get("success_rate")
@@ -907,63 +1286,66 @@ def build_g1_report(summaries: list[dict], args, wall: float) -> dict:
     if rate_mid is None:
         rate_mid = by_speed.get(HIGH_M_S, {}).get("success_rate")
 
+    # "Flat" = success at 20 cm/s is less than 15 points below success at 0 cm/s.
+    # This is a point guess. It is only trustworthy with n >= 80 per speed.
     flat_ok = None
     if rate0 is not None and rate_hi is not None:
         flat_ok = (rate0 - rate_hi) < MID_M_S
 
-    compare = None
-    margin_ok = None
-    if args.compare_report:
-        other = json.loads(Path(args.compare_report).read_text())
-        other_mid = None
-        for s in other.get("summaries", []):
-            if abs(s["speed_m_s"] - MID_M_S) < 1e-9 or abs(s["speed_m_s"] - HIGH_M_S) < 1e-9:
-                other_mid = s["success_rate"]
-                if abs(s["speed_m_s"] - MID_M_S) < 1e-9:
-                    break
-        if other_mid is not None and rate_mid is not None:
-            margin = rate_mid - other_mid
-            margin_ok = margin >= HIGH_M_S
-            compare = {"other_mid_rate": other_mid, "this_mid_rate": rate_mid, "margin": margin}
-
-    # Zero-out sanity is a separate run; recorded via flag.
+    # Zero-out sanity is a separate run; full G1 is eval/gate_g1.py.
     report = {
         "gate": "G2b" if args.cond_source == "filter" else "G1",
-        "model": args.model,
+        "model": "model",
         "zero_conditioning": bool(args.zero_conditioning),
         "cond_source": args.cond_source,
         "delta": float(args.delta) if args.delta is not None else None,
         "force_place": bool(args.force_place),
         "checkpoint": args.checkpoint,
         "criterion": {
-            "B_beats_A_mid_ge": HIGH_M_S,
-            "B_flat_drop_0_to_20_lt": MID_M_S,
+            "model_flat_drop_0_to_20_lt": MID_M_S,
             "mid_speed_m_s": MID_M_S,
         },
         "summaries": summaries,
         "flat_pass": flat_ok,
-        "margin_vs_A": compare,
-        "margin_pass": margin_ok,
         "wall_time_s": wall,
         "n_action_steps": (
             int(args.n_action_steps)
             if args.n_action_steps is not None
             else None
         ),
+        "overlays": {
+            "reflex": args.reflex,
+            "action_buffer": args.action_buffer,
+            "inject_latency_s": float(args.inject_latency_s),
+            "gripper_close_time_s": (getattr(args, "_close_time", None) or (None,))[0],
+        },
+        "seed": int(args.seed),
     }
-    if args.model == "B" and not args.zero_conditioning:
+    # Only the normal run claims a "flat" check. The zero-out run is the
+    # control, so it carries no partial verdict.
+    if not args.zero_conditioning:
         report["gate_g1_partial"] = {
             "flat_pass": flat_ok,
-            "margin_pass": margin_ok,
-            "note": "Full G1 needs Model A compare report + zero-out collapse check",
+            "note": "Full G1 needs model-zero run + eval/gate_g1.py (zero-out collapse)",
         }
     return report
 
 
 def main() -> None:
+    """Entry point. Start Isaac, load scene + policy, sweep speeds, write report.
+
+    Output files in --output_dir: metrics.jsonl (one line per trial),
+    gate_g1_report.json (one row per speed), eval_policy.log, and per-trial
+    .h5/.json (+ .mp4 with --debug).
+    """
     print("[foresight] G1 eval — starting AppLauncher…", flush=True)
+    if "--torch-deterministic" in sys.argv:
+        # cuBLAS reads this once, at first CUDA use (Isaac starts CUDA next).
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     from isaaclab.app import AppLauncher
 
+    # Isaac must start BEFORE we import sim code that needs omni/isaaclab.
+    # That is why the sim imports below sit after AppLauncher(args).
     sys.argv = [a for a in sys.argv if a != ""]
     parser = _build_parser()
     AppLauncher.add_app_launcher_args(parser)
@@ -973,9 +1355,8 @@ def main() -> None:
 
     if args.cond_source == "filter" and bool(args.zero_conditioning):
         raise SystemExit("Choose only one of --zero-conditioning / --cond-source filter")
-    if args.cond_source == "filter" and args.model != "B":
-        raise SystemExit("--cond-source filter is for model B")
 
+    # Cameras must be on or the images are black.
     args.enable_cameras = True
     app_launcher = AppLauncher(args)
     out_dir = Path(args.output_dir)
@@ -983,14 +1364,23 @@ def main() -> None:
 
     device = getattr(args, "device", None) or ("cuda:0" if torch.cuda.is_available() else "cpu")
     args._device = device
+    if args.torch_deterministic:
+        # Deterministic GPU kernels (env var for cuBLAS was set before AppLauncher).
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     from interfaces.config import conditioning_delta_s
     from sim.scene import Phase0Scene, load_cfg
 
     cfg = load_cfg(args.sim_cfg_file)
+    # Look-ahead delta must match training. Default comes from the config file.
     if args.delta is None:
         args.delta = conditioning_delta_s(cfg)
     logging.info("eval conditioning Δ=%.3f s (from %s)", args.delta, args.sim_cfg_file)
+    args._close_time = gripper_close_time(cfg)
+    logging.info("overlays: reflex=%s action_buffer=%s latency=%.3f s gripper_close_time=%.3f s (%s)",
+                 args.reflex, args.action_buffer, args.inject_latency_s, *args._close_time)
     if getattr(args, "device", None):
         cfg.setdefault("sim", {})["device"] = args.device
 
@@ -1003,15 +1393,17 @@ def main() -> None:
     )
     policy = load_policy(
         args.checkpoint,
-        args.model,
         device,
         n_action_steps=args.n_action_steps,
     )
 
+    # Start a fresh metrics file so old trials do not mix into this run.
     metrics_path = out_dir / "metrics.jsonl"
     if metrics_path.exists():
         metrics_path.unlink()
 
+    # ===== SPEED SWEEP =====
+    # One scene + one policy, reused for every speed. One summary row per speed.
     summaries = []
     wall0 = time.time()
     for speed in args.speeds:
@@ -1023,6 +1415,7 @@ def main() -> None:
         json.dump(report, fp, indent=2)
     logging.info("Wrote %s", report_path)
     print(json.dumps(report, indent=2))
+    # Hard exit: Isaac can hang on normal shutdown. Everything is saved by now.
     os._exit(0)
 
 

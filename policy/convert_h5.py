@@ -1,4 +1,13 @@
-"""Turn Foresight demo H5 files into a LeRobot dataset."""
+"""Turn Foresight demo H5 files into a LeRobot dataset.
+
+Step 1 of 3 (convert -> train -> infer). Sim writes one H5 + one JSON per
+episode. Training wants a LeRobot dataset. This file copies frames over.
+
+Layout rule: the slots here come from policy/features.py. 
+We store the 8 robot numbers as "state", and keep the 4 object numbers ("conditioning")
+and the perfect object pose ("oracle_state") on the side. Training glues
+them into the 12-number state. Do not glue here, or noise cannot be added later.
+"""
 
 from __future__ import annotations
 
@@ -43,6 +52,7 @@ def _as_uint8_rgb(img: np.ndarray) -> np.ndarray:
 
 def _gripper_from_open(open_cmd: float, open_val: float = 0.04, close_val: float = 0.0) -> float:
     """Map expert open∈{0,1} or continuous to a scalar gripper action in [0,1] open."""
+    # 1 = open, 0 = closed. Keeps the gripper on one simple scale.
     v = float(open_cmd)
     if v > 0.5:
         return 1.0
@@ -54,6 +64,7 @@ def _gripper_from_open(open_cmd: float, open_val: float = 0.04, close_val: float
 
 
 def pack_proprio(ee_pos: np.ndarray, ee_quat: np.ndarray, gripper_open: float) -> np.ndarray:
+    # 8 robot numbers: hand XYZ (3) + rotation (4) + gripper (1). Order = PROPRIO_NAMES.
     return np.concatenate(
         [
             np.asarray(ee_pos, dtype=np.float32).reshape(3),
@@ -69,7 +80,12 @@ def pack_action(action_pos: np.ndarray, action_quat: np.ndarray, gripper_open: f
 
 
 def list_success_episodes(input_dir: Path, *, success_only: bool = True) -> list[tuple[Path, Path]]:
-    """Return (h5, json) pairs under input_dir (recursive)."""
+    """Return (h5, json) pairs under input_dir (recursive).
+
+    By default keep only episodes the expert finished (success). Learning from
+    failed demos would teach the policy to fail. Skip files that lack cameras
+    or the object numbers, since training needs both.
+    """
     pairs: list[tuple[Path, Path]] = []
     for h5_path in sorted(input_dir.rglob("*.h5")):
         js = h5_path.with_suffix(".json")
@@ -92,6 +108,7 @@ def list_success_episodes(input_dir: Path, *, success_only: bool = True) -> list
 
 
 def episode_language(meta: dict) -> str:
+    # The text instruction the policy reads. Use the saved one, else make one.
     if meta.get("language"):
         return str(meta["language"])
     return default_language(meta.get("category"), meta.get("container_category"))
@@ -118,6 +135,7 @@ def convert_episodes(
     if not pairs:
         raise RuntimeError("No convertible episodes found")
 
+    # include_aux=True keeps the side data (4 object numbers + oracle pose).
     features = make_features(include_aux=True)
     ds = LeRobotDataset.create(
         repo_id=repo_id,
@@ -133,11 +151,13 @@ def convert_episodes(
         meta = json.loads(js_path.read_text())
         task = episode_language(meta)
         with h5py.File(h5_path, "r") as f:
-            T = int(f["object_pos"].shape[0])
+            T = int(f["object_pos"].shape[0])  # number of frames in this episode
+            # Shape checks: catch a wrong layout now, not after hours of training.
             assert f["conditioning"].shape == (T, CONDITIONING_DIM)
             assert f["oracle_state"].shape == (T, ORACLE_DIM)
             for t in range(T):
                 state = pack_proprio(f["ee_pos"][t], f["ee_quat"][t], float(f["gripper"][t]))
+                # Action = the pose the expert commanded at this frame.
                 action = pack_action(
                     f["action_pos"][t], f["action_quat"][t], float(f["gripper"][t])
                 )
@@ -146,6 +166,7 @@ def convert_episodes(
                 frame = {
                     "observation.state": state,
                     "action": action,
+                    # Side data, not glued to state yet (see transforms.py).
                     "observation.conditioning": np.asarray(f["conditioning"][t], dtype=np.float32),
                     "observation.oracle_state": np.asarray(f["oracle_state"][t], dtype=np.float32),
                     "observation.images.static_cam": _as_uint8_rgb(f["static_cam_rgb"][t]),

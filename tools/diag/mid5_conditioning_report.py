@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge mid eval reports + per-episode conditioning debug for B / B_zero."""
+"""Merge mid eval reports + per-episode conditioning debug for model / model_zero."""
 
 from __future__ import annotations
 
@@ -13,6 +13,13 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from interfaces.state import CONDITIONING_LAYOUT  # noqa: E402
+from policy.features import CONDITIONING_DIM  # noqa: E402
+
+# Report arm name → metrics.jsonl directory under OUT_ROOT (legacy folder names on disk).
+ARM_DIRS: dict[str, str] = {
+    "model": "eval_b",
+    "model_zero": "eval_b_zero",
+}
 
 
 def _load_jsonl(path: Path) -> list[dict]:
@@ -79,7 +86,7 @@ def _arm_summary(metrics: list[dict]) -> dict:
                 "std_first_replan": float(first[:, i].std()),
                 "mean_across_episode": float(mean[:, i].mean()),
             }
-            for i in range(12)
+            for i in range(CONDITIONING_DIM)
         ]
     return out
 
@@ -109,9 +116,9 @@ def main() -> None:
         gate = json.loads(gate_path.read_text())
 
     arms = {}
-    for tag in ("a", "b", "b_zero"):
-        metrics = _load_jsonl(root / f"eval_{tag}" / "metrics.jsonl")
-        arms[tag] = _arm_summary(metrics)
+    for arm, subdir in ARM_DIRS.items():
+        metrics = _load_jsonl(root / subdir / "metrics.jsonl")
+        arms[arm] = _arm_summary(metrics)
 
     report = {
         "root": str(root),
@@ -119,9 +126,8 @@ def main() -> None:
         "note": "n=5 mid is for debug viz + conditioning dump; magnitude claims stay INCONCLUSIVE.",
         "arms": arms,
         "mp4_glob": {
-            "a": sorted(str(p) for p in (root / "eval_a").glob("*.mp4")),
-            "b": sorted(str(p) for p in (root / "eval_b").glob("*.mp4")),
-            "b_zero": sorted(str(p) for p in (root / "eval_b_zero").glob("*.mp4")),
+            arm: sorted(str(p) for p in (root / subdir).glob("*.mp4"))
+            for arm, subdir in ARM_DIRS.items()
         },
     }
     out_json = root / "mid5_report.json"
@@ -139,17 +145,17 @@ def main() -> None:
         "",
         "## Success counts",
     ]
-    for tag in ("a", "b", "b_zero"):
-        a = arms[tag]
+    for arm in ARM_DIRS:
+        a = arms[arm]
         md.append(
-            f"- **{tag}**: {a['successes']}/{a['n_episodes']} "
+            f"- **{arm}**: {a['successes']}/{a['n_episodes']} "
             f"(conditioning rows: {a['n_with_conditioning']})"
         )
     md.append("")
 
-    for tag in ("b", "b_zero"):
-        a = arms[tag]
-        md.append(f"## Conditioning 12-vector — `{tag}`")
+    for arm in ARM_DIRS:
+        a = arms[arm]
+        md.append(f"## Conditioning vector — `{arm}`")
         md.append("")
         if not a.get("per_dim"):
             md.append("_No conditioning_debug in metrics.jsonl._")
@@ -179,9 +185,9 @@ def main() -> None:
         md.append("")
 
     md.append("## MP4 paths")
-    for tag in ("a", "b", "b_zero"):
-        md.append(f"### {tag}")
-        for path in report["mp4_glob"][tag]:
+    for arm, subdir in ARM_DIRS.items():
+        md.append(f"### {arm} (`{subdir}`)")
+        for path in report["mp4_glob"][arm]:
             md.append(f"- `{path}`")
         md.append("")
 

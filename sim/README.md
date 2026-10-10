@@ -8,7 +8,8 @@ How the expert works (plain words + code links): [`STATE_MACHINE.md`](STATE_MACH
 |---|---|
 | `phase0_cfg.yaml` | Scene, cameras, expert timings, mesh folders |
 | `scene.py` | Franka + table + object + container + cameras |
-| `motion.py` | On-table sliding motion + bounce-aware forecast |
+| `motion.py` | On-table sliding motion; bounce only when `xy_bounds` is given (floor). House / throw passes `None` = straight line |
+| `physics_grasp.py` | Helpers for the real PhysX grasp: sticky material, table-footprint check, wrist depth between the fingertips |
 | `state_machine.py` | Intercept-servo pick stages (0–9) |
 | `STATE_MACHINE.md` | Simple full walkthrough with links into the code |
 | `state_machine_logs.py` | Plain log lines (banners, stage lines, results) |

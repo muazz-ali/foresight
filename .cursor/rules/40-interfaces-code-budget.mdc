@@ -15,7 +15,7 @@ Logged / trained layout (`CONDITIONING_LAYOUT`):
 
 **Δ is fixed** from `sim/phase0_cfg.yaml` → `state_machine_params.conditioning_delta_s`
 (collect / train / eval must agree). It is **not** packed while it is constant.
-Train noise comes from `policy/configs/smolvla_b.yaml`. Pack Δ as a 5th number
+Train noise comes from `policy/configs/smolvla.yaml`. Pack Δ as a 5th number
 only when deploy latency genuinely varies (Phase 3 latency sweep / Phase 4 real arm).
 
 With fixed Δ, clean `[p̂, v̂]` is an invertible transform of `[p, v]` — phrase
@@ -23,14 +23,14 @@ G1 as “explicit object state helps,” and use a Δ=0 ablation if you need to
 isolate *future* vs *current*.
 
 **G2 does not change the pack.** The G2 swap feeds filter-made `[p̂, v̂]` to the
-**unchanged** G1 Model B (12-D state). Oracle and filter must emit the same pack,
+**unchanged** G1 model (12-D state). Oracle and filter must emit the same pack,
 built by the same `interfaces.state.conditioning_vector` (plain constant-velocity
-predict — no bounce-aware forecast, B never trained on one).
+predict — no bounce-aware forecast; model never trained on bounce-aware forecast).
 
 Still dropped: `p_hat_z`, `v_hat_z`, `sigma_*`, `valid`, `coast_time`. The filter
 already fills `covariance` / `valid` in `ObjectState`; packing them needs a retrain,
 so do it only **after** the G2 swap result, and only if the swap drop is ≥10 points
-and retraining B on filter-made vectors did not fix it (`foresight_plan.md` §11).
+and retraining the model on filter-made vectors did not fix it (`foresight_plan.md` §5).
 
 ## Budgets (glue, not frameworks)
 | Module | Budget |

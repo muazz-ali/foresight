@@ -65,12 +65,12 @@ def test_wrong_plane_height_biases_xy(cam):
     assert err > 0.015  # why plane_z must be the object centre height
 
 
-def test_tracker_colour_follows_nearest_blob(cam):
+def test_tracker_hist_follows_nearest_blob(cam):
     tr = BlobTracker()
     uv = cam.project([0.60, -0.05, 0.03])
     img = _frame(uv)
     cv2.circle(img, (int(uv[0]) + 80, int(uv[1])), 20, (200, 40, 40), -1)  # bigger decoy
-    assert tr.start(img, uv) and tr.mode == "colour"
+    assert tr.start(img, uv) and tr.mode == "hist"
     np.testing.assert_allclose(tr.step(img, uv + 5), uv, atol=1.0)
 
 
@@ -184,3 +184,84 @@ def test_estimator_redetects_after_hand_hides_object(cam):
         state = est.step(_frame(cam.project(p1)), k * DT)
     assert est.n_redetects == 1 and state.valid
     assert np.linalg.norm(state.position[:2] - p1[:2]) < 0.005
+
+
+def _wood(seed=0):
+    """Orange-brown table with darker grain stripes and noise (saturated, like house wood)."""
+    rng = np.random.default_rng(seed)
+    img = np.zeros((360, 480, 3), dtype=np.float64)
+    img[:] = (170, 115, 60)
+    rows = np.sin(np.arange(360) / 3.0 + rng.uniform(0, 6)) * 18  # grain
+    img += rows[:, None, None] + rng.normal(0, 6, (360, 480, 1))
+    img[:150] = (215, 215, 215)  # pale wall above the table
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _on_wood(uv, *, colour=(225, 200, 30), radius=7, seed=0):
+    img = _wood(seed)
+    centre = (int(round(uv[0] * 16)), int(round(uv[1] * 16)))
+    cv2.circle(img, centre, radius * 16, colour, -1, lineType=cv2.LINE_AA, shift=4)
+    return img
+
+
+def test_old_colour_look_drowns_on_wood(cam):
+    # Why rung 2 exists: on wood "any saturated pixel" is the whole table.
+    uv = cam.project([0.60, -0.05, 0.03])
+    hsv = cv2.cvtColor(_on_wood(uv), cv2.COLOR_RGB2HSV)
+    assert ((hsv[..., 1] > 90) & (hsv[..., 2] > 50))[200:].mean() > 0.5
+    tr = BlobTracker()
+    assert tr.start(_on_wood(uv), uv) and tr.mode == "hist"
+
+
+def test_estimator_tracks_lemon_on_wood(cam):
+    # Yellow fruit on orange-brown wood, moving 20 cm/s; fresh table noise each frame.
+    v = np.array([-0.20, 0.05, 0.0])
+    p0 = np.array([0.66, -0.08, 0.03])
+    est = StaticCamEstimator.from_cfg(CFG)
+    assert est.start(_on_wood(cam.project(p0)), p0)
+    fixes = 0
+    for k in range(25):
+        p = p0 + v * k * DT
+        state = est.step(_on_wood(cam.project(p), seed=k), k * DT)
+        fixes += est.last_uv is not None
+    assert fixes == 25
+    from interfaces.state import oracle_from_gt
+
+    oracle = conditioning_vector(oracle_from_gt(p, v, 24 * DT), 0.25)
+    mine = conditioning_vector(state, 0.25)
+    assert np.linalg.norm(mine[:2] - oracle[:2]) < 0.01
+    assert np.linalg.norm(mine[2:] - oracle[2:]) < VEL_BAR
+
+
+def test_estimator_tracks_upright_bottle(cam):
+    # Tall dark bottle standing on wood: centre height 12 cm, ~3 cm wide.
+    p0 = np.array([0.58, 0.02, 0.12])
+    v = np.array([-0.15, 0.0, 0.0])
+
+    def frame(p, k):
+        img = _wood(k)
+        top, bot = cam.project(p + [0, 0, 0.12]), cam.project(p - [0, 0, 0.12])
+        u = int(round(top[0]))
+        cv2.rectangle(img, (u - 5, int(top[1])), (u + 5, int(bot[1])), (60, 25, 15), -1)
+        return img
+
+    est = StaticCamEstimator.from_cfg(CFG)
+    assert est.start(frame(p0, 0), p0)
+    for k in range(20):
+        p = p0 + v * k * DT
+        st = est.step(frame(p, k), k * DT)
+        assert est.last_uv is not None
+    # A straight-sided tall box's pixel middle is not the projection of its centre
+    # (perspective): ~1.1 cm here. Grade the tracker against the drawn middle, and
+    # the total against the 2 cm G2a RMSE bar.
+    top, bot = cam.project(p + [0, 0, 0.12]), cam.project(p - [0, 0, 0.12])
+    drawn = cam.lift((top + bot) / 2, 0.12)
+    assert np.linalg.norm(st.position[:2] - drawn) < 0.005
+    assert np.linalg.norm(st.position[:2] - p[:2]) < 0.02
+
+
+def test_play_area_check_ignores_wall_pixels(cam):
+    # House frames show walls above the horizon; re-detect must skip them, not crash.
+    est = StaticCamEstimator.from_cfg(CFG)
+    est.plane_z = 0.03
+    assert est._in_play_area(np.array([240.0, 0.0])) is False

@@ -37,7 +37,7 @@ def test_kinematic_forecast_matches_cv_away_from_wall():
 
 
 def test_episode_for_json_is_light():
-    from sim.collect import JSON_TRACE_KEYS, episode_for_json
+    from sim.collect import episode_for_json
 
     T = 5
     episode = {
@@ -48,21 +48,23 @@ def test_episode_for_json_is_light():
         "ee_pos": np.zeros((T, 3)),
         "gripper": np.ones(T),
         "conditioning": np.tile([0.45, 0.0, 0.2, 0.0], (T, 1)),
+        "timestamp": np.arange(1, T + 1, dtype=np.float64) * 0.04,
         "filter_redetect_counts": np.array([0, 0, 1, 1, 2], dtype=np.int64),
         "static_cam_rgb": np.zeros((T, 8, 8, 3), dtype=np.uint8),
     }
     d = episode_for_json(episode)
     assert d["conditioning_dim"] == CONDITIONING_DIM
     assert d["conditioning_layout"] == list(CONDITIONING_LAYOUT)
-    assert abs(d["vel_xy_median"] - 0.2) < 1e-6
+    assert abs(d["vel_xy_median_m_s"] - 0.2) < 1e-6
     assert d["cond0"] == [0.45, 0.0, 0.2, 0.0]
-    assert "static_cam_rgb" not in d["trace"]
+    assert "trace" not in d
+    assert "frames" in d and len(d["frames"]) == T
     assert d["arrays"]["static_cam_rgb"]["shape"] == [T, 8, 8, 3]
-    for k in ("stage", "holding", "object_vel", "ee_pos", "gripper", "filter_redetect_counts"):
-        assert k in JSON_TRACE_KEYS
-        assert k in d["trace"]
-        assert len(d["trace"][k]) == T
-    assert d["trace"]["filter_redetect_counts"] == [0, 0, 1, 1, 2]
+    row0 = d["frames"][0]
+    assert row0["hand_mm"] == [0, 0, 0]
+    assert row0["obj_mm"] == [0, 0, 0]
+    assert "stage" in row0
+    assert d["highlights"]  # at least stage changes
 
 
 def test_write_episode_h5_is_4d_not_12():
@@ -116,6 +118,15 @@ def test_kinematic_forecast_bounces_unlike_cv():
     assert abs(float(bounce_pack[0] - vec[0])) > 1e-3
 
 
+def test_kinematic_forecast_no_bounce_without_bounds():
+    # House / throw: xy_bounds=None → straight line, can leave the band.
+    pos = np.array([0.68, 0.0, 0.05])
+    vel = np.array([0.4, 0.0, 0.0])
+    fp, fv = kinematic_forecast(pos, vel, 0.25, 0.04, xy_bounds=None)
+    np.testing.assert_allclose(fp, pos + vel * 0.25, atol=1e-9)
+    np.testing.assert_allclose(fv, vel, atol=1e-9)
+
+
 def test_sm_stage_order_and_success_latch():
     from sim.state_machine import (
         STAGE_APPROACH,
@@ -151,6 +162,7 @@ if __name__ == "__main__":
     test_flat_roundtrip_len()
     test_kinematic_forecast_matches_cv_away_from_wall()
     test_kinematic_forecast_bounces_unlike_cv()
+    test_kinematic_forecast_no_bounce_without_bounds()
     test_episode_for_json_is_light()
     test_write_episode_h5_is_4d_not_12()
     test_sm_stage_order_and_success_latch()

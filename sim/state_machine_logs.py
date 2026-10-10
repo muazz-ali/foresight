@@ -1,4 +1,11 @@
-"""Plain Phase 0 logs for people. JSON / H5 keep the old field names."""
+"""Plain Phase 0 logs for people. JSON / H5 keep the old field names.
+
+What it does: turns stage ids and failure codes into short, readable text, and
+prints the banners and per-episode lines in the run log.
+It runs whenever the expert or the run scripts write a log line.
+It must NOT change any saved data (JSON / H5 / metrics keep the short codes) or
+decide success. It only words things.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +16,7 @@ from typing import Any
 import numpy as np
 
 # Same integers as sim.state_machine. One spoken name each (no aliases).
+# Change the ids there and here together, or logs will name the wrong stage.
 STAGE_PLAIN = {
     0: "start",
     1: "intercept",
@@ -22,6 +30,7 @@ STAGE_PLAIN = {
     9: "done",
 }
 
+# One line per stage: what the hand is trying to do. Printed in the "how to read" banner.
 STAGE_WHY = {
     0: "Arm at rest. Object still on the table.",
     1: "Hand flies to where the object will be when the hand gets there (0.25 s cap).",
@@ -36,6 +45,8 @@ STAGE_WHY = {
 }
 
 # JSON still stores the short code. This is only for the human file.
+# One entry per expert label in sim/success.py FAILURE_LABELS — keep them in sync.
+# Policy runs use their own labels and never reach this map.
 WHY_FAILED = {
     "success": "success",
     "never-engaged": "never reached the object",
@@ -44,7 +55,7 @@ WHY_FAILED = {
     "grasp-slip": "lifted, then lost the object",
     "off-table": "object fell off the table",
     "timeout": "ran out of time",
-    "safety-abort": "run crashed",
+    "safety-abort": "stopped early (hand left table, or object went through box/base)",
     "wrong-object": "grabbed the wrong object",
 }
 
@@ -53,20 +64,24 @@ class HumanFormatter(logging.Formatter):
     """Skip the prefix when extra={'bare': True} so banners stay clean."""
 
     def format(self, record: logging.LogRecord) -> str:
+        """Plain message for banner lines; normal timestamped line for the rest."""
         if getattr(record, "bare", False):
             return record.getMessage()
         return super().format(record)
 
 
 def _bare(log: logging.Logger, message: str) -> None:
+    """Log a line with no timestamp prefix (see HumanFormatter)."""
     log.info(message, extra={"bare": True})
 
 
 def log_blank(log: logging.Logger) -> None:
+    """Empty line, to space out the log."""
     _bare(log, "")
 
 
 def log_section(log: logging.Logger, title: str) -> None:
+    """Big ``====  title  ====`` banner, e.g. one per speed bin."""
     log_blank(log)
     log_blank(log)
     _bare(log, f"========  {title}  ========")
@@ -74,19 +89,23 @@ def log_section(log: logging.Logger, title: str) -> None:
 
 
 def log_event(log: logging.Logger, message: str) -> None:
+    """Normal log line (with timestamp)."""
     log.info(message)
 
 
 def log_note(log: logging.Logger, message: str) -> None:
+    """Indented side note under an event line."""
     log.info("    %s", message)
 
 
 def fmt_xyz(p: Any) -> str:
+    """Point as ``(x, y, z) m`` with 3 decimals."""
     v = np.asarray(p, dtype=float).reshape(-1)
     return f"({float(v[0]):.3f}, {float(v[1]):.3f}, {float(v[2]):.3f}) m"
 
 
 def fmt_size_cm(size_m: Any) -> str:
+    """Size in metres → ``a x b x c cm`` (first 3 values)."""
     s = np.asarray(size_m, dtype=float).reshape(-1)
     return " x ".join(f"{100.0 * float(x):.1f}" for x in s[:3]) + " cm"
 
@@ -99,13 +118,17 @@ def stage_label(stage: int, names: dict | None = None) -> str:
 
 
 def why_failed(code: str) -> str:
+    """Failure code → plain sentence. Unknown codes pass through unchanged."""
     return WHY_FAILED.get(str(code), str(code))
 
 
 def speed_title(speed_m_s: float) -> str:
+    """Banner title for a speed bin, in cm/s."""
     cms = float(speed_m_s) * 100.0
+    # Under half a cm/s counts as "not moving".
     if cms < 0.5:
         return "SPEED 0 cm/s  (object sits still)"
+    # Whole numbers print without decimals (15, not 15.0).
     if abs(cms - round(cms)) < 0.05:
         return f"SPEED {int(round(cms))} cm/s"
     return f"SPEED {cms:.1f} cm/s"
@@ -120,6 +143,7 @@ def log_stage(
     speed_m_s: float,
     holding: bool,
 ) -> None:
+    """One line when a stage starts: hand spot, object spot, gap, speed, holding or not."""
     hand_v = np.asarray(hand, dtype=float).reshape(3)
     obj_v = np.asarray(obj, dtype=float).reshape(3)
     gap_cm = 100.0 * float(np.linalg.norm(hand_v - obj_v))
@@ -142,6 +166,7 @@ def log_how_to_read(
     names: dict | None = None,
     why: dict | None = None,
 ) -> None:
+    """Print the stage list once at the start, so a reader can follow the log."""
     name_table = STAGE_PLAIN if names is None else names
     why_table = STAGE_WHY if why is None else why
     log_blank(log)
@@ -173,6 +198,7 @@ def log_episode_begin(
     box_xy: Any,
     drop_z: float,
 ) -> None:
+    """Start-of-episode summary: where things are, and the step cap. Seed is logged for replay."""
     box = np.asarray(box_xy, dtype=float).reshape(-1)
     cms = 100.0 * float(object_speed_m_s)
     log.info(
@@ -202,6 +228,11 @@ def log_result(
     video: str | Path | None = None,
     names: dict | None = None,
 ) -> None:
+    """End-of-episode summary. Shows the farthest stage and object height (peak / end).
+
+    Why those two: they let a reader tell WHY a run failed (never reached it,
+    never lifted, lost it) instead of trusting the label alone.
+    """
     log_blank(log)
     log.info("Result: %s", why_failed(failure))
     log.info("  Farthest stage: %s", stage_label(max_stage, names))

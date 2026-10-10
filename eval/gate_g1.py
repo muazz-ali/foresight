@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Merge Model A / B / B-zero eval reports into Gate G1 verdict."""
+"""Merge model / model-zero eval reports into Gate G1 verdict.
+
+Two eval runs of the SAME checkpoint go in:
+  1. normal run     (policy sees the 4 numbers)
+  2. zero-out run   (the 4 numbers are set to 0)
+Two checks must both pass:
+  - flat:     success at 0 cm/s vs 20 cm/s drops by less than 15 points.
+  - zero-out: at the mid speed, zeroing the numbers costs at least 15 points.
+            (If zeroing changes nothing, the model is not using the numbers.)
+This file does not count trials or print Wilson intervals. It only reads the
+success rates already in the two reports. Its numerical verdict is only a
+scout result unless each speed has n >= 80; see foresight_plan.md §8.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # MID_M_S = 15 cm/s bin and 15-point bars (flat drop / zero-out).
-# HIGH_M_S = 20 cm/s bin and 20-point B-beats-A margin.
+# HIGH_M_S = 20 cm/s bin for flat-drop check.
 MID_M_S = 0.15
 HIGH_M_S = 0.20
 G1_SPEEDS = (0.0, 0.10, MID_M_S, HIGH_M_S)
@@ -30,11 +42,10 @@ def _mid_rate(report: dict) -> float | None:
 
 
 def main() -> None:
-    """Merge A / B / B-zero reports → G1 pass/fail JSON."""
+    """Merge model + model-zero reports → G1 pass/fail JSON."""
     p = argparse.ArgumentParser()
-    p.add_argument("--report-a", required=True)
-    p.add_argument("--report-b", required=True)
-    p.add_argument("--report-b-zero", required=True, help="B with --zero-conditioning")
+    p.add_argument("--report", required=True, help="Full conditioning eval report JSON")
+    p.add_argument("--report-zero", required=True, help="Same checkpoint with --zero-conditioning")
     p.add_argument(
         "-o",
         "--output",
@@ -42,53 +53,56 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    a = json.loads(Path(args.report_a).read_text())
-    b = json.loads(Path(args.report_b).read_text())
-    bz = json.loads(Path(args.report_b_zero).read_text())
+    model = json.loads(Path(args.report).read_text())
+    model_zero = json.loads(Path(args.report_zero).read_text())
 
-    a_mid = _mid_rate(a)
-    b_mid = _mid_rate(b)
-    b0 = _rate_at(b, 0.0)
-    b_hi = _rate_at(b, HIGH_M_S)
-    bz_mid = _mid_rate(bz)
+    # Pull the rates we need. None means "that speed was not run".
+    model_mid = _mid_rate(model)
+    m0 = _rate_at(model, 0.0)
+    m_hi = _rate_at(model, HIGH_M_S)
+    zero_mid = _mid_rate(model_zero)
 
-    margin = (b_mid - a_mid) if (a_mid is not None and b_mid is not None) else None
-    flat_drop = (b0 - b_hi) if (b0 is not None and b_hi is not None) else None
-    margin_pass = margin is not None and margin >= HIGH_M_S
+    # Flat check: still-object rate minus fast-object rate. Small drop = good.
+    # (Missing bin → flat_pass is False; no guessing.)
+    flat_drop = (m0 - m_hi) if (m0 is not None and m_hi is not None) else None
     flat_pass = flat_drop is not None and flat_drop < MID_M_S
-    # Zero-out must hurt: drop at least 15 pts vs full B at mid speed.
+    # Zero-out must hurt: drop at least 15 pts vs full model at mid speed.
     zero_collapse = (
-        bz_mid is not None and b_mid is not None and (b_mid - bz_mid) >= MID_M_S
+        zero_mid is not None and model_mid is not None and (model_mid - zero_mid) >= MID_M_S
     )
 
-    gate_pass = bool(margin_pass and flat_pass and zero_collapse)
+    # The two numerical checks pass only if BOTH bars pass.
+    # This script does not enforce the separate n>=80 claim rule.
+    gate_pass = bool(flat_pass and zero_collapse)
+    # Output JSON: verdict, the numbers behind it, the bars used, and source files.
     report = {
         "gate": "G1",
         "gate_g1_pass": gate_pass,
-        "margin_pass": margin_pass,
         "flat_pass": flat_pass,
         "zero_out_collapse": zero_collapse,
         "metrics": {
-            "A_mid": a_mid,
-            "B_mid": b_mid,
-            "B_zero_mid": bz_mid,
-            "margin_B_minus_A": margin,
-            "B_rate_0": b0,
-            "B_rate_20": b_hi,
+            "model_mid": model_mid,
+            "model_zero_mid": zero_mid,
+            "model_rate_0": m0,
+            "model_rate_20": m_hi,
             "flat_drop_0_to_20": flat_drop,
+            "zero_out_drop_mid": (
+                (model_mid - zero_mid)
+                if model_mid is not None and zero_mid is not None
+                else None
+            ),
         },
         "criterion": {
-            "B_beats_A_mid_ge": HIGH_M_S,
-            "B_flat_drop_0_to_20_lt": MID_M_S,
+            "model_flat_drop_0_to_20_lt": MID_M_S,
             "zero_out_drop_ge": MID_M_S,
         },
         "reports": {
-            "A": args.report_a,
-            "B": args.report_b,
-            "B_zero": args.report_b_zero,
+            "model": args.report,
+            "model_zero": args.report_zero,
         },
-        "summaries_B": b.get("summaries"),
-        "summaries_A": a.get("summaries"),
+        # Per-speed tables copied through, so one file has the full evidence.
+        "summaries_model": model.get("summaries"),
+        "summaries_model_zero": model_zero.get("summaries"),
     }
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

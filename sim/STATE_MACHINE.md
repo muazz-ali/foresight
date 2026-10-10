@@ -105,7 +105,7 @@ Two ideas glued together:
 
 The arm does not jump to a command instantly. There is a short delay from “tell the hand to go here” to “hand actually gets there”.
 
-We call that delay **`tau`** ≈ `servo_lag_s + dt` ([property](state_machine.py#L170)).
+We call that delay **`tau`** ≈ `robot_approach_pad_s + dt` ([property](state_machine.py#L170)).
 
 If we aim at the object *now*, the hand arrives late and trails behind.  
 If we aim a little *ahead by `tau`*, the hand can ride **on** the object in steady state.
@@ -124,6 +124,9 @@ Code: [`_intercept_lead_s`](state_machine.py#L231).
 - On top of the object → travel time → 0 → lead collapses to `tau` → hand rides the object.
 
 ### Bounce-aware guess
+
+> House / throw mode (`scene.use_house: true`): no bounce. `xy_bounds` is `None`, the forecast is constant velocity and the bounce guard is always clear. The next sections describe the floor (bounce box) mode.
+> Physics grasp (house default): `attach_object` means "close now", the scene frees the object to PhysX instead of welding it. A held object more than `slip_dist_m` from the hand sends the expert back to intercept.
 
 The object bounces off the play-band walls. A straight-line “fly 0.25 s ahead” guess can leave the table.
 
@@ -178,8 +181,8 @@ Arm sits at home. Wait `settle_s` so the scene is ready.
 - Compute lead with [`_intercept_lead_s`](state_machine.py#L231).
 - Aim with [`_forecast`](state_machine.py#L220).
 - Lower height as XY gets closer (`z_release_radius`) so we do not waste time on a flat hover then a late drop.
-- “Locked” = hand near object *now* (`track_xy_tol` / `approach_z_tol`) for `track_hold_s`.
-- Bounce guard must pass before we commit.
+- “Locked” = hand near object *now* (`riding_xy_ok_mm` / `riding_z_ok_mm`) for `riding_hold_ms`.
+- Wall clear check (`min_wait_after_bounce_ms`) must pass before we commit (floor mode).
 
 → **go down**.  
 If stuck too long → retry intercept ([`_restart_approach`](state_machine.py#L346)).
@@ -309,30 +312,32 @@ Success latch. Arm home, fingers open, object frozen in the box. The episode loo
 
 ## Knob cheat sheet
 
-All under `state_machine_params` in [`phase0_cfg.yaml`](phase0_cfg.yaml#L77). Loaded in [`__init__`](state_machine.py#L102).
+Edit the **yaml names** under `state_machine_params` in [`phase0_cfg.yaml`](phase0_cfg.yaml) (stage order).  
+Loader maps them to SI keys; the expert reads those in [`__init__`](state_machine.py#L102).
 
-| Key | Default | Plain meaning |
+| Yaml name | Default | Plain meaning |
 |---|---|---|
-| `lookahead_s` | 0.25 | Max look-ahead for the meeting point (s) |
-| `conditioning_delta_s` | 0.25 | How far ahead the **policy** numbers look (s); not used for aiming |
-| `servo_lag_s` | 0.16 | Hand delay we compensate for (s). Calibrate — do not guess |
-| `ee_speed_max` | 0.90 | How fast we assume the hand can travel (m/s) |
-| `hover_z` | 0.08 | Start height above the object when far away (m) |
-| `track_xy_tol` | 0.02 | How close in XY counts as “riding” the object (m) |
-| `track_hold_s` | 0.08 | Must stay locked this long before go-down (s) |
-| `bounce_guard_s` | 0.10 | Need at least this much clear time before a wall hit (s) |
-| `z_release_radius` | 0.12 | Start lowering when this far in XY (m) |
-| `grasp_xy_tol` / `grasp_z_tol` | 0.02 | Base grasp gates (m) |
-| `grasp_tol_step_k` | 0.6 | Grasp gate grows with speed |
-| `servo_xy_tol` | 0.03 | “Close enough” in XY for carry / lower / home (m) |
-| `place_xy_tol` | 0.12 | “In the box” XY gate (m) |
-| `lift_height` | 0.12 | Raise after grasp (m) |
-| `stage_timeout_s` | 1.5 | Stall cap after grasp (s) |
-| `grasp_stage_timeout_s` | 3.0 | Longer stall cap for intercept / go-down (s) |
-| `max_retries` | 3 | Re-intercept tries before giving up |
-| `inference_window_s` | 10 | Max episode time; timeout = fail |
+| `policy_look_ahead_ms` | 250 | Policy pack look-ahead (not for aiming) |
+| `wait_at_home_ms` | 200 | Pause at home before first chase |
+| `max_aim_ahead_ms` | 250 | Cap on meeting-point look-ahead |
+| `tip_lag_pad_ms` | 160 | Aim farther for tip lag (not a wait) |
+| `hand_speed_max_cm_s` | 90 | Assumed hand speed for meet-time |
+| `hover_above_object_mm` | 80 | Start height above object when far |
+| `start_lowering_xy_mm` | 120 | Begin walking Z down when this close in XY |
+| `riding_xy_ok_mm` | 10 | XY gap that counts as riding |
+| `riding_hold_ms` | 50 | Must keep riding this long before go-down |
+| `min_wait_after_bounce_ms` | 100 | Min clear path before wall (floor only) |
+| `grasp_xy_ok_mm` / `grasp_z_ok_mm` | 10 | Base gaps that allow finger close |
+| `hold_closed_weld_ms` / `hold_closed_physics_ms` | 100 / 300 | Dwell after close before lift |
+| `near_enough_xy_mm` | 30 | Close enough XY for carry / lower / home |
+| `in_box_xy_ok_mm` | 120 | “In the box” XY gate |
+| `lift_height_mm` | 120 | Raise after grasp |
+| `stall_timeout_ms` | 1500 | Stall cap after grasp |
+| `chase_stall_timeout_ms` | 3000 | Longer stall while chasing / going down |
+| `max_retries` | 3 | Re-chase tries before giving up |
+| `episode_max_ms` | 10000 | Max episode time; timeout = fail |
 
-Calibrate lag / hand speed with `tools/diag/calibrate_servo_lag.py`.
+Calibrate tip lag / hand speed with `tools/diag/calibrate_servo_lag.py`.
 
 ---
 

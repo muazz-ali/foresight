@@ -25,12 +25,12 @@ Phase-1 **live pack** into the policy is 5 numbers: `p_hat_x, p_hat_y, v_hat_x, 
 
 ## Phase gates (stop on fail — do not build ahead)
 - **G0** expert ≥70% @ 0–20 cm/s (0 / 10 / 15 / 20); collection hundreds/hr
-- **G1** Model B beats A by ≥20 pts at 15 cm/s; B loses <15 pts 0→20 cm/s *(hypothesis test — zero perception needed)*. **n≥80 per bin** to claim; 20 is scout. Do not call G1 / the hypothesis dead while Δ is unpacked, eval glue unsticks on open, or labels are `{0,4}` vs expert stages.
+- **G1** Grasp rate stays flat 0→20 cm/s (<15 pt drop); zero the 4 numbers at eval and success collapses (proof the model uses them). **n≥80 per bin** to claim; 20 is scout. A-vs-B comparison is retired — do not train Model A. Do not call G1 / the hypothesis dead while Δ is unpacked, eval glue unsticks on open, or labels are `{0,4}` vs expert stages.
 - **G2** pred RMSE @250 ms ≤1–2 cm; swap drop <10 pts
-- **G3** recover ≥half late/early failures; smoother paths
+- **G3** throw + timing in one: catch before off-table (no bounce box); buffer/reflex/wrist; recover ≥half late/early; smoother paths; **one last sim collect + one retrain**
 - **G4** real ≥60–70% @ 10–20 cm/s
 
 ## Deliberately do NOT build
-No latent world model (including AHEAD / DynaWM / PhysMani modules), no optical-flow net, no VLA-from-scratch, no 6D pose (centroid+velocity first), no 200K episodes, no off-table motion before Phase 5.
+No latent world model (including AHEAD / DynaWM / PhysMani modules), no optical-flow net, no VLA-from-scratch, no 6D pose (centroid+velocity first), no 200K episodes, no second sim collect after Phase 3 freezes, no “throw demos now / timing demos later.”
 No DynamicVLA state machine / `object_picked` latch as the Phase-0 expert (G0 lesson — flat ~40%, unfixable holes).
-No unfreezing vision to “fix cameras” while B-zero already shows the vector is the channel.
+No unfreezing vision to “fix cameras” while zero-out already shows the vector is the channel.

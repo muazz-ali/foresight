@@ -67,10 +67,10 @@ number. Anything else must be labeled UNKNOWN: or UNVERIFIED:.
 Glossary (use these exact terms):
   "mid"     = success rate at 0.20 m/s (fallback 0.30 m/s if 0.20 missing);
               see eval/gate_g1.py MID=0.20, MID_ALT=0.30
-  "drop"    = B_rate(0.0) - B_rate(0.30)  [flat_drop_0_to_30]; pass if drop < 0.15
-  "margin"  = B_mid - A_mid; pass if margin >= 0.20
-  "zero-out"= B_mid - B_zero_mid; pass if >= 0.15 (conditioning must hurt when zeroed)
-  arms      = A (no conditioning) | B (predicted) | B_zero (zeroed) | B_oracle (GT future; P5 only)
+  "drop"    = conditioned_rate(0.0) - conditioned_rate(0.30)  [flat_drop_0_to_30]; pass if drop < 0.15 (G1)
+  "zero-out"= success with full numbers vs with numbers zeroed; G1 proof when zeroed collapses (plan §5)
+  "margin"  = (retired gate) A_mid vs conditioned mid — legacy reeval only; current G1 is flat drop + zero-out
+  arms      = legacy labels in gate_g1 / reeval logs: A (no conditioning) | B (conditioned model) | B_zero | B_oracle (P5 only)
   reeval    = data/p1/reeval_n8/gate_g1_report.json  (verify n from summaries.*.attempts)
 
 Max 3 iterations. If still blocked, stop and return the single specific blocker.
@@ -91,10 +91,12 @@ STEPS
 1. From gate_g1_report.json and eval/gate_g1.py, state exactly what n is per
    cell: episodes per arm per speed bin. Cite the field you read (e.g.
    summaries_B[].attempts).
-2. Compute Wilson 95% CIs for: A mid, B mid, B_zero mid, and the 0→30 drop
-   (treat drop as difference of two binomial rates; state the method).
-3. Compute episodes-per-cell required to resolve a 20-point margin at 80% power,
-   alpha 0.05, around p≈0.3 (two-proportion comparison A vs B at mid).
+2. Compute Wilson 95% CIs for: conditioned mid, B_zero mid, and the 0→30 drop
+   (treat drop as difference of two binomial rates; state the method). Include A mid
+   only as legacy context — A-vs-B is not the current G1 criterion.
+3. Compute episodes-per-cell required to resolve a meaningful zero-out gap at 80% power,
+   alpha 0.05, around plan rates (e.g. 84% full vs 2% zeroed still). Note retired
+   20-pt A-vs-B margin if old reeval arms are present.
 4. Report wall-clock cost of one episode from reeval logs (elapsed_s / attempts
    if present), so we know what that n costs.
 
@@ -102,11 +104,11 @@ REQUIRED OUTPUT
 - Table: arm | n | point estimate | 95% CI
 - Required n, and required n × per-episode cost in hours
 - Verdict: GO or NO-GO
-    GO    = current table can resolve a 20-pt margin (CIs / power support it)
+    GO    = current table can resolve zero-out / flat-drop (CIs / power support it)
     NO-GO = it cannot
 
 DECISION RULE
-If NO-GO: every downstream verdict about A-vs-B *magnitude* is
+If NO-GO: every downstream verdict about G1 *magnitude* (zero-out, flat drop) is
 INCONCLUSIVE-BY-CONSTRUCTION and must be labeled so. P1–P4 still run after
 human confirm (they are about mechanism, not magnitude), but any later P5 must
 be re-scoped to the computed n before it is worth running.
@@ -119,7 +121,7 @@ Do not propose any code fix in this prompt.
 
 ```text
 WORKSTREAM: eval
-GOAL: Determine whether Model B's conditioning tensor actually reaches the
+GOAL: Determine whether the model's conditioning tensor actually reaches the
 policy at inference, and whether it matches what training saw.
 
 STEPS
@@ -143,7 +145,7 @@ Verdict, exactly one of:
   NOT-WIRED       conditioning absent or dropped at eval
   ZEROED          --zero-conditioning set on an arm that should not have it
   DIM-MISMATCH    train dim != eval dim
-  WRONG-CKPT      B is actually A
+  WRONG-CKPT      conditioned arm loaded the no-numbers checkpoint
   WIRING-CLEAN    tensor arrives, nonzero (when not B_zero), correct dim, correct ckpt
   UNKNOWN         blocked; state the single blocker
 plus the shape/norm printout for both arms when available.
@@ -264,7 +266,7 @@ WORKSTREAM: explore (orchestration only)
 ## P0 header
 P0 measurement: GO / NO-GO
 n per cell: __
-note: if NO-GO, all A-vs-B magnitude claims below are INCONCLUSIVE-BY-CONSTRUCTION
+note: if NO-GO, all G1 magnitude claims (zero-out, flat drop) below are INCONCLUSIVE-BY-CONSTRUCTION
 
 ## Verdicts
 P1 wiring:       ____
@@ -308,10 +310,10 @@ GOAL: One experiment that answers Q1 and Q2 together. Run only if a later GATE
 selected this branch and human approved.
 
 SETUP
-Four arms, SAME seeds, SAME episodes, n = value P0 computed:
-  A         no conditioning
-  B         predicted future state
-  B_zero    conditioning zeroed
+Four arms, SAME seeds, SAME episodes, n = value P0 computed (arm names = legacy eval labels):
+  A         no conditioning (historical baseline — not a current gate)
+  B         conditioned model, predicted future state
+  B_zero    conditioning zeroed on same checkpoint
   B_oracle  ground-truth future from sim at inference
 
 READ THE RESULT

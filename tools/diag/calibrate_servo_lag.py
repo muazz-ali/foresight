@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the two arm numbers the intercept-servo expert depends on: ``servo_lag_s`` and ``ee_speed_max``.
+"""Measure the two arm numbers the intercept expert depends on: ``tip_lag_pad_ms`` and ``hand_speed_max_cm_s``.
 
 Both are currently *guesses* in ``sim/phase0_cfg.yaml``. Every 40 / 80 cm/s
 claim rests on them, so measure before tuning anything else.
@@ -10,11 +10,11 @@ claim rests on them, so measure before tuning anything else.
 What it does
 ------------
 1. **Step response.** Command a 15 cm XY step from the init pose and fit a
-   first-order lag: ``servo_lag_s`` is the time to cover 63.2% of the step.
+   first-order lag: ``tip_lag_pad_ms`` is the time to cover 63.2% of the step.
 2. **Ramp tracking.** Command a target sliding at 0.8 m/s and read the
    steady-state trail distance. ``lag = trail / speed`` cross-checks (1); the
    two should agree within ~20%.
-3. **Speed cap.** Peak TCP speed reached during a long step is ``ee_speed_max``.
+3. **Speed cap.** Peak TCP speed reached during a long step is ``hand_speed_max_cm_s``.
 
 Writes ``tools/diag/out/servo_lag.json`` and prints the yaml lines to paste
 into ``state_machine_params``.
@@ -66,7 +66,7 @@ def step_response(scene, quat: np.ndarray, *, step_m: float, n: int) -> dict:
         "commanded_step_m": float(step_m),
         "settled_m": total,
         "steady_state_error_m": float(step_m - total),
-        "servo_lag_s": lag,
+        "robot_approach_pad_s": lag,
         "peak_tcp_speed_m_s": float(speeds.max()) if len(speeds) else 0.0,
     }
 
@@ -88,7 +88,7 @@ def ramp_response(scene, quat: np.ndarray, *, speed: float, n: int) -> dict:
     return {
         "ramp_speed_m_s": float(speed),
         "steady_trail_m": trail_m,
-        "servo_lag_s": trail_m / speed if speed > 0 else float("nan"),
+        "robot_approach_pad_s": trail_m / speed if speed > 0 else float("nan"),
     }
 
 
@@ -122,10 +122,10 @@ def main() -> None:
     _hold(scene, np.asarray(cfg["robot"]["init_pose"][:3]), quat, 25)
     ramp = ramp_response(scene, quat, speed=args.ramp_speed, n=args.steps)
 
-    lags = [x for x in (step["servo_lag_s"], ramp["servo_lag_s"]) if np.isfinite(x)]
+    lags = [x for x in (step["robot_approach_pad_s"], ramp["robot_approach_pad_s"]) if np.isfinite(x)]
     recommend = {
-        "servo_lag_s": round(float(max(lags)), 3) if lags else None,
-        "ee_speed_max": round(0.9 * step["peak_tcp_speed_m_s"], 2),
+        "tip_lag_pad_ms": int(round(1000.0 * float(max(lags)))) if lags else None,
+        "hand_speed_max_cm_s": round(100.0 * 0.9 * step["peak_tcp_speed_m_s"], 1),
     }
     report = {
         "sim_dt": scene.dt,
@@ -141,13 +141,14 @@ def main() -> None:
 
     print(json.dumps(report, indent=2))
     print("\nPaste into sim/phase0_cfg.yaml under state_machine_params:")
-    print(f"  servo_lag_s: {recommend['servo_lag_s']}")
-    print(f"  ee_speed_max: {recommend['ee_speed_max']}")
+    print(f"  tip_lag_pad_ms: {recommend['tip_lag_pad_ms']}")
+    print(f"  hand_speed_max_cm_s: {recommend['hand_speed_max_cm_s']}")
     if not report["agreement_ok"]:
         print("\nWARNING: step and ramp disagree by >20%. The arm is not a clean")
         print("first-order lag — report both numbers before trusting either.")
     import os
 
+    sys.stdout.flush()  # os._exit skips the flush; without it a redirected log loses the report
     os._exit(0)
 
 

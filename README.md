@@ -13,13 +13,13 @@ Full write-up: [`foresight_plan.md`](foresight_plan.md) · How we work: [`AGENTS
 | Checkpoint | What “pass” means | Status |
 |---|---|---|
 | **G0** | Scripted expert works ≥70% from still → 20 cm/s (bins 0 / 10 / 15 / 20); we can record hundreds of demos per hour | **PASS** on the older 0–40 cm/s sweep (report file not in this checkout) |
-| **G1** | Policy **with** future numbers (B) beats policy **without** (A) at 15 cm/s; B stays flat 0 → 20 cm/s; B with numbers zeroed collapses | **PASS** (Sep 13 2026). B 84 / 70 / 71% at 0 / 15 / 20 cm/s; A 9% still, 0% moving; B-zero 2%. n = 100 per B bin. Details: plan §7 |
-| G2a | Camera + filter numbers close to sim truth: at 20 cm/s, median ≤ 1 cm and RMSE ≤ 2 cm vs the sim-truth p̂ | **PASS** (Sep 18 2026, offline). 0.34 / 1.14 cm on demos, 0.31 / 1.26 cm on B's eval runs. Report: `data/eval/p2_perception_report/REPORT.md` |
-| G2b | Swap sim truth → camera numbers in B, same seeds: success drops < 10 points at 15 and 20 cm/s | **PASS** (Sep 29 2026). Filter 92 / 65 / 65 of 100 at 0 / 15 / 20 cm/s. Drop vs oracle is 5 points at 15 cm/s and 6 at 20. Logs: `data/eval/g2b_n100/` |
-| G3 | Fast grasp helper fixes many “too late / early close” fails | not started |
+| **G1** | Model keeps grasp rate flat 0 → 20 cm/s; zero the 4 numbers at eval and success collapses | **PASS** (Sep 13 2026). 84 / 70 / 71% at 0 / 15 / 20 cm/s; zero-out 2% still; drop still→20 is 13 points (<15 cap). n = 100 per bin. Details: plan §5 |
+| G2a | Camera + filter numbers close to sim truth: at 20 cm/s, median ≤ 1 cm and RMSE ≤ 2 cm vs the sim-truth p̂ | **PASS** (Sep 18 2026, offline). 0.34 / 1.14 cm on demos, 0.31 / 1.26 cm on model eval runs. Report: `data/eval/p2_perception_report/REPORT.md` |
+| G2b | Swap sim truth → camera numbers in the model, same seeds: success drops < 10 points at 15 and 20 cm/s | **PASS** (Sep 29 2026). Filter 92 / 65 / 65 of 100 at 0 / 15 / 20 cm/s. Drop vs oracle is 5 points at 15 cm/s and 6 at 20. Logs: `data/eval/g2b_n100/` |
+| G3 | Throw catch (no bounce box) + timing (buffer / reflex / wrist); recover ≥ half late / early-close; one last sim collect + one retrain | not started |
 | G4 | Real arm works well at 10–20 cm/s | not started |
 
-“Success” before Phase 3 = the policy's grasp holds under the eval latch, then a script places the object (`--force-place`).
+“Success” on the bounce-box model (G1 / G2) = the policy's grasp holds under the eval latch, then a script places (`--force-place`). Phase 3 / G3 uses a real physics grasp on the throw task.
 
 Lesson from G0: do **not** wrap DynamicVLA’s pick state machine. Our expert and scene live in this repo under `sim/`.
 
@@ -31,8 +31,8 @@ Lesson from G0: do **not** wrap DynamicVLA’s pick state machine. Our expert an
 |---|---|---|
 | Where / when | Track object + predict a bit ahead | `perception/` |
 | What / how | Small policy + 4 future numbers today (~12 later) | `policy/` |
-| Exactly when | Fast last-cm grasp close | `control/` (later) |
-| Clock | Time-stamped action queue | `control/` (later) |
+| Exactly when | Fast last-cm grasp close | `control/` (Phase 3 / G3) |
+| Clock | Time-stamped action queue | `control/` (Phase 3 / G3) |
 
 **Shared object message** (same for sim-truth and camera track; switch with a config flag):
 
@@ -50,7 +50,7 @@ The policy’s future numbers are built from that message (`interfaces/state.py`
 interfaces/   shared object state + future-number helper
 sim/          Isaac table scene, scripted expert, recording
 perception/   static camera → blob tracker → Kalman filter → object state (Phase 2)
-policy/       turn demos into LeRobot data; train Model A vs B
+policy/       turn demos into LeRobot data; train SmolVLA with the 4 numbers
 scripts/      run collection, convert, train, eval, G2 perception report
 eval/         checkpoint score helpers (G0 / G1)
 tests/        Isaac-free tests (expert, perception)
@@ -58,7 +58,7 @@ data/         local only (git-ignored):
   p1-retrain/        Phase 1 demos (3,718 episodes, with camera frames)
   lerobot/p1-retrain LeRobot copy used for training
   eval/              eval runs + reports (p1_r4k_report, p2_perception_report)
-runs/         local only: trained checkpoint (p1_r4k_b = the B model)
+runs/         local only: trained checkpoint (p1_r4k_b = Phase-1 model)
 ```
 
 ---
@@ -124,23 +124,30 @@ Failure labels each episode:
 
 ## Phase 1 — done (G1 pass)
 
-Models A and B were trained on 3,718 recorded demos (commands in [`policy/README.md`](policy/README.md)). The B weights still on disk are `runs/p1_r4k_b`. B (with the 4 numbers) beats A by 70 points at 15 cm/s and drops 13 points from still to 20 cm/s. Zeroing B's numbers drops it to 2%, so B really uses them. So far this shows “knowing where the object *is* helps”. Splitting that from “knowing where it *will be*” needs a model trained with Δ = 0 (plan §11).
+The model was trained on 3,718 recorded demos (commands in [`policy/README.md`](policy/README.md)). Weights on disk: `runs/p1_r4k_b`. G1 proof: grasp stays flat from still to 20 cm/s (84 → 71%, 13-point drop) and zeroing the 4 numbers collapses success to 2% still — the model uses those numbers. An old no-numbers baseline (Model A) and A-vs-B scoring are retired; see plan §3. Splitting “where it is” from “where it will be” needs a Δ = 0 ablation (plan §5).
 
 ---
 
-## Phase 2 — now
+## Phase 2 — done (G2a + G2b pass)
 
-Replace sim truth with what the static camera sees: blob tracker → pixel-to-table → Kalman filter → the same 4 numbers. B is **not** retrained.
+Replace sim truth with what the static camera sees: blob tracker → pixel-to-table → Kalman filter → the same 4 numbers. The model was **not** retrained for G2b.
 
 - **Done — G2a (offline):** `perception/` + `python scripts/g2_perception_report.py`. At 20 cm/s the camera numbers sit 0.3 cm (median) from sim truth, and every fruit is tracked, including the white egg.
 - **Done — G2b (Isaac):** `--cond-source filter` on the G1 seeds. Grasp rate dropped 5 points at 15 cm/s and 6 points at 20 cm/s (both under the 10-point bar). Flips: `data/eval/g2b_n100/flips.json`.
-- **Next — the throw:** leave the box. Throw from a random direction. Catch before it falls off the table. New demos, then a new train of B. Plan §5.
+
+---
+
+## Phase 3 / G3 — now (throw + timing, one collect)
+
+Throw and timing are **one** phase. Collecting demos and training are expensive — this is the **last sim dataset** and the **last sim retrain**.
+
+Build first (no collect yet): no wall bounce, throw catch expert, `control/` buffer + reflex, wrist last-cm, real physics grasp. Smoke the full stack. Then **one** collect → **one** train → Gate G3. Plan §5 / §8.
 
 ---
 
 ## What we are **not** building yet
 
-No big learned world model, no optical-flow network, no policy from scratch, no full 6D pose first (center + speed is enough), no 200K demos, no flying objects off the table before Phase 5, no DynamicVLA state machine as our expert.
+No big learned world model, no optical-flow network, no policy from scratch, no full 6D pose first (center + speed is enough), no second sim collect after Phase 3 freezes, no bounce-box demos in Phase 3, no DynamicVLA state machine as our expert.
 
 ---
 

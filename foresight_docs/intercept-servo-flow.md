@@ -67,7 +67,7 @@ flowchart TD
 
 ## What `tau` does (lag compensation)
 
-`tau` ≈ `servo_lag_s + dt` — arm delay from command to motion. We aim **ahead** so lateness puts the hand **on** the object, not behind it. The object speed is **not** slowed down.
+`tau` ≈ `robot_approach_pad_s + dt` — pad on aim for tip lag (command → motion). We aim **ahead** so lateness puts the hand **on** the object, not behind it. The object speed is **not** slowed down.
 
 ```mermaid
 flowchart LR

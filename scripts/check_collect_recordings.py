@@ -4,6 +4,13 @@
 Logged gripper is open∈[0,1] (1=open, 0=closed). Yaml ``gripper_open`` /
 ``gripper_close`` are finger widths (m) used only when the scene maps 0/1 → mm.
 
+Why it exists: bad recordings waste a long training run. This is a quick
+check after collection. For each .h5 it asks:
+  1. Is Δ saved, and is it the Δ in the yaml?
+  2. Does the saved 4-number pack match one rebuilt from the saved truth?
+  3. Does the gripper stay in [0,1] and both open and close at least once?
+Exit code 0 = all good, 1 = something is off (see "issues" in the JSON).
+
 Usage:
   python scripts/check_collect_recordings.py --root data/p1_smoke
 """
@@ -26,6 +33,7 @@ from interfaces.state import conditioning_vector, oracle_from_gt  # noqa: E402
 
 
 def _check_h5(path: Path, *, expect_delta: float) -> dict:
+    """Check one episode file. Returns a dict; ``issues`` lists what failed."""
     out: dict = {"path": str(path), "ok": True, "issues": []}
     with h5py.File(path, "r") as f:
         delta = float(np.asarray(f["delta"]).reshape(-1)[0]) if "delta" in f else None
@@ -39,6 +47,7 @@ def _check_h5(path: Path, *, expect_delta: float) -> dict:
     out["n_frames"] = int(cond.shape[0])
     out["cond_dim"] = int(cond.shape[1]) if cond.ndim == 2 else None
 
+    # Check 1: Δ in the file must equal Δ in the yaml (train and eval use the same one).
     if delta is None:
         out["ok"] = False
         out["issues"].append("missing delta dataset")
@@ -46,6 +55,10 @@ def _check_h5(path: Path, *, expect_delta: float) -> dict:
         out["ok"] = False
         out["issues"].append(f"delta={delta} != yaml {expect_delta}")
 
+    # Check 2: rebuild the pack from saved truth with the shared helper.
+    # It should match the saved pack almost exactly. A gap means the pack is
+    # not consistent with the saved object truth. (0.04 s = frame step used
+    # here for the timestamp; it does not change the pack.)
     recon = []
     for t in range(pos.shape[0]):
         st = oracle_from_gt(pos[t], vel[t], timestamp=float(t) * 0.04)
@@ -57,6 +70,8 @@ def _check_h5(path: Path, *, expect_delta: float) -> dict:
         out["ok"] = False
         out["issues"].append(f"conditioning RMSE vs CV@{expect_delta}s = {rmse:.3e}")
 
+    # Check 3: gripper stays in range, and the hand really opened AND closed
+    # (an episode that never closes cannot have grasped anything).
     g_min, g_max = float(np.min(grip)), float(np.max(grip))
     out["gripper_min"] = g_min
     out["gripper_max"] = g_max
@@ -72,6 +87,7 @@ def _check_h5(path: Path, *, expect_delta: float) -> dict:
         out["ok"] = False
         out["issues"].append("gripper never both open (>0.9) and closed (<0.1)")
 
+    # Info only (no pass/fail): gripper column of the saved action.
     if action is not None and action.ndim == 2 and action.shape[1] >= 8:
         a_grip = action[:, 7]
         out["action_gripper_min"] = float(np.min(a_grip))
@@ -97,6 +113,7 @@ def main() -> None:
 
     rows = [_check_h5(h, expect_delta=expect_delta) for h in h5s]
     mp4s = sorted(root.rglob("*.mp4"))
+    # Speed list is read from folder names like speed_0.15 (shows which bins were collected).
     speeds = sorted(
         {float(p.parent.name.split("_")[-1]) for p in h5s if "speed_" in p.parent.name}
     )
@@ -111,6 +128,7 @@ def main() -> None:
         "logged_gripper_note": "open∈[0,1]; scene maps to yaml finger widths",
         "episodes": rows,
     }
+    # Save the report next to the data, print it, and set the exit code.
     out_path = root / "recording_check.json"
     with open(out_path, "w") as fp:
         json.dump(report, fp, indent=2)

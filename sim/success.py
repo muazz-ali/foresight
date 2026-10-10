@@ -2,6 +2,10 @@
 
 Success = done stage reached + object lifted + (held high at end OR placed on container).
 We check stage / lift height *before* calling something “off table.”
+
+Runs after an episode ends, on the logged arrays. Never during the sim loop.
+Two label sets: expert runs use stages; policy runs only know "holding" 0/1.
+Must not: guess failures from one loose height check (it hides the real cause).
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ from sim.state_machine import (
     StageSchema,
 )
 
+# Expert-run labels. Use these only when real stage numbers are logged.
 FAILURE_LABELS = (
     "never-engaged",
     "too-late",
@@ -26,6 +31,9 @@ FAILURE_LABELS = (
     "success",
 )
 
+# Policy-run labels. A policy has no stages, only "holding" 0/1 and height,
+# so the expert labels above (early-close, grasp-slip...) do not apply.
+# The plan calls the first two never-glued and glued-no-lift — same meaning.
 POLICY_FAILURE_LABELS = (
     "never-held",
     "held-no-lift",
@@ -35,6 +43,7 @@ POLICY_FAILURE_LABELS = (
 
 
 def _stages(episode: dict | None) -> np.ndarray:
+    """Stage ids per step as an int array (empty if no episode)."""
     if episode is None:
         return np.asarray([], dtype=np.int64)
     return np.asarray(episode.get("stage", []), dtype=np.int64)
@@ -50,7 +59,11 @@ def episode_success(
     container_xy_tol: float = 0.12,
     z_placed_min: float = 0.02,
 ) -> bool:
-    """Plan-aligned expert success: grasp + lift + hold, or place onto container."""
+    """Did the expert win? Yes if it reached the last stage, lifted the object,
+    and either kept it up at the end or left it on the container.
+
+    This is OUR rule (logged), not any outside "picked" flag.
+    """
     if episode is None:
         return False
     stages = _stages(episode)
@@ -60,11 +73,14 @@ def episode_success(
     z = pos[:, 2]
     lifted = float(z.max()) >= float(z_lift_min)
     finished = int(stages.max()) >= int(place_stage)
+    # Average the last 5 steps so one noisy frame cannot decide "held high".
     held_at_end = (
         float(z[-5:].mean()) >= float(z_end_min)
         if len(z) >= 5
         else float(z[-1]) >= float(z_end_min)
     )
+    # "Placed" = close to the container in XY and still above the table.
+    # Caller can pass a fixed container spot; else we read it from the log below.
     placed_on_container = False
     if container_xy is not None and finished:
         xy = pos[-1, :2]
@@ -78,6 +94,7 @@ def episode_success(
         and "container_pos" in episode
         and finished
     ):
+        # No fixed spot given: the container moves per episode, so use the logged one.
         cpos = np.asarray(episode["container_pos"])
         if len(cpos) and np.isfinite(cpos[-1, 0]):
             xy = pos[-1, :2]
@@ -98,30 +115,53 @@ def classify_failure(
     off_table_margin: float = 0.04,
     z_lift_min: float = 0.12,
     schema: StageSchema | None = None,
+    off_table: bool = False,
+    abort_reason: str | None = None,
 ) -> str:
-    """Why the expert run failed (or success).
+    """Give one reason an expert run failed (or "success").
 
-    Order: success → never-engaged → too-late → grasp-slip → early-close →
-    off-table (only if object fell below table) → timeout.
+    Physics grasp (no weld): stages say how far the expert got, height says if
+    anything was really lifted. ``early-close`` = fingers shut but the object
+    never rose (missed / bumped away); ``grasp-slip`` = it rose (or the run
+    ended low) but never made it to the box; ``too-late`` = never got to lift.
+    ``off_table`` = left the table footprint (even mid-chase). ``abort_reason``
+    (ee off table / object through box or base) → ``safety-abort``.
+
+    Order: success → safety-abort → never-engaged → off-table → too-late →
+    grasp-slip → early-close → timeout.
     Pass ``z_lift_min=expert.lift_height`` when the expert is available.
-    ``schema`` maps stage ids to meaning; pass ``expert.stage_schema`` so the
-    Pass ``expert.stage_schema`` so numbering stays correct if stages change.
+    ``schema`` maps stage ids to meaning; pass ``expert.stage_schema`` so
+    numbering stays correct if stages change.
     """
     sch = schema if schema is not None else STAGE_SCHEMA
     if success:
         return "success"
+    if abort_reason:
+        return "safety-abort"
+    # Stuck at the first stage: the hand never got to the object.
     if max_stage <= sch.engaged:
+        # Object already gone counts as off-table, not "never tried".
+        if off_table or object_z_min < (table_z - off_table_margin):
+            return "off-table"
         return "never-engaged"
+    # Fell off while chasing / before lift — name the fall, not "too-late".
+    if off_table or object_z_min < (table_z - off_table_margin):
+        if max_stage < sch.lift:
+            return "off-table"
+    # Got close but never reached the lift stage: too slow to catch it.
     if max_stage < sch.lift:
         return "too-late"
+    # Reached lift, never placed. Height tells us if it ever left the table.
     if max_stage < sch.placed:
         if object_z_max < float(z_lift_min):
             return "early-close"
         return "grasp-slip"
-    if object_z_min < (table_z - off_table_margin):
+    # Only call it off-table if the scene says it left the table, or it truly dropped below it.
+    if off_table or object_z_min < (table_z - off_table_margin):
         return "off-table"
     if max_stage < sch.done:
         return "timeout"
+    # Finished all stages but the object ended low: it slipped out.
     if object_z_end < float(z_lift_min):
         return "grasp-slip"
     return "timeout"
@@ -134,14 +174,19 @@ def classify_policy_failure(
     object_z_max: float,
     z_lift_min: float = 0.12,
 ) -> str:
-    """Why a policy run failed. Uses holding (0/1), not expert stages."""
+    """Give one reason a policy run failed (or "success").
+
+    Uses "holding" 0/1 and peak height only. No expert stages here.
+    """
     if success:
         return "success"
+    # Did the object ever count as held? If not, the policy never grabbed it.
     held = False
     if holding is not None and len(np.asarray(holding)):
         held = bool(np.any(np.asarray(holding) > 0.5))
     if not held:
         return "never-held"
+    # Held but never rose to lift height.
     if float(object_z_max) < float(z_lift_min):
         return "held-no-lift"
     return "lifted-no-place"
@@ -152,7 +197,9 @@ def episode_diagnostics(
     *,
     z_lift_min: float = 0.12,
 ) -> dict:
-    """Extract max_stage / z_max / z_end for logging.
+    """Pull the numbers we log next to every result: max stage, min/max/end height.
+
+    They let a human check why a label was chosen (no blind "off-table").
 
     ``z_lift_min`` is echoed for gate logs; pass ``expert.lift_height`` when available.
     """

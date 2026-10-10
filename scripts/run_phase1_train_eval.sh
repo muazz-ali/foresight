@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# After Phase-1 collection finishes: convert → train A/B → eval G1.
+# After Phase-1 collection finishes: convert → train model → eval G1.
 # Envs: convert/train use dynamicVLA_training; eval uses dynamicVLA_isaac.
 set -euo pipefail
+# Paths, step count, and device choices can be overridden, e.g. STEPS=1000.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 P1_DATA="${P1_DATA:-$ROOT/data/p1}"
 REPO_ID="${REPO_ID:-foresight/p1}"
@@ -11,6 +12,8 @@ DEVICE_TRAIN="${DEVICE_TRAIN:-cuda:1}"
 DEVICE_EVAL="${DEVICE_EVAL:-cuda:0}"
 
 echo "[p1] convert $P1_DATA → $LR_ROOT"
+# Step 1: turn our recorded .h5 demos into the format the trainer reads.
+# (conda activate needs conda's shell hook loaded first.)
 # shellcheck disable=SC1091
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate dynamicVLA_training
@@ -20,39 +23,33 @@ python "$ROOT/scripts/convert_to_lerobot.py" \
   --root "$LR_ROOT" \
   --overwrite
 
-echo "[p1] train Model A"
+# Step 2: train the policy (training env, not the sim env).
+echo "[p1] train policy (conditioning pack)"
 python "$ROOT/scripts/train_smolvla.py" \
-  --model A --repo-id "$REPO_ID" --dataset-root "$LR_ROOT" \
-  --output-dir "$ROOT/runs/p1_a" --steps "$STEPS" --device "$DEVICE_TRAIN" \
+  --repo-id "$REPO_ID" --dataset-root "$LR_ROOT" \
+  --output-dir "$ROOT/runs/p1" --steps "$STEPS" --device "$DEVICE_TRAIN" \
   --batch-size 8 --chunk-size 50
 
-echo "[p1] train Model B"
-python "$ROOT/scripts/train_smolvla.py" \
-  --model B --repo-id "$REPO_ID" --dataset-root "$LR_ROOT" \
-  --output-dir "$ROOT/runs/p1_b" --steps "$STEPS" --device "$DEVICE_TRAIN" \
-  --batch-size 8 --chunk-size 50
-
-echo "[p1] eval A / B / B-zero (Isaac)"
+# Step 3: eval twice in Isaac (sim env): normal, then with the 4 numbers zeroed.
+# G1 needs both runs. As written, eval uses its default n=20, so this is a
+# scout only; use n>=80 per speed before making a G1 claim.
+echo "[p1] eval model + model-zero (Isaac)"
 conda activate dynamicVLA_isaac
 python "$ROOT/scripts/eval_policy.py" \
-  --checkpoint "$ROOT/runs/p1_a/pretrained_model" --model A \
+  --checkpoint "$ROOT/runs/p1/pretrained_model" \
   --headless --enable_cameras --device "$DEVICE_EVAL" \
-  -o "$ROOT/data/p1/eval_a"
+  -o "$ROOT/data/p1/eval"
 
 python "$ROOT/scripts/eval_policy.py" \
-  --checkpoint "$ROOT/runs/p1_b/pretrained_model" --model B \
+  --checkpoint "$ROOT/runs/p1/pretrained_model" --zero-conditioning \
   --headless --enable_cameras --device "$DEVICE_EVAL" \
-  -o "$ROOT/data/p1/eval_b"
+  -o "$ROOT/data/p1/eval_zero"
 
-python "$ROOT/scripts/eval_policy.py" \
-  --checkpoint "$ROOT/runs/p1_b/pretrained_model" --model B --zero-conditioning \
-  --headless --enable_cameras --device "$DEVICE_EVAL" \
-  -o "$ROOT/data/p1/eval_b_zero"
-
+# Step 4: merge the reports and check the two rate bars. At n=20, the
+# resulting numerical verdict is still only a scout.
 python "$ROOT/eval/gate_g1.py" \
-  --report-a "$ROOT/data/p1/eval_a/gate_g1_report.json" \
-  --report-b "$ROOT/data/p1/eval_b/gate_g1_report.json" \
-  --report-b-zero "$ROOT/data/p1/eval_b_zero/gate_g1_report.json" \
+  --report "$ROOT/data/p1/eval/gate_g1_report.json" \
+  --report-zero "$ROOT/data/p1/eval_zero/gate_g1_report.json" \
   -o "$ROOT/data/p1/gate_g1_report.json"
 
 echo "[p1] done → $ROOT/data/p1/gate_g1_report.json"

@@ -1,60 +1,107 @@
 # Foresight Phase 0 — Franka-only in-repo scene.
-camera:
-  clip:
-    far: 100.0
-    near: 0.01
-  data_types:
-  - rgb
+#
+# Units: mm, ms, cm/s. load_cfg / load_yaml convert to m / s / m/s.
+#
+#   static_camera / wrist_camera / lighting → cameras + lights
+#   robot                 → arm + fingers
+#   scene                 → table / throw / meshes
+#   state_machine_params  → expert stages (0 → done) + one policy look-ahead
+#   paths / sim           → asset folders + control / physics rate
+
+# =============================================================================
+# STATIC CAMERA — fixed RGB (log / policy key: static_cam)
+# =============================================================================
+static_camera:
+  width: 480
+  height: 360
+  fps: 25                 # match sim.dt_ms (40 → 25 Hz)
   focal_length: 2.3
   focus_distance: 400.0
-  fps: 25
-  height: 360
   horizontal_aperture: 4.6
+  data_types:
+  - rgb
+  clip:
+    near_mm: 10.0
+    far_mm: 100000.0
+  position_mm: [1000.0, 0.0, 600.0]
+  rotation_deg: [0.0, 60.0, 90.0]
+
+# =============================================================================
+# WRIST CAMERA — RGB-D on panda_hand (log / policy key: wrist_cam)
+# =============================================================================
+wrist_camera:
   width: 480
-  # Wrist RGB on panda_hand (offset m, quat wxyz, near/far m).
-  wrist_pos: [0.065, 0.0, 0.0]
-  wrist_quat_wxyz: [0.0, 0.7071068, 0.7071068, 0.0]
-  wrist_clipping_range: [0.01, 2.0]
+  height: 360
+  fps: 25
+  focal_length: 2.3
+  focus_distance: 400.0
+  horizontal_aperture: 4.6
+  data_types:
+  - rgb
+  - depth                 # Isaac Lab distance_to_image_plane (m)
+  pos_mm: [65.0, 0.0, 0.0]
+  quat_wxyz: [0.0, 0.7071068, 0.7071068, 0.0]
+  clipping_range_mm: [10.0, 2000.0]
+
+# =============================================================================
+# ROBOT — Franka
+# =============================================================================
 robot:
   name: franka
-  # TCP offset from panda_hand (Isaac Lab Franka DiffIK default)
-  tcp_offset: [0.0, 0.0, 0.107]
-  gripper_open: 0.04
-  gripper_close: 0.0
-  # EE pose: pos(3) + quat wxyz(4). Place XY/Z come from the container.
-  init_pose: [0.45, 0.0, 0.40, 0.0, 1.0, 0.0, 0.0]
-  max_reach_dist: 0.85
+  tcp_offset_mm: [0.0, 0.0, 107.0]   # DiffIK default from panda_hand
+  gripper_open_mm: 40.0
+  gripper_close_mm: 0.0
+  init_pose_mm: [450.0, 0.0, 400.0, 0.0, 1.0, 0.0, 0.0]  # xyz + quat wxyz
+  max_reach_dist_mm: 850.0
+  # Finger travel time (reflex). Expert dwell = hold_closed_* below. Measure:
+  # tools/diag/measure_gripper_close.py
+  gripper_close_time_ms: 80
+
+# =============================================================================
+# SCENE — table / house, throw, meshes
+# =============================================================================
 scene:
-  table_height: 0.0
-  table_size: [1.0, 1.0, 0.02]
-  table_pos: [0.50, 0.0, -0.01]
+  # true = house USD + throw (no wall bounce). false = floor bounce box + weld.
+  use_house: true
+  # use_weld_grasp: true   # force weld in a house (default: physics in house)
+  table_height_mm: 0.0              # floor mode only; house overwrites
+  table_size_mm: [1000.0, 1000.0, 20.0]
+  table_pos_mm: [500.0, 0.0, -10.0]
+
   object_mass: 0.05
   object_friction: 2.0
-  # Household USDs from paths.object_dir (DynamicVLA asset tree). true = sphere G0 debug.
-  use_primitive: false
-  object_radius: 0.03 # sphere radius when use_primitive is true
+  use_primitive: false              # true = debug sphere
+  object_radius_mm: 30.0            # only if use_primitive
   container_mass: 0.1
   n_containers: 1
-  place_hover_above_container: 0.08
-  spawn_xy_pad: 0.03 # inset object spawn from bounce walls (m)
-  container_jitter_xy: 0.02 # per-episode container XY jitter (m)
-  container_xy_clip: [[0.45, 0.58], [0.26, 0.34]] # clip jitter so bowl stays off play band
-  attach_z_offset_max: -0.005 # weld object at most this far below EE (m)
-  # Object bounce box: in front of Franka, clear of base (~origin) and bowl (+Y).
-  object_xy_bounds: [[0.48, 0.72], [-0.20, 0.10]]
-  # Bad home-reach / stage-8 stall meshes (diag: onion+bowl OK; these fail).
-  usd_exclude:
-  - plate02
-  - tray08
-  # Reachable side pocket (~0.58 m from base); robot drops here without crowding play.
-  container_xy: [0.50, 0.30]
+  place_hover_above_container_mm: 80.0
+  spawn_xy_pad_mm: 30.0             # inset spawn from play-band edge
+  container_jitter_xy_mm: 20.0
+  container_xy_clip_mm: [[450.0, 580.0], [260.0, 340.0]]  # floor default
+  attach_z_offset_max_mm: -5.0      # weld: object at most this far below EE
+  object_xy_bounds_mm: [[480.0, 720.0], [-200.0, 100.0]]  # spawn / aim band
+  container_xy_mm: [500.0, 300.0]
+
+  exclude_usd_containers:
+  - plate
+  - tray
+  - placemat
+  exclude_usd_objects:
+  - tomato                          # ~85 mm > gripper
+  - beer
+  - bottle
+  # Franka open ≈ 2*gripper_open ≈ 80 mm.
+  max_object_width_mm: 75.0
+  min_container_clearance_mm: 10.0   # container taller than object by this
+  min_container_xy_margin_mm: 10.0   # container footprint bigger than object
+  robot_base_keepout_mm: 120.0       # coast through pedestal → safety-abort
+  ee_table_margin_mm: 20.0           # hand past table footprint → safety-abort
+
   object_categories:
   - apple
   - avocado
-  # - beer
-  # - bottle
-  # - can
-  # - cup
+  - can
+  - cup
   - egg
   - kiwi
   - lemon
@@ -64,53 +111,87 @@ scene:
   - peach
   - potato
   - tangerine
-  - tomato
+  # Held-out `unseen` only via --object-usd.
   container_categories:
   - bowl
   - box
-  - plate
-  # - placemat
-  - tray
-  cameras:
-  # Third-person RGB (primary tracking view). Wrist cam uses camera.wrist_*.
-  - name: static_cam
-    position: [1.0, 0.0, 0.60]
-    rotation_deg: [0.0, 60.0, 90.0]
 
-    
+# =============================================================================
+# LIGHTING — house mode (behind / above static_camera)
+# =============================================================================
+lighting:
+  temperature: [4000, 8000]
+  intensity: [150, 750]
+  behind_mm: [3000.0, 12000.0]
+  above_mm: [2000.0, 15000.0]
+  side_mm: [-2000.0, 2000.0]
+
+# =============================================================================
+# EXPERT — knobs in stage order (0 → done)
+# =============================================================================
 state_machine_params:
-  lookahead_s: 0.25 # robot arm lookahead time
-  conditioning_delta_s: 0.25 # policy live-pack Δ (s); separate from aiming
-  hover_z: 0.08 # meters above object top at the start of intercept
-  ee_settle_tol: 0.05 # treat speed below this as still (m/s)
-  servo_xy_tol: 0.03 # XY servo gate for carry/lower/home (m)
-  place_xy_tol: 0.12 # container XY gate only; match success container_xy_tol (m)
-  approach_z_tol: 0.03 # max Z error (m) for servo height gates
-  home_z_tol: 0.05 # max Z error (m) to count the arm as home (IK sits ~2–5 cm off init Z)
-  settle_s: 0.2 # seconds at start before intercept begins
-  close_gripper_s: 0.15 # seconds fingers stay closed before we lift / open before home
-  lift_height: 0.12 # meters to raise the hand after a good close
-  drop_z_gap: 0.04 # extra height above object rest pose inside the box (m)
-  drop_rim_clear_m: 0.01 # drop Z stays this far below container rim (m)
-  inference_window_s: 10 # max seconds per demo run; timeout = failure
-  # intercept-servo knobs
-  servo_lag_s: 0.16 # EE command->motion lag (s). CALIBRATE with tools/diag/calibrate_servo_lag.py
-  ee_speed_max: 0.90 # usable TCP speed (m/s) for the rendezvous solve. MEASURE, do not guess
-  intercept_iters: 3 # fixed-point steps for the travel-time solve
-  track_xy_tol: 0.02 # XY error to the object *now* that counts as "riding it" (m)
-  track_hold_s: 0.08 # must stay locked this long before committing to descend (s)
-  bounce_guard_s: 0.10 # floor on straight-line time before a wall reversal (s)
-  z_release_radius: 0.12 # XY error (m) at which the hand starts walking Z down onto the object
-  grasp_tol_step_k: 0.6 # grasp gate floor = k * speed * dt (one step of object travel)
-  grasp_xy_tol: 0.02 # base XY grasp gate (m); floors up with speed
-  grasp_z_tol: 0.02 # base Z grasp gate (m)
-  stage_timeout_s: 1.5 # per-stage stall cap (s) for post-grasp stages
-  grasp_stage_timeout_s: 3.0 # longer cap for intercept/descend (needs bounce windows)
-  max_retries: 3 # re-intercept attempts before giving up
 
+  # Policy pack only (not used for aiming). Often same as max_aim_ahead_ms.
+  policy_look_ahead_ms: 250
+
+  # --- stage 0: start ---
+  wait_at_home_ms: 200
+
+  # --- stage 1: chase / ride ---
+  max_aim_ahead_ms: 250
+  # Aim farther for tip lag (not a wait). Measure: tools/diag/calibrate_servo_lag.py
+  tip_lag_pad_ms: 160
+  hand_speed_max_cm_s: 90.0
+  aim_refine_iters: 3
+  hover_above_object_mm: 80.0
+  start_lowering_xy_mm: 120.0       # begin walking Z down when this close in XY
+  riding_xy_ok_mm: 10.0
+  riding_z_ok_mm: 30.0              # also used for drop height gates
+  riding_hold_ms: 50
+  # Floor only: need this much clear path before a wall reverse. House: unused.
+  min_wait_after_bounce_ms: 100
+  object_still_cm_s: 5.0            # slower → skip wall check
+
+  # --- stage 2: go down ---
+  grasp_xy_ok_mm: 10.0              # base; grows with speed via grasp_tol_grows_k
+  grasp_z_ok_mm: 10.0               # weld mode
+  grasp_tol_grows_k: 0.6
+  physics_grasp_z_ok_mm: 8.0        # house / PhysX (tighter)
+
+  # --- stage 3: close ---
+  # Dwell after close (not finger travel = robot.gripper_close_time_ms).
+  hold_closed_weld_ms: 100
+  hold_closed_physics_ms: 300
+  use_reflex: false
+  wrist_close_depth_mm: 0.0         # 0 = off (use GT hand–object Z)
+
+  # --- stages 4–7: lift / carry / lower / open ---
+  lift_height_mm: 120.0
+  slip_if_farther_mm: 100.0
+  near_enough_xy_mm: 30.0           # carry / lower / home
+  drop_above_rest_mm: 40.0
+  drop_below_rim_mm: 10.0
+  in_box_xy_ok_mm: 120.0
+
+  # --- stage 8: home ---
+  home_z_ok_mm: 50.0
+
+  # --- budgets ---
+  # Whole-demo ceiling. Throw miss stops earlier via off_table. Do not set ~1000.
+  episode_max_ms: 10000
+  stall_timeout_ms: 1500
+  chase_stall_timeout_ms: 3000
+  max_retries: 3
+
+# =============================================================================
+# PATHS + SIM CLOCK
+# =============================================================================
 paths:
   object_dir: /home/gpuadmin/Desktop/muazzam/objects
   scene_dir: /home/gpuadmin/Desktop/muazzam/scenes
+
 sim:
-  dt: 0.04
+  dt_ms: 40                         # control / cameras / logs = 25 Hz
+  # House only: physics steps per control step (4 → 100 Hz). Floor always 1.
+  physics_substeps: 4
   device: cuda:0

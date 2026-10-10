@@ -282,7 +282,7 @@ def _load_lerobot_cond_stats() -> dict | None:
 
 
 def _norm_stats_from_h5_pool(cond_mean: np.ndarray, cond_std: np.ndarray, cond_min: np.ndarray, cond_max: np.ndarray) -> dict:
-    """Simulate expand_state_stats merge for Model B conditioning dims."""
+    """Simulate expand_state_stats merge for concatenated conditioning dims."""
     fake_stats = {
         "observation.state": {
             "min": np.zeros(PROPRIO_DIM, np.float32),
@@ -299,7 +299,7 @@ def _norm_stats_from_h5_pool(cond_mean: np.ndarray, cond_std: np.ndarray, cond_m
             "count": np.array([1]),
         },
     }
-    merged = expand_state_stats(fake_stats, "B")
+    merged = expand_state_stats(fake_stats)
     st = merged["observation.state"]
     cond_std_m = st["std"][PROPRIO_DIM:]
     zero_std_dims = [i for i, s in enumerate(cond_std_m) if float(s) < STD_EPS]

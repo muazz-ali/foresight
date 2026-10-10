@@ -37,11 +37,11 @@ Tag every subagent Task with `WORKSTREAM: <tag>`.
 
 | Tag | Deliverable | Gate focus |
 |---|---|---|
-| `sim-scene` | In-repo scene + Foresight expert + logging | G0 |
+| `sim-scene` | In-repo scene + Foresight expert + logging (throw / no-bounce for G3) | G0, G3 |
 | `perception` | Track → filter → predict | G2 |
-| `policy` | A vs B training + look-ahead / noise aug. Pack **Δ**. No latent WM. | G1 |
-| `control` | Buffer + reflex + coast/safety | G3 |
-| `eval` | Speed curve, RMSE, **policy** labels (`never-glued / glued-no-lift / …`). n=20 scout; n≥80 to claim G1. | all gates |
+| `policy` | SmolVLA + 4-number pack, look-ahead / noise aug. Pack **Δ** when delay varies. No latent WM. Last sim retrain = G3. | G1, G3 |
+| `control` | Buffer + reflex + coast/safety (same Phase 3 as throw; before the last collect) | G3 |
+| `eval` | Speed curve, RMSE, **policy** labels (`never-glued / glued-no-lift / …`). n=20 scout; n≥80 to claim. | all gates |
 | `explore` | Read-only investigation | — |
 
 ### Handoff checklist

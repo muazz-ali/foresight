@@ -37,13 +37,25 @@ DROP = np.array([0.50, 0.30, 0.06], dtype=np.float64)
 
 
 def load_cfg() -> dict:
-    with _YAML.open() as f:
-        return yaml.safe_load(f)
+    from interfaces.config import load_yaml
+
+    return load_yaml(_YAML)
 
 
 @pytest.fixture
 def cfg() -> dict:
-    return load_cfg()
+    """Floor / bounce-box config (use_house false): the legacy bounce tests run on this."""
+    c = load_cfg()
+    c["scene"]["use_house"] = False
+    return c
+
+
+@pytest.fixture
+def throw_cfg() -> dict:
+    """House / throw config straight from the yaml (use_house true): no bounce."""
+    c = load_cfg()
+    assert c["scene"]["use_house"] is True
+    return c
 
 
 @pytest.fixture
@@ -193,9 +205,9 @@ class FakeArm:
 
     Commands take effect one step late, matching the real loop: ``collect.py``
     reads the pose, calls the expert, writes the target, *then* steps physics.
-    That is why the expert's ``tau`` is ``servo_lag_s + dt`` and not just the
-    servo lag — drop the delay here and the surrogate flatters the expert by
-    exactly ``v * dt`` (1.6 cm at 40 cm/s, more than ``track_xy_tol``).
+    That is why the expert's ``tau`` is ``robot_approach_pad_s + dt`` and not
+    just the tip pad — drop the delay here and the surrogate flatters the expert
+    by exactly ``v * dt`` (1.6 cm at 40 cm/s, more than ``track_xy_tol``).
     """
 
     def __init__(self, pos, *, tau: float, speed_max: float, dt: float):
@@ -231,16 +243,24 @@ def run_fake_episode(
     sm.set_box_poses(CARRY, drop_pos=DROP)
 
     rng = np.random.default_rng(seed)
-    (xmin, xmax), (ymin, ymax) = sm.xy_bounds
-    obj = np.array(
-        [rng.uniform(xmin + 0.03, xmax - 0.03), rng.uniform(ymin + 0.03, ymax - 0.03), 0.03]
-    )
-    th = rng.uniform(0.0, 2.0 * np.pi)
-    vel = np.array([speed * np.cos(th), speed * np.sin(th), 0.0])
+    if sm.throw_mode:
+        # Aimed throw, same sampler as the scene. No walls: sm.xy_bounds is None.
+        from sim.house_layout import sample_throw
+
+        b = cfg["scene"]["object_xy_bounds"]
+        p0, vel = sample_throw(rng, ((b[0][0], b[0][1]), (b[1][0], b[1][1])), speed=speed)
+        obj = np.array([p0[0], p0[1], 0.03])
+    else:
+        (xmin, xmax), (ymin, ymax) = sm.xy_bounds
+        obj = np.array(
+            [rng.uniform(xmin + 0.03, xmax - 0.03), rng.uniform(ymin + 0.03, ymax - 0.03), 0.03]
+        )
+        th = rng.uniform(0.0, 2.0 * np.pi)
+        vel = np.array([speed * np.cos(th), speed * np.sin(th), 0.0])
 
     arm = FakeArm(
         cfg["robot"]["init_pose"][:3],
-        tau=float(tau_true if tau_true is not None else sm.servo_lag_s),
+        tau=float(tau_true if tau_true is not None else sm.robot_approach_pad_s),
         speed_max=float(speed_max_true if speed_max_true is not None else sm.ee_speed_max),
         dt=dt,
     )
@@ -321,7 +341,12 @@ def test_80cms_is_bounded_by_the_arm_not_the_logic(cfg):
     assert all(r["max_stage"] <= STAGE_DESCEND for r in stock), "expected an intercept stall"
 
     fast = yaml.safe_load(yaml.safe_dump(cfg))  # deep copy
-    fast["state_machine_params"]["servo_lag_s"] = 0.08
+    fast["state_machine_params"]["robot_approach_pad_s"] = 0.08
+    # Pin the gates this claim was measured with (yaml may be tighter for house).
+    fast["state_machine_params"]["track_xy_tol"] = 0.02
+    fast["state_machine_params"]["grasp_xy_tol"] = 0.02
+    fast["state_machine_params"]["grasp_z_tol"] = 0.02
+    fast["state_machine_params"]["track_hold_s"] = 0.08
     tuned = [
         run_fake_episode(fast, 0.80, seed=s, tau_true=0.08, speed_max_true=0.90)
         for s in range(10)
@@ -361,4 +386,130 @@ def test_stage_schema_matches_the_constants():
             schema=STAGE_SCHEMA,
         )
         == "too-late"
+    )
+
+
+# ------------------------------------------------------- throw mode (no bounce)
+
+
+def test_throw_mode_has_no_walls(throw_cfg):
+    sm = PickPlaceStateMachine(throw_cfg, dt=float(throw_cfg["sim"]["dt"]))
+    sm.set_box_poses(CARRY, drop_pos=DROP)
+    assert sm.throw_mode and sm.xy_bounds is None
+    (xmin, xmax), (ymin, ymax) = throw_cfg["scene"]["object_xy_bounds"]
+    # Next to the band edge, flying at it: no wall wait, forecast goes straight through.
+    obj = np.array([xmax - 0.01, 0.0, 0.03])
+    vel = np.array([0.80, 0.0, 0.0])
+    on_top = np.array([obj[0], obj[1], obj[2] + sm.grasp_z_tol])
+    assert sm._time_to_wall_s(obj, vel) == float("inf")
+    assert sm._bounce_clear(obj, vel, on_top)
+    pred = sm._forecast(obj, vel, 0.25)
+    np.testing.assert_allclose(pred, obj + vel * 0.25, atol=1e-9)
+    assert pred[0] > xmax, "forecast must leave the band (constant velocity)"
+
+
+def test_motion_no_bounce_without_bounds():
+    from sim.motion import kinematic_forecast
+
+    pos, vel = np.array([0.69, 0.0, 0.03]), np.array([0.4, 0.0, 0.0])
+    p, v = kinematic_forecast(pos, vel, 0.5, 0.04, xy_bounds=None)
+    np.testing.assert_allclose(p, pos + vel * 0.5, atol=1e-9)
+    np.testing.assert_allclose(v, vel)
+    bounds = ((0.4, 0.7), (-0.2, 0.2))
+    pb, vb = kinematic_forecast(pos, vel, 0.5, 0.04, xy_bounds=bounds)
+    assert vb[0] < 0 and pb[0] <= 0.7 + 1e-9, "bounce must stay when bounds are set"
+
+
+@pytest.mark.parametrize("speed", [0.0, 0.10, 0.20])
+def test_throw_closed_loop_completes(throw_cfg, speed):
+    """Fake arm + aimed throw, no walls: expert still reaches done and lifts."""
+    runs = [run_fake_episode(throw_cfg, speed, seed=s) for s in range(10)]
+    done = sum(r["done"] for r in runs)
+    assert done >= 9, [{k: r[k] for k in ("max_stage", "retries", "grasp_err_xy")} for r in runs]
+
+
+def test_slip_goes_back_to_intercept(sm):
+    """Physics grasp: object far from the hand during lift → re-intercept, not carry on."""
+    sm.stage = STAGE_LIFT
+    sm.lift_z = 0.2
+    ee = np.array([0.55, 0.0, 0.15])
+    obj = np.array([0.55, 0.0, 0.03])  # 12 cm below the hand
+    cmd = sm.step(_state(obj, np.zeros(3)), ee, sm._down_quat)
+    assert cmd.stage == STAGE_APPROACH and sm.retries == 1
+    # Held (object at the hand) keeps lifting.
+    sm.stage = STAGE_LIFT
+    cmd = sm.step(_state(ee.copy(), np.zeros(3)), ee, sm._down_quat)
+    assert cmd.stage == STAGE_LIFT
+
+
+def test_depth_close_gate(cfg):
+    """Depth gate on: close when depth is under the threshold; NaN falls back to GT Z."""
+    cfg["state_machine_params"]["close_depth_m"] = 0.08
+    sm = PickPlaceStateMachine(cfg, dt=float(cfg["sim"]["dt"]))
+    sm.set_box_poses(CARRY, drop_pos=DROP)
+    obj = np.array([0.55, 0.0, 0.03])
+    high = np.array([0.55, 0.0, 0.03 + 0.06])  # GT Z gate (2 cm) would say "not yet"
+    sm.stage = STAGE_DESCEND
+    assert sm.step(_state(obj, np.zeros(3)), high, sm._down_quat, wrist_depth_m=0.05).stage == STAGE_CLOSE
+    sm.stage = STAGE_DESCEND
+    assert sm.step(_state(obj, np.zeros(3)), high, sm._down_quat, wrist_depth_m=0.30).stage == STAGE_DESCEND
+    sm.stage = STAGE_DESCEND
+    assert sm.step(_state(obj, np.zeros(3)), high, sm._down_quat, wrist_depth_m=float("nan")).stage == STAGE_DESCEND
+    sm.stage = STAGE_DESCEND
+    assert sm.step(_state(obj, np.zeros(3)), obj.copy(), sm._down_quat, wrist_depth_m=float("nan")).stage == STAGE_CLOSE
+
+
+def test_physics_grasp_helpers():
+    from sim.physics_grasp import gripper_depth_m, xy_outside_box
+
+    d = np.full((40, 60), np.inf, dtype=np.float32)
+    assert np.isnan(gripper_depth_m(d)) and np.isnan(gripper_depth_m(None))
+    d[35, 30] = 0.07  # bottom centre, between the fingertips
+    d[20, 30] = 0.01  # image centre (table) is outside the window
+    d[39, 2] = 0.01  # a fingertip in the bottom corner is outside too
+    assert gripper_depth_m(d[..., None]) == pytest.approx(0.07, abs=1e-6)
+    lo, hi = np.array([0.0, -0.5]), np.array([1.2, 0.5])
+    assert not xy_outside_box([0.6, 0.0], lo, hi)
+    assert xy_outside_box([1.3, 0.0], lo, hi) and xy_outside_box([0.6, -0.6], lo, hi)
+
+
+def test_off_table_flag_labels_a_lost_object():
+    from sim.success import classify_failure
+
+    kw = dict(success=False, max_stage=8, object_z_min=0.03, object_z_max=0.2,
+              object_z_end=0.03, schema=None)
+    assert classify_failure(**kw) == "timeout"
+    assert classify_failure(**kw, off_table=True) == "off-table"
+
+
+def test_off_table_during_chase_not_too_late():
+    """Fall mid-intercept used to be labelled too-late; name the fall."""
+    from sim.success import classify_failure
+
+    assert (
+        classify_failure(
+            success=False,
+            max_stage=2,
+            object_z_min=-0.07,
+            object_z_max=0.04,
+            object_z_end=-0.07,
+            off_table=True,
+        )
+        == "off-table"
+    )
+
+
+def test_abort_reason_is_safety_abort():
+    from sim.success import classify_failure
+
+    assert (
+        classify_failure(
+            success=False,
+            max_stage=2,
+            object_z_min=0.04,
+            object_z_max=0.04,
+            object_z_end=0.04,
+            abort_reason="object-through-container",
+        )
+        == "safety-abort"
     )

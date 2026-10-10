@@ -8,6 +8,13 @@ Launch (conda: dynamicVLA_isaac):
 
 Object/container USD meshes are fixed for the process (2A). Diversify with
 distinct --seed across workers, or pass --object-usd / --container-usd.
+
+What it does: runs our scripted expert at set object speeds, scores each try,
+and writes a pass/fail report for Gate G0 (>=70% per speed, ~100 eps/hour).
+It runs by hand from the shell, in the sim conda env, with Isaac launched first.
+It must NOT use DynamicVLA code, and it does not train anything. Success comes
+from sim/success.py, not from the expert's own stage latch.
+Without --g0 it is only a smoke check, not a gate result.
 """
 
 from __future__ import annotations
@@ -27,14 +34,18 @@ FORESIGHT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CFG = FORESIGHT_ROOT / "sim" / "phase0_cfg.yaml"
 DEFAULT_OUT = FORESIGHT_ROOT / "data" / "g0"
 
-G0_SPEEDS_M_S = (0.0, 0.10, 0.15, 0.20)  # same bins as G1 today; plan G0 also allowed 40 cm/s
+G0_SPEEDS_M_S = (0.0, 0.10, 0.15, 0.20)  # plan G0 bins: 0-20 cm/s. Same bins G1 uses.
+# 20 tries per speed is a scout size. Fine for G0 smoke, too small to settle a close call.
 G0_TRIALS_PER_SPEED = 20
+# Gate G0 pass line per speed (foresight_plan.md). Do not move it to make a run pass.
 G0_SUCCESS_THRESHOLD = 0.70
 
+# So `import sim...` works when run as a script from any folder.
 sys.path.insert(0, str(FORESIGHT_ROOT))
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """Command-line flags for this script (Isaac's own flags are added later in main)."""
     parser = argparse.ArgumentParser(description="Foresight Phase 0 / Gate G0 (Franka)")
     parser.add_argument("--speed", type=float, default=None)
     parser.add_argument(
@@ -43,6 +54,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="comma-separated speeds in m/s (e.g. 0.0,0.05). Overrides --speed.",
     )
+    # --g0 = the real gate run (all 4 speeds, 20 tries each). Without it: smoke check.
     parser.add_argument("--g0", action="store_true")
     parser.add_argument("-n", "--n_simulations", type=int, default=5)
     parser.add_argument("--trials-per-speed", type=int, default=G0_TRIALS_PER_SPEED)
@@ -83,7 +95,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _setup_logging(output_dir: str | Path, *, debug: bool = False) -> Path:
-    """Console + file logger under output_dir (phase0.log). --debug → DEBUG."""
+    """Console + file logger under output_dir (phase0.log). --debug → DEBUG.
+
+    Why here and after AppLauncher: Isaac resets logging on start, so we set
+    ours up last. The file is appended to, so old runs stay in it.
+    """
     from sim.state_machine_logs import HumanFormatter
 
     out = Path(output_dir)
@@ -117,6 +133,11 @@ def _setup_logging(output_dir: str | Path, *, debug: bool = False) -> Path:
 
 
 def _count_failure(metrics_path: Path, speed: float) -> dict:
+    """Count each failure label for one speed, from metrics.jsonl.
+
+    Why: the pass rate says HOW MANY failed; this says WHY (never-engaged,
+    too-late, grasp-slip, ...).
+    """
     counts: dict[str, int] = {}
     if not metrics_path.exists():
         return counts
@@ -131,6 +152,12 @@ def _count_failure(metrics_path: Path, speed: float) -> dict:
 
 
 def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path: Path) -> dict:
+    """Run ``n_trials`` episodes at one object speed. Returns that speed's score.
+
+    Each try: run the episode → judge success → pick a failure label → save
+    files → append one line to metrics.jsonl. A crash counts as a failure,
+    never as a skip, so the pass rate cannot be flattered.
+    """
     from sim.collect import episode_for_json, run_episode, write_episode_h5
     from sim.state_machine_logs import log_blank, log_event, log_result, log_section, speed_title
     from sim.success import classify_failure, episode_diagnostics, episode_success
@@ -140,11 +167,14 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
 
     attempts = successes = 0
     t0 = time.time()
+    # Offset the seed by speed so each speed bin gets its own episodes,
+    # but the same --seed always repeats the same run.
     seed = int(args.seed) + int(round(speed * 1000))
 
     log = logging.getLogger()
     log_section(log, speed_title(speed))
 
+    # Count every try, pass or fail. No retries here: a bad run stays in the score.
     while attempts < n_trials:
         log_blank(log)
         log_event(
@@ -171,6 +201,9 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
                     )
                 ),
             )
+            # OUR success rule (sim/success.py): object lifted high enough,
+            # run reached the "done" stage, object ended up high or on the box.
+            # Not DynamicVLA's object_picked.
             success = episode_success(
                 episode,
                 z_lift_min=float(expert.lift_height),
@@ -178,6 +211,7 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
                 place_stage=int(expert.stage_schema.done),
             )
         except Exception as ex:
+            # Log the full error, remember it, and score this try as a failure.
             logging.exception("Episode crashed (seed=%s): %s", seed, ex)
             err = str(ex)
             success = False
@@ -186,9 +220,13 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
         if success:
             successes += 1
 
+        # Facts about the run (farthest stage, object height low/high/end).
+        # They go in the record so a failure label can be double-checked.
         diag = episode_diagnostics(
             episode, z_lift_min=float(expert.lift_height)
         )
+        # Label WHY it failed (never-engaged | too-late | early-close | ...),
+        # using the stage ids from the expert. "success" if it passed.
         failure = classify_failure(
             success=success,
             max_stage=diag["max_stage"],
@@ -197,10 +235,14 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
             object_z_end=diag["z_end"],
             z_lift_min=float(expert.lift_height),
             schema=expert.stage_schema,
+            off_table=bool(meta.get("off_table", False)),
+            abort_reason=meta.get("abort_reason"),
         )
+        # A crash overrides any other label: we have no trustworthy data to classify.
         if err:
             failure = "safety-abort"
 
+        # One line per try in metrics.jsonl. This is what the gate report counts from.
         record = {
             "speed_m_s": speed,
             "seed": seed,
@@ -217,9 +259,12 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
             "grasp_err_z": meta.get("grasp_err_z"),
             "grasp_speed_m_s": meta.get("grasp_speed_m_s"),
             "retries": meta.get("retries"),
+            "off_table": bool(meta.get("off_table", False)),
+            "abort_reason": meta.get("abort_reason"),
         }
 
         video_path = None
+        # Save files for wins always; for failures only with --debug (to look at them).
         if episode is not None and args.save and (success or args.debug):
             ep_name = f"p0_franka_{speed:.2f}_{seed}_{uuid.uuid4().hex[:4]}"
             payload = {
@@ -259,11 +304,13 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
                 },
             )
             if args.debug:
-                from sim.video import write_debug_mp4
+                from sim.video import gates_from_expert, write_debug_mp4
 
-                fps = int(scene.cfg["camera"]["fps"])
+                fps = int(scene.cfg["static_camera"]["fps"])
                 video_path = out_dir / f"{ep_name}.mp4"
-                write_debug_mp4(episode, video_path, fps=fps)
+                write_debug_mp4(
+                    episode, video_path, fps=fps, gates=gates_from_expert(expert)
+                )
 
         log_result(
             log,
@@ -279,10 +326,12 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
         with open(metrics_path, "a") as fp:
             fp.write(json.dumps(record) + "\n")
 
+        # Next try gets a new seed: different start, still repeatable.
         seed += 1
 
     elapsed = time.time() - t0
     rate = successes / attempts if attempts else 0.0
+    # Speed check for the gate: how many tries per hour at this pace.
     eps_per_hour = attempts / elapsed * 3600 if elapsed > 0 else 0.0
     summary = {
         "speed_m_s": speed,
@@ -306,8 +355,13 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
 
 
 def run(args, scene, expert) -> dict:
+    """Run every speed bin, then write ``gate_g0_report.json`` and print it.
+
+    Pick of speeds: --g0 wins, then --speeds, then --speed, else 0.0 only.
+    """
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     metrics_path = Path(args.output_dir) / "metrics.jsonl"
+    # Start clean: stale lines from an old run would be counted in this score.
     if metrics_path.exists():
         metrics_path.unlink()
 
@@ -334,6 +388,9 @@ def run(args, scene, expert) -> dict:
     overall_success = sum(s["successes"] for s in summaries)
     overall_rate = overall_success / overall_attempts if overall_attempts else 0.0
     throughput = overall_attempts / wall * 3600 if wall > 0 else 0.0
+    # Gate rule: EVERY speed must clear 70% — one strong speed cannot cover a
+    # weak one. Throughput bar here is >= 100 episodes/hour; the plan asks for
+    # "hundreds per hour", so this code checks the looser number.
     bins_pass = all(s["gate_g0_bin_pass"] for s in summaries)
     throughput_pass = throughput >= 100.0
 
@@ -350,8 +407,13 @@ def run(args, scene, expert) -> dict:
         "overall_throughput_eps_per_hour": throughput,
         "all_bins_pass": bins_pass,
         "throughput_pass": throughput_pass,
+        # Only a full --g0 run checks throughput. A smoke run reports bins only,
+        # and the log says it is not a gate result.
         "gate_g0_pass": bool(bins_pass and throughput_pass) if args.g0 else bool(bins_pass),
         "wall_time_s": wall,
+        # Physics rate (house mode runs several physics substeps per control step).
+        "control_dt_s": float(scene.dt),
+        "physics_substeps": int(getattr(scene, "n_substeps", 1)),
     }
     report_path = Path(args.output_dir) / "gate_g0_report.json"
     with open(report_path, "w") as fp:
@@ -390,6 +452,11 @@ def run(args, scene, expert) -> dict:
 
 
 def main() -> None:
+    """Start Isaac, build the scene and expert, run, then exit.
+
+    Order matters: Isaac's AppLauncher must start BEFORE any isaaclab / omni
+    import, or imports fail. That is why most imports live inside this function.
+    """
     print("[foresight] starting AppLauncher…", flush=True)
 
     from isaaclab.app import AppLauncher
@@ -425,10 +492,12 @@ def main() -> None:
 
     from sim.state_machine import PickPlaceStateMachine as ExpertClass
 
+    # Settings live in the yaml; the --device flag may override the GPU choice.
     cfg = load_cfg(args.sim_cfg_file)
     if getattr(args, "device", None):
         cfg.setdefault("sim", {})["device"] = args.device
 
+    # asset_seed picks the object / box meshes: same --seed, same assets.
     scene = Phase0Scene(
         cfg,
         enable_cameras=bool(args.enable_cameras),
@@ -440,7 +509,7 @@ def main() -> None:
     log_event(log, f"Expert intercept-servo. Step time {expert.dt:.3f} s. Look-ahead {expert.lookahead_s:.2f} s.")
     log_event(
         log,
-        f"Servo lag {expert.servo_lag_s:.3f} s (tau {expert.tau:.3f} s), "
+        f"Robot approach pad {expert.robot_approach_pad_s:.3f} s (tau {expert.tau:.3f} s), "
         f"hand speed cap {expert.ee_speed_max:.2f} m/s, "
         f"bounce guard {expert.bounce_guard_s:.2f} s.",
     )
@@ -458,7 +527,8 @@ def main() -> None:
         logging.exception("Phase 0 run failed")
         raise
     finally:
-        # Kit `app.close()` often hangs headless; report is already on disk.
+        # Hard exit: Isaac's normal close often hangs when headless. Safe here
+        # because the report and metrics are already written to disk.
         log_event(log, "Exiting (skip app.close hang)")
         os._exit(0)
 
