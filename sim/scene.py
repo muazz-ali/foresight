@@ -5,8 +5,8 @@ Owns: Franka Panda + work surface + one rigid object + static container
 
 ``scene.use_house: true`` loads a random house USD (paths.scene_dir), moves it
 so a free long table edge sits at the world origin (robot stays at 0,0,0),
-randomizes lights, and aims throws across a catch band. Floor mode keeps the
-old kinematic slab. No DynamicVLA import — only their geometry knobs.
+randomizes lights, and aims throws across a catch band. 
+Floor mode keeps the old kinematic slab.
 
 Grasp (``scene.use_weld_grasp``): house default = real PhysX (fingers close,
 no weld; the object is scripted until the expert closes, then free). Floor
@@ -155,11 +155,14 @@ def _filter_holdable_containers(
     *,
     min_clearance_m: float,
     min_xy_margin_m: float,
+    open_categories: set[str] | None = None,
+    finger_clearance_m: float = 0.0,
 ) -> list[Path]:
     """Drop flat / tiny containers that cannot keep this object after place."""
     from sim.asset_filters import container_can_hold
     from sim.state_machine_logs import fmt_size_cm
 
+    open_cats = {c.lower() for c in (open_categories or set())}
     kept: list[Path] = []
     for p in catalog:
         try:
@@ -167,11 +170,14 @@ def _filter_holdable_containers(
         except RuntimeError as ex:
             logger.warning("Skip container %s (bbox failed): %s", p.name, ex)
             continue
+        open_top = p.parent.name.lower() in open_cats
         if container_can_hold(
             object_size,
             size,
             min_clearance_m=min_clearance_m,
             min_xy_margin_m=min_xy_margin_m,
+            open_top=open_top,
+            finger_clearance_m=finger_clearance_m,
         ):
             kept.append(p)
         else:
@@ -245,15 +251,18 @@ def pick_usd(
         return path
 
     # Category shorthand: --object-usd can → random USD under objects/can/
+    # Only use the filtered catalog. Never fall back to the raw folder — that
+    # re-admits excluded / too-small meshes and then crashes on the fit check.
     if object_dir is not None:
         cat_dir = object_dir / raw
         if cat_dir.is_dir():
-            # Prefer catalog (already exclude-filtered) when it covers this category.
             pool = [p for p in catalog if p.parent.resolve() == cat_dir.resolve()]
             if not pool:
-                pool = sorted(cat_dir.glob("*.usd"))
-            if not pool:
-                raise FileNotFoundError(f"No .usd files in category dir: {cat_dir}")
+                raise FileNotFoundError(
+                    f"No usable .usd left for category {raw!r} after exclude/size "
+                    f"filters (dir exists: {cat_dir}). Pick another category or "
+                    f"relax scene fit knobs."
+                )
             return pool[int(rng.integers(0, len(pool)))]
 
     stem = path.stem if raw.endswith(".usd") else raw
@@ -402,6 +411,13 @@ class Phase0Scene:
         )
         self._min_container_clearance_m = float(sc.get("min_container_clearance_m", 0.01))
         self._min_container_xy_margin_m = float(sc.get("min_container_xy_margin_m", 0.01))
+        # Closed fingers must fit across the container (they open along world Y).
+        self._container_finger_clearance_m = float(
+            sc.get("min_container_finger_clearance_m", 0.0)
+        )
+        self._open_container_categories = {
+            str(c).lower() for c in (sc.get("open_container_categories") or [])
+        }
         self._robot_base_keepout_m = float(sc.get("robot_base_keepout_m", 0.12))
         self._ee_table_margin_m = float(sc.get("ee_table_margin_m", 0.02))
         self._object_usds: list[Path] = []
@@ -506,6 +522,8 @@ class Phase0Scene:
                 self._object_size,
                 min_clearance_m=self._min_container_clearance_m,
                 min_xy_margin_m=self._min_container_xy_margin_m,
+                open_categories=self._open_container_categories,
+                finger_clearance_m=self._container_finger_clearance_m,
             )
             if not ctr_usds:
                 raise FileNotFoundError(
@@ -522,11 +540,17 @@ class Phase0Scene:
             from sim.asset_filters import container_can_hold
             from sim.state_machine_logs import fmt_size_cm
 
+            open_top = (
+                self._container_usd.parent.name.lower()
+                in self._open_container_categories
+            )
             if not container_can_hold(
                 self._object_size,
                 self._container_size,
                 min_clearance_m=self._min_container_clearance_m,
                 min_xy_margin_m=self._min_container_xy_margin_m,
+                open_top=open_top,
+                finger_clearance_m=self._container_finger_clearance_m,
             ):
                 raise RuntimeError(
                     f"Container {self._container_usd.stem} size "
@@ -607,6 +631,7 @@ class Phase0Scene:
         self._phys_free = False  # physics grasp: True once PhysX owns the object
         self.off_table = False  # object left the table footprint this episode
         self.abort_reason = None  # mid-episode safety stop (ee off table / through box)
+        self._clear_play_band_of_container(cfg)
         bounds = _require(cfg, "scene", "object_xy_bounds")
         self._xy_bounds = (
             (float(bounds[0][0]), float(bounds[0][1])),
@@ -748,6 +773,40 @@ class Phase0Scene:
             cfg["scene"]["object_xy_bounds"][1],
             cfg["scene"]["container_xy"],
         )
+
+    def _clear_play_band_of_container(self, cfg: dict) -> None:
+        """Shrink the throw/catch band on the container's side to the real box size.
+
+        The house layout runs before the meshes are picked, so it reserves only a
+        4 cm container half-width. Real bowls / boxes are 6–12 cm, so on narrow
+        tables the box overlapped the catch band and throws aborted as
+        ``object-through-container`` before the hand could catch them. Edits
+        ``cfg['scene']['object_xy_bounds']`` in place (house meta shares it).
+        """
+        if self._play_layout is None or self._container_size is None:
+            return
+        b = cfg["scene"]["object_xy_bounds"]
+        y0, y1 = float(b[1][0]), float(b[1][1])
+        cy = float(self._container_pos[1])
+        obj_half = (
+            0.5 * float(max(self._object_size[0], self._object_size[1]))
+            if self._object_size is not None
+            else 0.0
+        )
+        # Box half-depth + per-episode nudge + object half-width + 2 cm air gap.
+        margin = 0.5 * float(self._container_size[1]) + self._container_jitter_xy + obj_half + 0.02
+        new_y0, new_y1 = (y0, min(y1, cy - margin)) if cy >= 0.0 else (max(y0, cy + margin), y1)
+        if new_y1 - new_y0 < 0.12:
+            raise RuntimeError(
+                f"play band too thin after clearing container {self._container_usd}: "
+                f"y=({new_y0:.3f},{new_y1:.3f}) (need ≥0.12 m); pick another seed"
+            )
+        if (new_y0, new_y1) != (y0, y1):
+            logger.info(
+                "Play band y (%.3f, %.3f) → (%.3f, %.3f) to clear the container",
+                y0, y1, new_y0, new_y1,
+            )
+            b[1][0], b[1][1] = float(new_y0), float(new_y1)
 
     def _spawn_cameras(self) -> None:
         """Add the cameras that mirror the real rig: fixed table cam + one on the hand.
@@ -903,10 +962,12 @@ class Phase0Scene:
         # Start from "object sits on the box floor" plus a small gap, then clamp
         # below: under the rim (hand fits in) and under carry height (move goes down).
         gap = float(_require(self.cfg, "state_machine_params", "drop_z_gap"))
-        # Prefer drop_rim_clear_m from yaml; fall back to grasp_z_tol if an old cfg omits it.
+        # Prefer drop_rim_clear_m from yaml; fall back to grasp_xyz_ok Z if omitted.
         sm = _require(self.cfg, "state_machine_params")
-        rim_clear = float(sm.get("drop_rim_clear_m", sm["grasp_z_tol"]))
-        hover_clear = float(_require(self.cfg, "state_machine_params", "approach_z_tol"))
+        grasp_ok = sm["grasp_xyz_ok"]
+        place_z = float(grasp_ok[2])
+        rim_clear = float(sm.get("drop_rim_clear_m", place_z))
+        hover_clear = place_z
         drop_z = sit_z + gap
         if rim_z > sit_z:
             drop_z = min(drop_z, rim_z - rim_clear)
@@ -1154,6 +1215,14 @@ class Phase0Scene:
     def get_gripper_open(self) -> float:
         """Commanded gripper open∈[0,1] (matches collect ``gripper`` / LeRobot state[7])."""
         return float(self._last_gripper_open)
+
+    def get_finger_gap_m(self) -> float:
+        """Measured gap between the two fingers (m): both finger joints summed.
+
+        Closed on fruit it stays at the fruit width; closed on nothing it is ~0.
+        """
+        q = self.robot.data.joint_pos[0, self._finger_idx]
+        return float(q.sum().item())
 
     def _finger_width(self, gripper_open: float) -> float:
         """Map open 0..1 to a finger joint position (0 = closed, 1 = fully open)."""

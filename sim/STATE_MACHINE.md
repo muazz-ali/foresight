@@ -94,7 +94,8 @@ Rule of thumb:
 
 ## Intercept-servo (the hard idea, said simply)
 
-**Intercept-servo** is how the hand chases a *moving* object in stages 1–2.
+**Intercept-servo** is how the hand chases a *moving* object in stage 1
+(stage 2 “go down” is unused; the same chase closes when the grasp gate passes).
 
 Two ideas glued together:
 
@@ -134,19 +135,20 @@ We roll the object forward with the **same** bounce rules the scene uses: [`_for
 
 ### Object-frame gates
 
-“Are we ready to go down / grasp?” compares the hand to the **object now**, not to the moving aim point.
+“Are we ready to close?” compares the hand to the **object now**, not to the moving aim point.
 
 With lag compensation, that error can go to zero. Without it, the aim stays ahead forever and the gate never closes.
 
-### Grasp gate that grows with speed
+### One grasp gate
 
-At high speed, one control step moves the object several centimeters. A fixed 1–2 cm gate is too tight.
-
-Effective XY gate: `max(grasp_xy_tol, k × speed × dt)` — [`_grasp_tol_xy`](state_machine.py#L258).
+Chase aims at the object (XY ahead, Z = object Z). Close when the hand is inside
+`grasp_xyz_ok_mm` (`|dx|`, `|dy|`, `|dz|`) on GT pose — [`_grasp_gate_ok`](state_machine.py).
+Wrist depth is logged only; it must not replace GT Z.
 
 ### Bounce guard
 
-Do not commit to “go down” if the object is about to reverse off a wall before the descend can finish — [`_bounce_clear`](state_machine.py#L300).
+Do not close if the object is about to reverse off a wall before the hand can
+finish the last Z drop — [`_bounce_clear`](state_machine.py).
 
 ---
 
@@ -172,32 +174,25 @@ Arm sits at home. Wait `settle_s` so the scene is ready.
 
 ---
 
-### Stage 1 — intercept
+### Stage 1 — intercept (chase → close)
 
-[`STAGE_APPROACH` branch](state_machine.py#L388)
+[`STAGE_APPROACH` branch](state_machine.py)
 
-**Goal:** put the hand over the object and keep it there briefly.
+**Goal:** put the hand on the object and close.
 
-- Compute lead with [`_intercept_lead_s`](state_machine.py#L231).
-- Aim with [`_forecast`](state_machine.py#L220).
-- Lower height as XY gets closer (`z_release_radius`) so we do not waste time on a flat hover then a late drop.
-- “Locked” = hand near object *now* (`riding_xy_ok_mm` / `riding_z_ok_mm`) for `riding_hold_ms`.
-- Wall clear check (`min_wait_after_bounce_ms`) must pass before we commit (floor mode).
+- Compute lead with [`_intercept_lead_s`](state_machine.py).
+- Aim with [`_forecast`](state_machine.py); target Z is the object (no hover).
+- One gate: `grasp_xyz_ok_mm` (GT only) — [`_grasp_gate_ok`](state_machine.py).
+- Wall clear check (`min_wait_after_bounce_ms`) must pass before close (floor mode).
 
-→ **go down**.  
-If stuck too long → retry intercept ([`_restart_approach`](state_machine.py#L346)).
+→ **close fingers**.  
+If stuck too long → retry intercept ([`_restart_approach`](state_machine.py)).
 
 ---
 
-### Stage 2 — go down
+### Stage 2 — go down (unused)
 
-[`STAGE_DESCEND` branch](state_machine.py#L436)
-
-Keep riding the object in XY (aim with lag `tau` only). Drive Z onto it.
-
-When XY/Z gates pass, record honest grasp error ([`grasp_err_xy` / `grasp_err_z`](state_machine.py#L445)) so a loose gate cannot hide a bad grab.
-
-→ **close fingers**. Stall → re-intercept.
+Id kept for old logs / failure labels. Happy path never enters it; if entered, same chase gate as stage 1.
 
 ---
 
@@ -247,7 +242,10 @@ Move down to the drop pose inside the container ([`_drop_target`](state_machine.
 
 [`STAGE_OPEN` branch](state_machine.py#L512)
 
-Release (unglue). Freeze so the object cannot bounce out.
+Release. The hand holds still where the open began. Weld mode (floor) pins the
+object; physics grasp (house) lets it drop into the box. A lower that is blocked
+over the box (object on the floor, finger on the rim) also comes here, so every
+place shows a real open.
 
 Require object XY near box center (`place_xy_tol`) — [`_in_container`](state_machine.py#L343).
 
@@ -259,7 +257,13 @@ Require object XY near box center (`place_xy_tol`) — [`_in_container`](state_m
 
 [`STAGE_HOME` branch](state_machine.py#L524)
 
-Object stays in the box (frozen). Arm climbs clear if needed, then returns home — [`_home_target`](state_machine.py#L332).
+Three legs — [`_home_target`](state_machine.py):
+1. **Retreat:** hold the XY where go-home began and rise `release_retreat_mm`
+   (100 mm), leading Z by `release_step_mm` (20 mm) per tick. A big Z jump made
+   DiffIK swing ~5 cm sideways and the open fingers dragged the fruit out
+   (34% of `g0_object_smoke` successes).
+2. **Climb** to a safe height.
+3. **Cross** to home.
 
 Done when hand is home **and** object is still in the box.
 
@@ -281,13 +285,12 @@ Success latch. Arm home, fingers open, object frozen in the box. The episode loo
   [0 start]
       │  settle_s
       ▼
-  [1 intercept]  ←── meet the object (lag + shrinking lead)
-      │  locked over object + bounce clear
-      ▼
-  [2 go down]    ←── ride object; grasp gate
+  [1 intercept]  ←── chase object (lag + shrinking lead); Z on object
+      │  grasp_xyz_ok (GT) + bounce clear
       │
+      │  (2 go down — unused id; happy path skips it)
       ▼
-  [3 close]      ←── glue to hand (no freeze)
+  [3 close]      ←── glue / squeeze (no freeze)
       │  close_gripper_s
       ▼
   [4 lift]
@@ -322,18 +325,16 @@ Loader maps them to SI keys; the expert reads those in [`__init__`](state_machin
 | `max_aim_ahead_ms` | 250 | Cap on meeting-point look-ahead |
 | `tip_lag_pad_ms` | 160 | Aim farther for tip lag (not a wait) |
 | `hand_speed_max_cm_s` | 90 | Assumed hand speed for meet-time |
-| `hover_above_object_mm` | 80 | Start height above object when far |
-| `start_lowering_xy_mm` | 120 | Begin walking Z down when this close in XY |
-| `riding_xy_ok_mm` | 10 | XY gap that counts as riding |
-| `riding_hold_ms` | 50 | Must keep riding this long before go-down |
+| `grasp_xyz_ok_mm` | [10, 10, 15] | One close gate: \|dx\|, \|dy\|, \|dz\| (mm) |
+| `wrist_close_depth_mm` | 0 | Logged only; expert close Z always uses GT \|dz\| |
 | `min_wait_after_bounce_ms` | 100 | Min clear path before wall (floor only) |
-| `grasp_xy_ok_mm` / `grasp_z_ok_mm` | 10 | Base gaps that allow finger close |
 | `hold_closed_weld_ms` / `hold_closed_physics_ms` | 100 / 300 | Dwell after close before lift |
 | `near_enough_xy_mm` | 30 | Close enough XY for carry / lower / home |
+| `arrived_z_ok_mm` | 30 | Height arrival for lift / carry / lower (not grasp) |
 | `in_box_xy_ok_mm` | 120 | “In the box” XY gate |
 | `lift_height_mm` | 120 | Raise after grasp |
 | `stall_timeout_ms` | 1500 | Stall cap after grasp |
-| `chase_stall_timeout_ms` | 3000 | Longer stall while chasing / going down |
+| `chase_stall_timeout_ms` | 3000 | Longer stall while chasing |
 | `max_retries` | 3 | Re-chase tries before giving up |
 | `episode_max_ms` | 10000 | Max episode time; timeout = fail |
 

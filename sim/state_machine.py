@@ -2,8 +2,9 @@
 intercept: predict where the object will be and move hand there
 servo: move the hand to that predicted position
 
-Stages: 0 start → 1 intercept → 2 go down → 3 close → 4 lift → 5 carry
-→ 6 lower → 7 open → 8 home → 9 done.
+Stages: 0 start → 1 intercept → 3 close → 4 lift → 5 carry → 6 lower
+→ 7 open → 8 home → 9 done. Stage 2 (go down) is unused: intercept closes
+when the grasp_xyz_ok gate passes (spoken names in state_machine_logs.py).
 
 What it is: the scripted "teacher". It reads the true object state from the sim
 and tells the hand where to go. Its demos train the policy and set the G0 score.
@@ -11,7 +12,7 @@ It runs once per control step, inside the episode loop (sim/collect.py).
 It must NOT use DynamicVLA code or its "object_picked" check. Success is judged
 elsewhere (sim/success.py), never inside this file.
 The plan's expert is four big steps (approach, grab+lift, place, reset). Here
-they are split into 9 stage ids so logs show exactly where a run got stuck.
+they are split into stage ids 0–9 so logs show exactly where a run got stuck.
 """
 
 from __future__ import annotations
@@ -145,8 +146,6 @@ class PickPlaceStateMachine:
         # Chasing a fast object takes longer than other stages: give the
         # approach 3x the normal stage time unless the yaml says otherwise.
         self.grasp_stage_timeout_s = self._f("grasp_stage_timeout_s", self.stage_timeout_s * 3.0)
-        # How long the hand must stay on the object before we start going down.
-        self.track_hold_s = self._f("track_hold_s")
         # Min straight-line time we need before the object hits a wall and turns.
         self.bounce_guard_s = self._f("bounce_guard_s")
 
@@ -162,26 +161,33 @@ class PickPlaceStateMachine:
         self.intercept_iters = int(self._p.get("intercept_iters", 3))
 
         # --- tolerances ---------------------------------------------------
-        # "How close is close enough" before we move to the next stage.
+        # One chase→close gate: |dx|, |dy|, |dz| (metres).
+        ok = self._p.get("grasp_xyz_ok")
+        if ok is None or len(ok) != 3:
+            logger.error("missing required yaml key: state_machine_params.grasp_xyz_ok")
+            raise KeyError("state_machine_params.grasp_xyz_ok")
+        self.grasp_xyz_ok = np.asarray(ok, dtype=np.float64).reshape(3)
+        self.grasp_xy_tol = float(max(self.grasp_xyz_ok[0], self.grasp_xyz_ok[1]))
+        self.grasp_z_tol = float(self.grasp_xyz_ok[2])
+        # Carry / lower / lift *arrival* height — looser than the grasp close gate.
+        # Held hands settle ~12–15 mm above the drop command; 15 mm made lowers stall.
+        self.place_z_tol = self._f("place_z_tol", 0.03)
         self.servo_xy_tol = self._f("servo_xy_tol")
-        self.approach_z_tol = self._f("approach_z_tol")
-        self.track_xy_tol = self._f("track_xy_tol")
-        self.grasp_xy_tol = self._f("grasp_xy_tol")
-        self.grasp_z_tol = self._f("grasp_z_tol")
-        self.grasp_tol_step_k = self._f("grasp_tol_step_k")
         self.place_xy_tol = self._f("place_xy_tol")
         self.home_z_tol = self._f("home_z_tol")
         self.ee_settle_tol = self._f("ee_settle_tol")
 
         # --- heights ------------------------------------------------------
-        self.hover_z = self._f("hover_z")
-        self.z_release_radius = self._f("z_release_radius")
         self.lift_height = self._f("lift_height")
         self.drop_z_gap = self._f("drop_z_gap")
         # Wrist depth close gate (m). 0 = off (use GT hand-object Z). Needs a depth reading.
         self.close_depth_m = self._f("close_depth_m", 0.0)
         # Held object farther than this from the hand = it slipped out (physics grasp).
         self.slip_dist_m = self._f("slip_dist_m", 0.10)
+        # After release: rise this far straight up (fixed XY) before heading home,
+        # leading Z by at most release_step_m per tick so the hand does not swing.
+        self.release_retreat_m = self._f("release_retreat_m", 0.10)
+        self.release_step_m = self._f("release_step_m", 0.02)
 
         # --- retries ------------------------------------------------------
         # How many times a missed grab may go back to stage 1 before giving up.
@@ -205,9 +211,7 @@ class PickPlaceStateMachine:
         # Real PhysX grasp (no weld) — same default rule as sim/scene.py.
         self.physics_grasp = not bool(scene.get("use_weld_grasp", not self.throw_mode))
         if self.physics_grasp:
-            # Pads must sit at the object's equator (squeeze, not pop out), and the
-            # fingers need time to shut before the lift starts.
-            self.grasp_z_tol = self._f("physics_grasp_z_tol")
+            # Fingers need the longer dwell before lift starts.
             self.close_gripper_s = self._f("physics_close_s")
 
         # Placeholders. The episode loop calls set_box_poses() each episode with
@@ -262,12 +266,12 @@ class PickPlaceStateMachine:
         """Back to stage 0 and clear all per-episode memory (timers, retries, grasp stats)."""
         self.stage = STAGE_RESET
         self.timer_s = 0.0  # time spent in the current stage
-        self.lock_s = 0.0  # how long the hand has stayed on the object (stage 1)
         self.retries = 0
         self._blocked_s = 0.0  # only throttles the "waiting for a straight run" log
-        self._z_frac = 1.0  # 1 = full hover height, 0 = on the object (stage 1 only)
         self.lift_z: float | None = None
         self.grasp_xy: np.ndarray | None = None
+        self._home_anchor: np.ndarray | None = None  # hand pose when go-home began
+        self._open_anchor: np.ndarray | None = None  # hand pose when open began
         # Grasp quality, surfaced in meta so a loosened tolerance cannot hide.
         self.grasp_err_xy: float | None = None
         self.grasp_err_z: float | None = None
@@ -317,7 +321,7 @@ class PickPlaceStateMachine:
         On top of the object travel time → 0 → the lead collapses to ``tau`` and
         the hand rides the object instead of running ahead of it.
         """
-        gz = float(obj[2] + self.hover_z if goal_z is None else goal_z)
+        gz = float(obj[2] if goal_z is None else goal_z)
         t_travel = 0.0
         for _ in range(max(1, self.intercept_iters)):
             aim = self._forecast(obj, vel, min(t_travel, self.lookahead_s))
@@ -325,14 +329,30 @@ class PickPlaceStateMachine:
             t_travel = float(np.linalg.norm(ee - goal)) / max(self.ee_speed_max, 1e-6)
         return min(t_travel, self.lookahead_s) + self.tau
 
-    def _grasp_tol_xy(self, vel: np.ndarray) -> float:
-        """Grasp gate cannot be tighter than one control step of object travel.
+    def _grasp_gate_ok(
+        self,
+        ee: np.ndarray,
+        obj: np.ndarray,
+        wrist_depth_m: float | None = None,
+    ) -> tuple[bool, float, float]:
+        """True when the hand is inside ``grasp_xyz_ok`` (ready to close).
 
-        Why: a fast object moves further than a fixed tiny gate each step, so
-        the hand could never pass the gate. The gate grows with speed.
+        XY uses |dx| and |dy|. Z always uses GT |dz| — never wrist depth alone.
+        Wrist depth used to *replace* GT Z and caused both early closes (wrist
+        under threshold while |dz| was still ~17 mm) and stuck retries (GT fine
+        but wrist stuck ~6 mm above the depth gate). ``wrist_depth_m`` is kept
+        for the call site / logs only. Returns (ok, err_xy_norm, err_z).
         """
-        step = self.grasp_tol_step_k * float(np.linalg.norm(vel[:2])) * self.dt
-        return max(self.grasp_xy_tol, step)
+        del wrist_depth_m  # logged elsewhere; must not override GT Z
+        err_dx = abs(float(ee[0] - obj[0]))
+        err_dy = abs(float(ee[1] - obj[1]))
+        err_z = abs(float(ee[2] - obj[2]))
+        err_xy = float(np.hypot(err_dx, err_dy))
+        xy_ok = err_dx <= float(self.grasp_xyz_ok[0]) and err_dy <= float(
+            self.grasp_xyz_ok[1]
+        )
+        low_enough = err_z <= float(self.grasp_xyz_ok[2])
+        return xy_ok and low_enough, err_xy, err_z
 
     def _time_to_wall_s(self, pos: np.ndarray, vel: np.ndarray) -> float:
         """Seconds until the object reverses off a play-band wall (inf if never)."""
@@ -349,12 +369,11 @@ class PickPlaceStateMachine:
                 best = min(best, t)
         return best
 
-    def _descend_time_s(self, ee: np.ndarray, obj: np.ndarray) -> float:
+    def _close_time_s(self, ee: np.ndarray, obj: np.ndarray) -> float:
         """Seconds of Z still to burn before the grasp gate can pass.
 
-        First-order settle of the remaining height to ``grasp_z_tol``. Because
-        APPROACH already walks Z down with the XY lock, this is usually one or
-        two steps, not a fresh ``hover_z`` descent.
+        First-order settle of the remaining height to ``grasp_z_tol``. Chase aims
+        at object Z, so this is usually one or two steps once XY is close.
         """
         dz = max(0.0, float(ee[2] - obj[2]))
         if dz <= self.grasp_z_tol:
@@ -364,11 +383,11 @@ class PickPlaceStateMachine:
     def _grasp_window_s(self, ee: np.ndarray | None = None, obj: np.ndarray | None = None) -> float:
         """Straight-line time the grasp needs before the object reverses.
 
-        Only the *residual descend* has to fit. Once CLOSE attaches, the object
+        Only the leftover Z drop has to fit. Once CLOSE attaches, the object
         is welded to the hand and stops following the table, so nothing after
         attach cares about walls. ``bounce_guard_s`` is the floor.
         """
-        need = self.dt if ee is None or obj is None else self._descend_time_s(ee, obj)
+        need = self.dt if ee is None or obj is None else self._close_time_s(ee, obj)
         return max(self.bounce_guard_s, need)
 
     def _bounce_clear(
@@ -377,7 +396,7 @@ class PickPlaceStateMachine:
         vel: np.ndarray,
         ee: np.ndarray | None = None,
     ) -> bool:
-        """Enough straight-line time left to finish the descend without a reversal."""
+        """Enough straight-line time left to close without a wall reversal."""
         if float(np.linalg.norm(vel[:2])) < self.ee_settle_tol:
             return True
         return self._time_to_wall_s(pos, vel) > self._grasp_window_s(ee, pos)
@@ -400,7 +419,7 @@ class PickPlaceStateMachine:
         if self.lift_z is not None:
             # Never ask for a drop point higher than the travel height minus
             # one tolerance; keeps "lower" a real downward move.
-            p[2] = min(float(p[2]), self._retract_z() - self.approach_z_tol)
+            p[2] = min(float(p[2]), self._retract_z() - self.place_z_tol)
         return p
 
     def _at_home(self, ee: np.ndarray) -> bool:
@@ -412,7 +431,24 @@ class PickPlaceStateMachine:
         )
 
     def _home_target(self, ee: np.ndarray) -> np.ndarray:
-        """go home: climb clear before crossing XY — straight lines from drop Z hit the table."""
+        """go home: retreat straight up off the released object, then climb, then cross.
+
+        Physics grasp does not pin the placed object, so open fingers that move
+        sideways sweep it out of the box. Leg 1 holds the XY where home started
+        and leads Z by a small step (a big Z jump makes DiffIK swing ~5 cm in XY)
+        until the fingers clear the object. Leg 2 climbs to a safe height, leg 3
+        crosses to home.
+        """
+        if self._home_anchor is None:
+            self._home_anchor = ee.copy()
+        anchor = self._home_anchor
+        top = float(anchor[2]) + self.release_retreat_m
+        # Done within one step of the top: a lagging arm only approaches it
+        # asymptotically, so an exact ">= top" would never finish.
+        if float(ee[2]) < top - self.release_step_m:
+            t = anchor.copy()
+            t[2] = min(float(ee[2]) + self.release_step_m, top)
+            return t
         home = self.init_pose[:3].copy()
         clear_z = max(float(home[2]), float(self.carry_pose[2]), self._retract_z())
         err_xy = float(np.linalg.norm(ee[:2] - home[:2]))
@@ -435,8 +471,6 @@ class PickPlaceStateMachine:
         """
         self.retries += 1
         self.timer_s = 0.0
-        self.lock_s = 0.0
-        self._z_frac = 1.0
         if self.retries > self.max_retries:
             logger.info("    %s; out of retries (%d), going home", why, self.max_retries)
             self.stage = STAGE_HOME
@@ -487,91 +521,47 @@ class PickPlaceStateMachine:
             if self.timer_s >= self.settle_s:
                 self.stage = STAGE_APPROACH
                 self.timer_s = 0.0
-                self.lock_s = 0.0
 
-        elif self.stage == STAGE_APPROACH:
-            # Intercept: aim where the object will be when the hand arrives.
-            # Z converges *with* XY, not after it. A flat hover followed by a
-            # separate descend spends ~0.3 s of straight-line time that a fast
-            # object simply does not have between wall bounces; blending means
-            # the hand is already on the object the moment XY locks.
-            err_xy = float(np.linalg.norm(ee[:2] - obj[:2]))
-            frac = float(np.clip(err_xy / max(self.z_release_radius, 1e-6), 0.0, 1.0))
-            # Ratchet: height only ever comes down within one approach attempt.
-            # Without it a fast object's XY error oscillates on every wall
-            # bounce, the Z target pumps up and down, and Z never settles.
-            self._z_frac = min(self._z_frac, frac)
-            target_z = obj[2] + self.hover_z * self._z_frac
-
+        elif self.stage in (STAGE_APPROACH, STAGE_DESCEND):
+            # Chase: aim where the object will be when the hand arrives. Target Z
+            # is the object itself (no hover). One grasp_xyz_ok gate → close.
+            # STAGE_DESCEND is unused in the happy path; if entered, same logic.
+            target_z = float(obj[2])
             lead_s = self._intercept_lead_s(ee, obj, vel, goal_z=target_z)
             aim = self._forecast(obj, vel, lead_s)
             target = np.array([aim[0], aim[1], target_z], dtype=np.float64)
 
-            # Gate in the object's frame — with lag compensation this closes.
-            err_z = abs(float(ee[2] - target_z))
-            locked = err_xy < self.track_xy_tol and err_z < self.approach_z_tol
-            self.lock_s = self.lock_s + self.dt if locked else 0.0
-
-            # Locked on, but a wall bounce is too close to finish the descent.
-            # Wait for a clean run. Log at most once per second (the 1.0).
-            if self.lock_s >= self.track_hold_s and not self._bounce_clear(obj, vel, ee):
+            gate_ok, err_xy, err_z = self._grasp_gate_ok(ee, obj, wrist_depth_m)
+            if gate_ok and not self._bounce_clear(obj, vel, ee):
                 self._blocked_s += self.dt
                 if self._blocked_s >= 1.0:
                     self._blocked_s = 0.0
                     logger.info(
-                        "    locked, but waiting for a straight run: need %.2f s, "
-                        "wall in %.2f s (widen scene.object_xy_bounds, cut "
-                        "z_release_radius, or cut robot_approach_pad_ms)",
+                        "    in grasp box, but waiting for a straight run: need %.2f s, "
+                        "wall in %.2f s (widen scene.object_xy_bounds or cut "
+                        "tip_lag_pad_ms)",
                         self._grasp_window_s(ee, obj),
                         self._time_to_wall_s(obj, vel),
                     )
-            # Held on target long enough AND a straight run is ahead → go down.
-            if self.lock_s >= self.track_hold_s and self._bounce_clear(obj, vel, ee):
+            if gate_ok and self._bounce_clear(obj, vel, ee):
                 logger.info(
-                    "    locked over object: XY %.1f cm, speed %.0f cm/s, "
+                    "    grasp gate: XY %.1f cm, Z %.1f cm, speed %.0f cm/s, "
                     "lead %.0f ms, wall in %.2f s",
                     100.0 * err_xy,
+                    100.0 * err_z,
                     100.0 * speed,
                     1000.0 * lead_s,
                     self._time_to_wall_s(obj, vel),
                 )
-                self.stage = STAGE_DESCEND
-                self.timer_s = 0.0
-            # Never locked in time → try intercept again (counts as a retry).
-            elif self.timer_s > self.grasp_stage_timeout_s:
-                self._restart_approach("could not lock onto the object")
-
-        # Stage 2 — GO DOWN: stay over the moving object and drop the last bit
-        # of height. When close enough in XY and Z, record grasp stats and close.
-        elif self.stage == STAGE_DESCEND:
-            # Keep riding the object in XY (lag lead only), drive Z onto it.
-            aim = self._forecast(obj, vel, self.tau)
-            target = np.array([aim[0], aim[1], obj[2]], dtype=np.float64)
-
-            tol_xy = self._grasp_tol_xy(vel)
-            err_xy = float(np.linalg.norm(ee[:2] - obj[:2]))
-            err_z = abs(float(ee[2] - obj[2]))
-            # Last cm: wrist depth under the threshold, else the GT hand-object Z gate.
-            if (
-                self.close_depth_m > 0.0
-                and wrist_depth_m is not None
-                and np.isfinite(wrist_depth_m)
-            ):
-                low_enough = float(wrist_depth_m) <= self.close_depth_m
-            else:
-                low_enough = err_z < self.grasp_z_tol
-            if err_xy < tol_xy and low_enough:
                 self.grasp_err_xy = err_xy
                 self.grasp_err_z = err_z
                 self.grasp_speed = speed
                 self.grasp_xy = obj[:2].copy()
-                # Lift target = height where we grabbed + lift_height.
                 self.lift_z = float(ee[2]) + self.lift_height
                 self.stage = STAGE_CLOSE
                 self.timer_s = 0.0
-            # Could not get low enough in time → back to stage 1 (a retry).
-            elif self.timer_s > self.stage_timeout_s:
-                self._restart_approach(f"descend stalled at XY {100.0 * err_xy:.1f} cm")
+            elif self.timer_s > self.grasp_stage_timeout_s:
+                self._restart_approach("could not reach grasp gate")
 
         # Stage 3 — CLOSE FINGERS: shut the gripper. ``attach`` means "grasp now":
         # weld mode glues the object to the hand; physics mode frees it to PhysX
@@ -607,7 +597,7 @@ class PickPlaceStateMachine:
             if self.grasp_xy is not None:
                 target[0], target[1] = float(self.grasp_xy[0]), float(self.grasp_xy[1])
             target[2] = self.lift_z
-            if float(ee[2]) >= self.lift_z - self.approach_z_tol:
+            if float(ee[2]) >= self.lift_z - self.place_z_tol:
                 self.stage = STAGE_CARRY
                 self.timer_s = 0.0
             elif self.timer_s > self.stage_timeout_s:
@@ -623,7 +613,7 @@ class PickPlaceStateMachine:
             quat = self.carry_pose[3:].copy()
             err_xy = float(np.linalg.norm(ee[:2] - target[:2]))
             err_z = abs(float(ee[2] - target[2]))
-            if err_xy < self.servo_xy_tol and err_z < self.approach_z_tol:
+            if err_xy < self.servo_xy_tol and err_z < self.place_z_tol:
                 self.stage = STAGE_LOWER
                 self.timer_s = 0.0
             elif self.timer_s > self.stage_timeout_s:
@@ -638,20 +628,30 @@ class PickPlaceStateMachine:
             quat = self.carry_pose[3:].copy()
             err_xy = float(np.linalg.norm(ee[:2] - target[:2]))
             err_z = abs(float(ee[2] - target[2]))
-            if err_xy < self.servo_xy_tol and err_z < self.approach_z_tol:
+            if err_xy < self.servo_xy_tol and err_z < self.place_z_tol:
                 self.stage = STAGE_OPEN
                 self.timer_s = 0.0
             elif self.timer_s > self.stage_timeout_s:
-                logger.info("    lower stalled; going home")
-                self.stage = STAGE_HOME
+                # Blocked (object on the floor / finger on the rim) but already
+                # over the box: release here so the demo still shows a real open.
+                if err_xy < self.servo_xy_tol:
+                    logger.info("    lower blocked over the box; releasing here")
+                    self.stage = STAGE_OPEN
+                else:
+                    logger.info("    lower stalled off the box; going home")
+                    self.stage = STAGE_HOME
                 self.timer_s = 0.0
 
         # Stage 7 — OPEN FINGERS: let go over the box. Move on once the fingers
         # had time to open AND the object sits over the box (or time runs out).
         elif self.stage == STAGE_OPEN:
-            # Release + pin so the object cannot bounce back out of the box.
+            # Release. Weld mode pins the object; physics mode lets it drop.
+            # Hold the hand where the open began: pushing on toward the drop
+            # point while the fingers part shoves the object sideways.
             grip, attach, kin, freeze = 1.0, False, False, True
-            target = self._drop_target()
+            if self._open_anchor is None:
+                self._open_anchor = ee.copy()
+            target = self._open_anchor.copy()
             quat = self.carry_pose[3:].copy()
             if self.timer_s >= self.close_gripper_s and self._in_container(obj):
                 self.stage = STAGE_HOME
@@ -660,8 +660,8 @@ class PickPlaceStateMachine:
                 self.stage = STAGE_HOME
                 self.timer_s = 0.0
 
-        # Stage 8 — GO HOME: object stays pinned in the box. Done only if the hand
-        # is home AND the object is still in the box.
+        # Stage 8 — GO HOME: retreat straight up off the object, then home (see
+        # _home_target). Done only if the hand is home AND the object is still in the box.
         elif self.stage == STAGE_HOME:
             grip, attach, kin, freeze = 1.0, False, False, True
             target = self._home_target(ee)
@@ -674,6 +674,12 @@ class PickPlaceStateMachine:
             grip, attach, kin, freeze = 1.0, False, False, True
             target = self.init_pose[:3].copy()
             quat = self.init_pose[3:].copy()
+
+        # Anchors live only while their stage runs (a retry can re-enter later).
+        if self.stage != STAGE_OPEN:
+            self._open_anchor = None
+        if self.stage != STAGE_HOME:
+            self._home_anchor = None
 
         # Log only on a stage change, so the human log reads like a short story.
         if self.stage != prev_stage:
@@ -689,11 +695,14 @@ class PickPlaceStateMachine:
             )
             if self.stage == STAGE_CLOSE:
                 logger.info(
-                    "    grasp error XY %.1f cm, Z %.1f cm at %.0f cm/s (gate %.1f cm)",
+                    "    grasp error XY %.1f cm, Z %.1f cm at %.0f cm/s "
+                    "(gate dx/dy/dz %.1f/%.1f/%.1f cm)",
                     100.0 * (self.grasp_err_xy or 0.0),
                     100.0 * (self.grasp_err_z or 0.0),
                     100.0 * (self.grasp_speed or 0.0),
-                    100.0 * self._grasp_tol_xy(vel),
+                    100.0 * float(self.grasp_xyz_ok[0]),
+                    100.0 * float(self.grasp_xyz_ok[1]),
+                    100.0 * float(self.grasp_xyz_ok[2]),
                 )
 
         # kinematic only when not holding: a held object follows the hand instead.

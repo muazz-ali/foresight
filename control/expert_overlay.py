@@ -15,7 +15,8 @@ from control.reflex import ReflexClose, ReflexOut
 from interfaces.state import ObjectState
 
 
-# Descend / close only — do not fight the approach intercept.
+# Close (3) only in the happy path. Stage 2 (go down) is unused but kept if entered.
+# Do not run during stage 1 intercept — that would fight the chase aim.
 _REFLEX_STAGES = frozenset({2, 3})
 
 
@@ -34,8 +35,8 @@ def overlay_reflex(
     gripper_open, attach_object, kinematic_object, stage, …). Frozen dataclasses
     are rebuilt with ``replace``; plain namespaces are mutated in place.
 
-    Steer XY at the meeting point in descend/close. Only force a close once the
-    expert is already in the CLOSE stage (so we never jump past the height gate).
+    Steer XY at the meeting point in close (stage 3; unused stage 2 if entered).
+    Only force a close once the expert is already in CLOSE.
     """
     if int(cmd.stage) not in _REFLEX_STAGES:
         return cmd, None

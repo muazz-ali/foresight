@@ -19,7 +19,7 @@ Install: `~/Desktop/IsaacLab` → `muazzam/IsaacLab`. Connect cookbook: `ppt.md`
 ## Foresight specifics
 - Cameras mirror the real rig: static front RGB + wrist RGB-D.
 - Start with scripted object motion; physics rolling later.
-- Expert: four-stage SM on GT `ObjectState` (plan §4), implemented under `sim/`.
+- Expert: plan §4 jobs as stage ids 0–9 on GT `ObjectState`, implemented under `sim/` (stage 2 unused).
 - Log the conditioning vector *exactly* as the policy will see it.
 - Prove **one** successful episode + shapes before scaling collection.
 - Success criterion and failure taxonomy are Foresight-owned; log `max_sm`, `z_max`, `z_end` so taxonomy is diagnosable.

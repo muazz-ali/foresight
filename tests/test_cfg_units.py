@@ -33,14 +33,12 @@ def test_normalize_converts_mm_ms_cm_s():
             "clipping_range_mm": [10.0, 2000.0],
         },
         "state_machine_params": {
-            "hover_above_object_mm": 80.0,
-            "riding_hold_ms": 80,
+            "grasp_xyz_ok_mm": [10.0, 10.0, 15.0],
+            "arrived_z_ok_mm": 30.0,
             "hand_speed_max_cm_s": 90.0,
             "object_still_cm_s": 5.0,
-            "physics_grasp_z_ok_mm": 8.0,
             "hold_closed_physics_ms": 300,
             "aim_refine_iters": 3,
-            "grasp_tol_grows_k": 0.6,
         },
         "sim": {"dt_ms": 40},
     }
@@ -59,14 +57,12 @@ def test_normalize_converts_mm_ms_cm_s():
     assert cfg["static_camera"]["clip"]["far"] == 100.0
     assert cfg["wrist_camera"]["pos"] == [0.065, 0.0, 0.0]
     assert cfg["wrist_camera"]["clipping_range"] == [0.01, 2.0]
-    assert cfg["state_machine_params"]["hover_z"] == 0.08
-    assert cfg["state_machine_params"]["track_hold_s"] == 0.08
+    assert cfg["state_machine_params"]["grasp_xyz_ok"] == [0.01, 0.01, 0.015]
+    assert cfg["state_machine_params"]["place_z_tol"] == 0.03
     assert cfg["state_machine_params"]["ee_speed_max"] == 0.9
     assert cfg["state_machine_params"]["ee_settle_tol"] == 0.05
-    assert cfg["state_machine_params"]["physics_grasp_z_tol"] == 0.008
     assert cfg["state_machine_params"]["physics_close_s"] == 0.3
     assert cfg["state_machine_params"]["intercept_iters"] == 3
-    assert cfg["state_machine_params"]["grasp_tol_step_k"] == 0.6
     assert cfg["sim"]["dt"] == 0.04
     assert "gripper_open_mm" not in cfg["robot"]
     assert "hand_speed_max_cm_s" not in cfg["state_machine_params"]
@@ -91,6 +87,12 @@ def test_legacy_human_knob_names_are_rejected():
         normalize_cfg_units({"state_machine_params": {"min_clear_before_wall_ms": 100}})
     with pytest.raises(ValueError, match="tip_lag_pad_ms"):
         normalize_cfg_units({"state_machine_params": {"robot_approach_pad_ms": 160}})
+    with pytest.raises(ValueError, match="grasp_xyz_ok_mm"):
+        normalize_cfg_units({"state_machine_params": {"hover_above_object_mm": 80}})
+    with pytest.raises(ValueError, match="grasp_xyz_ok_mm"):
+        normalize_cfg_units({"state_machine_params": {"riding_xy_ok_mm": 10}})
+    with pytest.raises(ValueError, match="grasp_xyz_ok_mm"):
+        normalize_cfg_units({"state_machine_params": {"grasp_xy_ok_mm": 10}})
 
 
 def test_phase0_yaml_loads_to_expected_si():
@@ -98,7 +100,9 @@ def test_phase0_yaml_loads_to_expected_si():
     assert cfg["robot"]["init_pose"][:3] == [0.45, 0.0, 0.4]
     assert abs(cfg["robot"]["gripper_close_time_s"] - 0.08) < 1e-12
     assert abs(cfg["scene"]["max_object_width_m"] - 0.075) < 1e-12
-    assert abs(cfg["state_machine_params"]["hover_z"] - 0.08) < 1e-12
+    assert cfg["state_machine_params"]["grasp_xyz_ok"] == pytest.approx(
+        [0.01, 0.01, 0.015]
+    )
     assert abs(cfg["state_machine_params"]["ee_speed_max"] - 0.9) < 1e-12
     assert abs(cfg["state_machine_params"]["ee_settle_tol"] - 0.05) < 1e-12
     assert abs(cfg["state_machine_params"]["bounce_guard_s"] - 0.10) < 1e-12

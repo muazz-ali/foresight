@@ -30,20 +30,31 @@ def container_can_hold(
     *,
     min_clearance_m: float = 0.01,
     min_xy_margin_m: float = 0.01,
+    open_top: bool = False,
+    finger_clearance_m: float = 0.0,
 ) -> bool:
-    """True if the container is taller and wider than the object by the margins.
+    """True if the container can take this object.
 
-    Flat plates / trays fail the height check. Tiny bowls fail the XY check.
+    Closed boxes need height + XY margins. Open bowls only need XY room — the
+    fruit may sit above the rim. Plates stay out via ``exclude_usd_containers``.
+
+    ``finger_clearance_m``: the closed fingers must also fit. They open along
+    world Y (down-facing Franka hand), so the container's Y side must exceed the
+    object's widest side by this much (two finger pads + place error). Without
+    it a 66 mm potato in a 122 mm box parks a finger on the rim.
     """
     obj = np.asarray(object_size_m, dtype=np.float64).reshape(-1)
     ctr = np.asarray(container_size_m, dtype=np.float64).reshape(-1)
     if obj.size < 3 or ctr.size < 3:
         return False
-    if float(ctr[2]) < float(obj[2]) + float(min_clearance_m):
-        return False
+    if not open_top:
+        if float(ctr[2]) < float(obj[2]) + float(min_clearance_m):
+            return False
     if float(ctr[0]) < float(obj[0]) + float(min_xy_margin_m):
         return False
     if float(ctr[1]) < float(obj[1]) + float(min_xy_margin_m):
+        return False
+    if float(ctr[1]) < float(max(obj[0], obj[1])) + float(finger_clearance_m):
         return False
     return True
 

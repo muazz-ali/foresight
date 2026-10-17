@@ -6,6 +6,8 @@ Plain guide to how the expert chases a moving object. Code: [`sim/state_machine.
 
 ## One sim step (stages 0–9)
 
+Happy path skips stage 2: intercept (1) closes straight to close (3).
+
 ```mermaid
 flowchart TD
     A[Read object pos + vel + hand pos] --> B{Which stage?}
@@ -17,22 +19,17 @@ flowchart TD
 
     S1 --> L1["Compute lead time lead_s<br/>_intercept_lead_s()"]
     L1 --> L2["Forecast object at lead_s<br/>(with wall bounces)"]
-    L2 --> L3["Aim hand at forecast XY + blended Z"]
-    L3 --> L4{Hand over object now?<br/>track_xy + approach_z<br/>held for track_hold_s}
+    L2 --> L3["Aim hand at forecast XY + object Z"]
+    L3 --> L4{grasp_xyz_ok<br/>GT |dx|,|dy|,|dz|}
     L4 -->|no| L5{Stuck too long?}
     L5 -->|yes| RET["Re-intercept (retry)"]
     L5 -->|no| L3
     L4 -->|yes| BG{Bounce clear?<br/>enough time before wall hit}
     BG -->|no| L3
-    BG -->|yes| S2
+    BG -->|yes| S3["Log grasp_err, grasp_speed"]
 
-    B -->|2 go down| S2
-    S2 --> D1["Aim at object + tau lead in XY<br/>drive Z onto object"]
-    D1 --> D2{Grasp gate OK?<br/>XY + Z + speed-aware tol}
-    D2 -->|no| D3{Stalled?}
-    D3 -->|yes| RET
-    D3 -->|no| D1
-    D2 -->|yes| S3["Log grasp_err, grasp_speed"]
+    B -->|2 go down unused| U2["Same chase as stage 1<br/>(happy path skips)"]
+    U2 --> L4
 
     B -->|3 close| S3
     S3 --> S4[lift → carry → lower → open → home → done]
@@ -44,11 +41,11 @@ flowchart TD
 
 ## Inside `_intercept_lead_s` (meet-up solver)
 
-Code: [`state_machine.py` lines 230–256](../sim/state_machine.py#L230).
+Code: [`_intercept_lead_s`](../sim/state_machine.py) in `state_machine.py`.
 
 ```mermaid
 flowchart TD
-    START[Hand ee, object obj, velocity vel] --> GZ["Pick target height gz<br/>(hover above object)"]
+    START[Hand ee, object obj, velocity vel] --> GZ["Pick target height gz<br/>(object Z — no hover)"]
     GZ --> T0["t_travel = 0"]
 
     T0 --> LOOP{{"Repeat intercept_iters (≈3)"}}
@@ -108,8 +105,8 @@ flowchart TD
 | **forecast** | Roll object forward in time (same bounce rules as sim) |
 | **lead_s** | How many seconds ahead we look when aiming |
 | **tau** | Arm delay — command arrives before motion catches up |
-| **track gate** | Is hand over object *now*? (not over a moving aim point) |
-| **bounce guard** | Don't go down if object will hit a wall before grasp finishes |
+| **grasp gate** | Hand inside `grasp_xyz_ok` on the object *now* (not on the aim point) |
+| **bounce guard** | Don't close if object will hit a wall before the grasp finishes |
 
 ---
 

@@ -20,7 +20,7 @@ import numpy as np
 STAGE_PLAIN = {
     0: "start",
     1: "intercept",
-    2: "go down",
+    2: "go down",  # unused happy-path id; intercept closes directly
     3: "close fingers",
     4: "lift",
     5: "carry to box",
@@ -33,14 +33,14 @@ STAGE_PLAIN = {
 # One line per stage: what the hand is trying to do. Printed in the "how to read" banner.
 STAGE_WHY = {
     0: "Arm at rest. Object still on the table.",
-    1: "Hand flies to where the object will be when the hand gets there (0.25 s cap).",
-    2: "Hand rides on the object and comes down onto it.",
+    1: "Chase the object (0.25 s ahead). Close when inside grasp_xyz_ok.",
+    2: "Unused. Old go-down stage; chase now closes on the same gate.",
     3: "Fingers shut. Object is held (snapped to the hand).",
     4: "Raise the object.",
     5: "Move high, over the box.",
     6: "Come down inside the box.",
     7: "Let go. Object should stay in the box.",
-    8: "Arm returns to rest. Object stays in the box.",
+    8: "Arm rises straight off the object, then returns to rest.",
     9: "Finished.",
 }
 

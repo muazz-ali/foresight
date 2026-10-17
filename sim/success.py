@@ -14,6 +14,8 @@ import numpy as np
 
 from sim.state_machine import (
     STAGE_DONE,
+    STAGE_HOME,
+    STAGE_OPEN,
     STAGE_SCHEMA,
     StageSchema,
 )
@@ -58,9 +60,13 @@ def episode_success(
     container_xy: np.ndarray | None = None,
     container_xy_tol: float = 0.12,
     z_placed_min: float = 0.02,
+    z_placed_max_above_container: float = 0.05,
 ) -> bool:
     """Did the expert win? Yes if it reached the last stage, lifted the object,
     and either kept it up at the end or left it on the container.
+
+    "On the container" means near in XY and low enough to be inside/on it —
+    not hovering at carry height after a stalled lower skipped the open stage.
 
     This is OUR rule (logged), not any outside "picked" flag.
     """
@@ -73,35 +79,43 @@ def episode_success(
     z = pos[:, 2]
     lifted = float(z.max()) >= float(z_lift_min)
     finished = int(stages.max()) >= int(place_stage)
+    if not (finished and lifted):
+        return False
     # Average the last 5 steps so one noisy frame cannot decide "held high".
     held_at_end = (
         float(z[-5:].mean()) >= float(z_end_min)
         if len(z) >= 5
         else float(z[-1]) >= float(z_end_min)
     )
-    # "Placed" = close to the container in XY and still above the table.
-    # Caller can pass a fixed container spot; else we read it from the log below.
-    placed_on_container = False
-    if container_xy is not None and finished:
-        xy = pos[-1, :2]
+    # Resolve container pose (caller XY and/or logged per-step pose).
+    cpos = None
+    if "container_pos" in episode:
+        raw = np.asarray(episode["container_pos"])
+        if len(raw) and np.isfinite(raw[-1, 0]):
+            cpos = raw[-1]
+    if container_xy is not None:
         cxy = np.asarray(container_xy, dtype=np.float64).reshape(2)
-        near = float(np.linalg.norm(xy - cxy)) <= float(container_xy_tol)
-        above_table = float(z[-1]) >= float(z_placed_min)
-        placed_on_container = bool(near and above_table)
-    if (
-        not placed_on_container
-        and container_xy is None
-        and "container_pos" in episode
-        and finished
-    ):
-        # No fixed spot given: the container moves per episode, so use the logged one.
-        cpos = np.asarray(episode["container_pos"])
-        if len(cpos) and np.isfinite(cpos[-1, 0]):
-            xy = pos[-1, :2]
-            near = float(np.linalg.norm(xy - cpos[-1, :2])) <= float(container_xy_tol)
+    elif cpos is not None:
+        cxy = cpos[:2]
+    else:
+        cxy = None
+
+    # Over the bowl: must sit low (in/on it). A stalled lower that freezes the
+    # object mid-air still has high z_end — that must NOT count as success via
+    # the "held high" branch.
+    if cxy is not None:
+        near = float(np.linalg.norm(pos[-1, :2] - cxy)) <= float(container_xy_tol)
+        if near:
             above_table = float(z[-1]) >= float(z_placed_min)
-            placed_on_container = bool(near and above_table)
-    return bool(finished and lifted and (held_at_end or placed_on_container))
+            if cpos is not None:
+                low_enough = float(z[-1]) <= float(cpos[2]) + float(
+                    z_placed_max_above_container
+                )
+            else:
+                # No container height logged: reject carry-height hover via z_end_min.
+                low_enough = float(z[-1]) < float(z_end_min)
+            return bool(above_table and low_enough)
+    return bool(held_at_end)
 
 
 def classify_failure(
@@ -221,3 +235,45 @@ def episode_diagnostics(
         "z_end": float(z[-1]),
         "z_lift_min": float(z_lift_min),
     }
+
+
+def release_disturbed(stage, obj_pos, ee_pos, steps: int = 4) -> bool:
+    """True if the hand pulled or lifted the placed object as go-home began.
+
+    First ``steps`` frames of go-home: the object moved > 1 cm in XY along the
+    hand's direction, or rose > 1 cm. (g0_object_smoke: 34% of successes did
+    this before the straight-up retreat in ``_home_target``.)
+    """
+    stage = np.asarray(stage)
+    obj = np.asarray(obj_pos, dtype=np.float64)
+    ee = np.asarray(ee_pos, dtype=np.float64)
+    idx = np.where(stage == STAGE_HOME)[0]
+    if len(idx) == 0:
+        return False
+    a = int(idx[0])
+    b = min(a + steps, len(stage) - 1)
+    d_obj = obj[b, :2] - obj[a, :2]
+    d_ee = ee[b, :2] - ee[a, :2]
+    rise = float(obj[a : b + 1, 2].max() - obj[a, 2])
+    n_obj, n_ee = float(np.linalg.norm(d_obj)), float(np.linalg.norm(d_ee))
+    # The hand must itself move sideways (> 5 mm) for "along" to mean a drag;
+    # otherwise a fruit rolling inside the box under a still hand looks dragged.
+    along = n_obj > 0.01 and n_ee > 0.005 and float(d_obj @ d_ee) / (n_obj * n_ee) > 0.7
+    return bool(along or rise > 0.01)
+
+
+def clean_reject_reason(episode: dict, retries: int | None) -> str | None:
+    """Why a successful demo is not clean (None = clean).
+
+    Clean = first-try grasp (no slip + re-chase), a real open stage, and the
+    hand leaves without dragging the object. Used at collect time (target
+    counts clean wins) and at convert time (``--clean-only``).
+    """
+    if int(retries or 0) > 0:
+        return "retried"
+    stage = np.asarray(episode["stage"])
+    if STAGE_OPEN not in stage:
+        return "no-open-stage"
+    if release_disturbed(stage, episode["object_pos"], episode["ee_pos"]):
+        return "release-drag"
+    return None

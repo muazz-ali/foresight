@@ -23,10 +23,9 @@ WHAT SUCCESS LOOKS LIKE (see foresight_plan.md for the real gate text)
     (a) normal run: success stays flat from 0 to 20 cm/s (drop < 15 points).
     (b) `--zero-conditioning` run: success at mid speed falls by >= 15 points.
   This script only writes the per-speed table (gate_g1_report.json) and one
-  line per episode (metrics.jsonl). The pass/fail verdict is made by
-  eval/gate_g1.py, which merges the (a) and (b) reports.
-  Sample size: 20 trials per speed is a SCOUT only. You need n >= 80 per speed
-  before you claim G1 passed or failed.
+  line per episode (metrics.jsonl). 
+  The pass/fail verdict is made by scripts/gate_g1.py, which merges the (a) and (b) reports.
+  Sample size: trials n >= 80 per speed before you claim G1 passed or failed.
 
 FAILURE LABELS (policy only)
   The code currently stores: never-held | held-no-lift | lifted-no-place |
@@ -41,8 +40,8 @@ FAILURE LABELS (policy only)
 
 SEEDING
   Every episode seeds python/numpy/torch from the episode seed, and the
-  SmolVLA flow-matching noise is drawn from its own seeded generator. Same
-  seed + same flags = same rollout (see --torch-deterministic for GPU kernels).
+  SmolVLA flow-matching noise is drawn from its own seeded generator. 
+  Same seed + same flags = same rollout (see --torch-deterministic for GPU kernels).
 
 TIMING OVERLAYS (Phase 3, eval-time only; all default off = old behaviour)
   --reflex on            ReflexClose steers XY + closes in the last ~10 cm.
@@ -73,10 +72,13 @@ DEFAULT_CFG = FORESIGHT_ROOT / "sim" / "phase0_cfg.yaml"
 
 sys.path.insert(0, str(FORESIGHT_ROOT))
 from eval.gate_g1 import G1_SPEEDS, HIGH_M_S, MID_M_S  # noqa: E402
+from interfaces.state import ObjectState  # noqa: E402
 
-# Default trials per speed. 20 is a scout (quick look). Use n >= 80 per speed
 # (--trials-per-speed 80) before claiming G1 pass or fail.
-G1_TRIALS = 20
+G1_TRIALS = 100
+# Filter arm: finger gap above this with the gripper commanded closed = holding.
+# Fruit holds at 60–67 mm; an empty close or a slip reads under 2 mm.
+HELD_MIN_GAP_M = 0.010
 
 # --force-place is a DEBUG helper, not part of the G1 score. After the policy
 # picks the object, a simple script (not the policy) carries it to the bowl and
@@ -107,12 +109,21 @@ def _step_toward(current: np.ndarray, target: np.ndarray, max_step: float) -> np
 def _build_parser() -> argparse.ArgumentParser:
     """All CLI flags. Isaac's own launcher flags (--headless etc.) are added in main()."""
     p = argparse.ArgumentParser(description="Foresight G1 closed-loop policy eval")
-    p.add_argument("--checkpoint", type=str, default="runs/p1/pretrained_model")
+    p.add_argument("--checkpoint", type=str, default="runs/p3_throw/pretrained_model")
     p.add_argument("--zero-conditioning", action="store_true", help="Sanity: zero conditioning vector")
+    p.add_argument(
+        "--cond-shift-m",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("DX", "DY"),
+        help="Claim test: add (DX, DY) m to p̂ the model sees. If the model uses the "
+        "numbers, the hand should miss by about this much.",
+    )
     p.add_argument(
         "--cond-source",
         choices=["oracle", "filter"],
-        default="oracle",
+        default="filter",
         help="Where the 4 conditioning numbers come from. oracle = sim truth (default). "
         "filter = static camera + Kalman. Filter runs warm up 2 frames before the first plan.",
     )
@@ -125,7 +136,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trials-per-speed", type=int, default=G1_TRIALS)
     p.add_argument("--speeds", type=float, nargs="+", default=list(G1_SPEEDS))
     p.add_argument("-c", "--sim_cfg_file", default=str(DEFAULT_CFG))
-    p.add_argument("-o", "--output_dir", default=str(FORESIGHT_ROOT / "data" / "p1" / "eval"))
+    p.add_argument("-o", "--output_dir", default=str(FORESIGHT_ROOT / "data" / "p1_throw" / "eval"))
     p.add_argument("--seed", type=int, default=9000)
     p.add_argument("--object-usd", default=None)
     p.add_argument("--container-usd", default=None)
@@ -160,6 +171,17 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Timestamped ActionBuffer: drop chunk slots whose time has passed.")
     p.add_argument("--inject-latency-s", type=float, default=0.0,
                    help="Simulated inference delay (s): plan from an observation this old.")
+    p.add_argument("--held-from-hand", choices=["on", "off"], default="on",
+                   help="Filter arm: while the fingers hold something, the 4 numbers come "
+                   "from the hand (held object rides with it). off = raw filter throughout.")
+    # Wrist depth ≈ 1.25 × (hand − object centre height) + 7.8 cm in the demos
+    # (σ 0.7 cm); the expert closes at ~8.4 cm. 9.0 cm ≈ hand ≤ 1 cm above centre.
+    p.add_argument("--close-gate", choices=["on", "off"], default="off",
+                   help="Hold the policy's first close until wrist depth and tracked XY say "
+                   "the hand is in place (times out).")
+    p.add_argument("--close-gate-depth-m", type=float, default=0.090)
+    p.add_argument("--close-gate-xy-m", type=float, default=0.012)
+    p.add_argument("--close-gate-max-wait", type=int, default=8, help="frames (25 Hz)")
     p.add_argument("--torch-deterministic", action="store_true",
                    help="torch.use_deterministic_algorithms + cuDNN deterministic (slower).")
     return p
@@ -233,12 +255,7 @@ def _lerobot_device_tag(device: str) -> str:
     return "cpu"
 
 
-def load_policy(
-    checkpoint: str,
-    device: str,
-    *,
-    n_action_steps: int | None = None,
-):
+def load_policy(checkpoint: str,device: str, *, n_action_steps: int | None = None):
     """Load the SmolVLA checkpoint onto the GPU in eval mode. Called once in main()."""
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
@@ -252,10 +269,10 @@ def load_policy(
             cfg_path.write_text(json.dumps(raw, indent=4) + "\n")
 
     policy = SmolVLAPolicy.from_pretrained(checkpoint)
-    # chunk_size = how many actions the net predicts per forward.
-    # n_action_steps = how many of those we execute before calling the net again.
-    # Smaller n = the net looks at fresh numbers more often (replans sooner).
-    # Only override when the user passed --n-action-steps.
+    # chunk_size = SmolVLA predicts chunk of future actions in one fwd pass (default 50).
+    # n_action_steps = how many of those "action chunks"we execute on robot before calling the net again (replan).
+    # @25hz (25 actions/s) n_action_steps=50 means 2s of action execution (50*0.04s/action = 2s).
+    # smaller n = the net looks at fresh numbers more often (replans sooner).
     if n_action_steps is not None:
         n = int(n_action_steps)
         if n < 1:
@@ -270,6 +287,11 @@ def load_policy(
             1000.0 * n / 25.0,
             chunk,
         )
+    from policy.transforms import load_frames
+
+    # How this checkpoint reads p̂ and writes actions (abs / rel / delta).
+    policy.foresight_frames = load_frames(checkpoint)
+    logging.info("policy frames: %s", policy.foresight_frames)
     policy.to(device)
     policy.eval()
     return policy
@@ -352,6 +374,8 @@ def build_obs_batch(
     images: dict | None = None,
     oracle_state=None,
     filter_state=None,
+    frames: dict | None = None,
+    cond_shift: np.ndarray | None = None,
 ) -> tuple[dict, dict]:
     """One SmolVLA observation dict + the packs we logged.
 
@@ -383,7 +407,17 @@ def build_obs_batch(
         delta=delta,
         zero=zero_conditioning,
     )
-    state = np.concatenate([state, aux["cond"]], axis=0).astype(np.float32)
+    if cond_shift is not None and not zero_conditioning:
+        # Claim test: feed a deliberately wrong p̂ (logged as the cond we fed).
+        aux["cond"] = np.asarray(aux["cond"], dtype=np.float64).copy()
+        aux["cond"][0:2] += np.asarray(cond_shift, dtype=np.float64).reshape(2)
+    from policy.transforms import cond_to_model
+
+    cond_frame = (frames or {}).get("cond_frame", "abs")
+    # Zero-out hides the numbers in the model's own frame (all zeros fed).
+    model_cond = aux["cond"] if zero_conditioning else cond_to_model(aux["cond"], ee_pos, cond_frame)
+    aux["cond_model"] = np.asarray(model_cond, dtype=np.float32)
+    state = np.concatenate([state, aux["cond_model"]], axis=0).astype(np.float32)
 
     # Add a batch dimension of 1. The task text ends with a newline, as in training.
     batch = {
@@ -433,6 +467,9 @@ def run_episode_policy(
     action_buffer_on: bool = False,
     inject_latency_s: float = 0.0,
     close_time: tuple[float, str] | None = None,
+    cond_shift: np.ndarray | None = None,
+    held_from_hand: bool = True,
+    close_gate: dict | None = None,
 ) -> tuple[dict, dict]:
     """Closed-loop policy rollout. Logs the same arrays as expert collect.
 
@@ -458,6 +495,9 @@ def run_episode_policy(
     meta["no_attach"] = bool(no_attach)
     meta["force_place"] = bool(force_place)
     meta["cond_source"] = cond_source
+    frames = dict(getattr(policy, "foresight_frames", None) or {"cond_frame": "abs", "action_frame": "abs"})
+    meta["frames"] = frames
+    meta["cond_shift_m"] = None if cond_shift is None else [float(v) for v in cond_shift]
     meta["checkpoint"] = checkpoint
     meta["n_action_steps"] = None if n_action_steps is None else int(n_action_steps)
     meta["delta"] = float(delta)
@@ -507,6 +547,10 @@ def run_episode_policy(
     reflex_engaged = False  # the current reflex close was already handled
     reflex_close_t_list: list = []  # earlier reflex closes that slipped
     n_hold_steps = 0  # buffer on: steps with no due action (held the last one)
+    ee_prev = None  # (hand xyz, time) last frame: hand velocity while holding
+    # Close gate state: first close only (a later re-close is the policy's own).
+    gate_done, gate_wait, gate_hold, gate_log = False, 0, None, []
+    n_hand_frames = 0  # filter arm: frames whose numbers came from the held hand
 
     # Only the filter arm (G2b) needs a camera tracker + Kalman filter.
     est = None
@@ -600,6 +644,23 @@ def run_episode_policy(
                 _rgb_frame(imgs["static_cam"]),
                 float(oracle_now.timestamp),
             )
+            # Held object rides with the hand: the camera cannot see it inside
+            # the fingers, and once lifted it is off the table plane the filter
+            # assumes. Fingers stopped apart = something is held (real arm: same
+            # width reading). The filter keeps running underneath for a slip.
+            ee_now = np.asarray(scene.get_ee_pose()[0], dtype=np.float64)
+            t_now = float(oracle_now.timestamp)
+            if (
+                held_from_hand
+                and float(scene.get_gripper_open()) < 0.5
+                and scene.get_finger_gap_m() > HELD_MIN_GAP_M
+                and ee_prev is not None
+                and t_now > ee_prev[1]
+            ):
+                v = (ee_now - ee_prev[0]) / (t_now - ee_prev[1])
+                filt_state = ObjectState(ee_now, v, np.full(6, 1e-6), t_now, True)
+                n_hand_frames += 1
+            ee_prev = (ee_now, t_now)
         batch, aux = build_obs_batch(
             scene,
             delta=delta,
@@ -610,6 +671,8 @@ def run_episode_policy(
             images=imgs,
             oracle_state=oracle_now,
             filter_state=filt_state,
+            frames=frames,
+            cond_shift=cond_shift,
         )
         # Latency: the policy plans from the observation lat_steps ago
         # (clamped to the first frame at episode start). L=0: this frame.
@@ -624,6 +687,11 @@ def run_episode_policy(
             with torch.inference_mode():
                 chunk = policy.predict_action_chunk(batch_used, noise=noise)
             chunk = chunk[0, :n_exec].detach().cpu().numpy().astype(np.float64)
+            # Delta checkpoints predict moves from the hand in the planning obs.
+            from policy.transforms import action_from_model
+
+            ee_plan = batch_used["observation.state"][0, 0:3].detach().cpu().numpy()
+            chunk = action_from_model(chunk, ee_plan, frames.get("action_frame", "abs"))
             if action_buf is not None:
                 # Action i was meant for obs time + i*dt. Slots already past are dropped.
                 action_buf.push_chunk(chunk, t0=now_k - lat_steps * dt, dt=dt, now=now_k - 1e-6)
@@ -651,6 +719,30 @@ def run_episode_policy(
         ee, ee_q = scene.get_ee_pose()
         dist = float(np.linalg.norm(ee - obj.position))
         want_close = grip < 0.5
+
+        # ----- CLOSE GATE (Job 3 overlay, eval only) -----
+        # The policy picks *when*; the gate checks the hand is really there before
+        # the first close: wrist depth (height above the object) and the tracked
+        # object XY (filter arm: the filter, never sim truth). While waiting, hold
+        # the pre-close target and carry it along with the object. Times out.
+        if close_gate is not None and not gate_done and want_close and float(scene.get_gripper_open()) > 0.5:
+            src = filt_state if filt_state is not None else obj
+            p_now = src.position + src.velocity * max(now_t - float(src.timestamp), 0.0)
+            if gate_hold is None:
+                gate_hold = (np.asarray(pos, dtype=np.float64).reshape(3).copy(), p_now.copy())
+            depth = float(scene.get_wrist_depth_m())
+            xy_err = float(np.linalg.norm(ee[:2] - p_now[:2]))
+            ready = xy_err <= close_gate["xy_m"] and np.isfinite(depth) and depth <= close_gate["depth_m"]
+            if ready or gate_wait >= close_gate["max_wait"]:
+                gate_done = True
+                gate_log.append({"t": now_t, "wait": gate_wait, "ready": bool(ready),
+                                 "depth_m": depth, "xy_err_m": xy_err})
+            else:
+                gate_wait += 1
+                hold_pos, p0 = gate_hold
+                pos = hold_pos.copy()
+                pos[0:2] += (p_now - p0)[0:2]
+                grip, want_close = 1.0, False
 
         # Reflex (control rate): steer XY at the meeting point, close on time-to-arrival.
         # Uses the filter state when there is one, else sim truth. A close stays latched.
@@ -945,6 +1037,10 @@ def run_episode_policy(
     meta["reflex_close_t"] = reflex_close_t
     meta["reflex_close_t_slipped"] = reflex_close_t_list
     meta["n_hold_steps"] = int(n_hold_steps)
+    meta["held_from_hand"] = bool(held_from_hand) if est is not None else None
+    meta["n_hand_frames"] = int(n_hand_frames)
+    meta["close_gate"] = close_gate
+    meta["close_gate_log"] = gate_log
     meta["off_table"] = bool(getattr(scene, "off_table", False))
     meta["table_z"] = float(getattr(scene, "_table_z", 0.0))
     meta["dt"] = dt
@@ -1172,6 +1268,17 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
                 action_buffer_on=getattr(args, "action_buffer", "off") == "on",
                 inject_latency_s=float(getattr(args, "inject_latency_s", 0.0)),
                 close_time=getattr(args, "_close_time", None),
+                cond_shift=getattr(args, "cond_shift_m", None),
+                held_from_hand=getattr(args, "held_from_hand", "on") == "on",
+                close_gate=(
+                    {
+                        "depth_m": float(args.close_gate_depth_m),
+                        "xy_m": float(args.close_gate_xy_m),
+                        "max_wait": int(args.close_gate_max_wait),
+                    }
+                    if getattr(args, "close_gate", "off") == "on"
+                    else None
+                ),
             )
             ok = episode_success_policy(episode, carry_pose=np.asarray(meta.get("carry_pose")))
         except Exception as ex:
@@ -1238,6 +1345,18 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
             "n_hold_steps": meta.get("n_hold_steps"),
             "off_table": meta.get("off_table"),
             "timing": meta.get("timing"),
+            # Asset identity (fixed per process; proves multi-worker diversity).
+            "frames": meta.get("frames"),
+            "cond_shift_m": meta.get("cond_shift_m"),
+            "held_from_hand": meta.get("held_from_hand"),
+            "n_hand_frames": meta.get("n_hand_frames"),
+            "close_gate": meta.get("close_gate"),
+            "close_gate_log": meta.get("close_gate_log"),
+            "asset_seed": meta.get("asset_seed"),
+            "category": meta.get("category"),
+            "container_category": meta.get("container_category"),
+            "usd": meta.get("usd"),
+            "container_usd": meta.get("container_usd"),
             **diag,
         }
         if meta.get("conditioning_debug"):
@@ -1384,18 +1503,11 @@ def main() -> None:
     if getattr(args, "device", None):
         cfg.setdefault("sim", {})["device"] = args.device
 
-    scene = Phase0Scene(
-        cfg,
-        enable_cameras=True,
-        object_usd=args.object_usd,
-        container_usd=args.container_usd,
-        asset_seed=int(args.seed),
-    )
-    policy = load_policy(
-        args.checkpoint,
-        device,
-        n_action_steps=args.n_action_steps,
-    )
+    # Create a new scene for each speed.
+    scene = Phase0Scene(cfg, enable_cameras=True, object_usd=args.object_usd,container_usd=args.container_usd,asset_seed=int(args.seed))
+    
+    # Load the policy for the given checkpoint.
+    policy = load_policy(args.checkpoint,device,n_action_steps=args.n_action_steps)
 
     # Start a fresh metrics file so old trials do not mix into this run.
     metrics_path = out_dir / "metrics.jsonl"

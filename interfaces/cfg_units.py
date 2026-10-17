@@ -45,19 +45,29 @@ _SM_RENAMES: dict[str, str] = {
     "servo_lag_s": "tip_lag_pad_ms",
     "ee_speed_max_cm_s": "hand_speed_max_cm_s",
     "intercept_iters": "aim_refine_iters",
-    "hover_z_mm": "hover_above_object_mm",
-    "z_release_radius_mm": "start_lowering_xy_mm",
-    "track_xy_tol_mm": "riding_xy_ok_mm",
-    "approach_z_tol_mm": "riding_z_ok_mm",
-    "track_hold_ms": "riding_hold_ms",
+    # Chase/grasp collapsed to one gate (see grasp_xyz_ok_mm).
+    "hover_z_mm": "grasp_xyz_ok_mm",
+    "hover_above_object_mm": "grasp_xyz_ok_mm",
+    "z_release_radius_mm": "grasp_xyz_ok_mm",
+    "start_lowering_xy_mm": "grasp_xyz_ok_mm",
+    "track_xy_tol_mm": "grasp_xyz_ok_mm",
+    "riding_xy_ok_mm": "grasp_xyz_ok_mm",
+    "approach_z_tol_mm": "grasp_xyz_ok_mm",
+    "riding_z_ok_mm": "grasp_xyz_ok_mm",
+    "track_hold_ms": "grasp_xyz_ok_mm",
+    "riding_hold_ms": "grasp_xyz_ok_mm",
+    "grasp_xy_tol_mm": "grasp_xyz_ok_mm",
+    "grasp_xy_ok_mm": "grasp_xyz_ok_mm",
+    "grasp_z_tol_mm": "grasp_xyz_ok_mm",
+    "grasp_z_ok_mm": "grasp_xyz_ok_mm",
+    "grasp_tol_step_k": "grasp_xyz_ok_mm",
+    "grasp_tol_grows_k": "grasp_xyz_ok_mm",
+    "physics_grasp_z_tol_mm": "grasp_xyz_ok_mm",
+    "physics_grasp_z_ok_mm": "grasp_xyz_ok_mm",
     "bounce_guard_ms": "min_wait_after_bounce_ms",
     "wait_after_bounce_ms": "min_wait_after_bounce_ms",
     "min_clear_before_wall_ms": "min_wait_after_bounce_ms",
     "ee_settle_tol_cm_s": "object_still_cm_s",
-    "grasp_xy_tol_mm": "grasp_xy_ok_mm",
-    "grasp_z_tol_mm": "grasp_z_ok_mm",
-    "grasp_tol_step_k": "grasp_tol_grows_k",
-    "physics_grasp_z_tol_mm": "physics_grasp_z_ok_mm",
     "close_gripper_ms": "hold_closed_weld_ms",
     "physics_close_ms": "hold_closed_physics_ms",
     "close_depth_mm": "wrist_close_depth_mm",
@@ -126,6 +136,7 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
         _take(scene, "max_object_width_mm", "max_object_width_m", _MM)
         _take(scene, "min_container_clearance_mm", "min_container_clearance_m", _MM)
         _take(scene, "min_container_xy_margin_mm", "min_container_xy_margin_m", _MM)
+        _take(scene, "min_container_finger_clearance_mm", "min_container_finger_clearance_m", _MM)
         _take(scene, "robot_base_keepout_mm", "robot_base_keepout_m", _MM)
         _take(scene, "ee_table_margin_mm", "ee_table_margin_m", _MM)
         _take(scene, "container_xy_mm", "container_xy", _MM)
@@ -170,7 +181,6 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
             ("wait_at_home_ms", "settle_s"),
             ("max_aim_ahead_ms", "lookahead_s"),
             ("tip_lag_pad_ms", "robot_approach_pad_s"),
-            ("riding_hold_ms", "track_hold_s"),
             ("min_wait_after_bounce_ms", "bounce_guard_s"),
             ("hold_closed_weld_ms", "close_gripper_s"),
             ("hold_closed_physics_ms", "physics_close_s"),
@@ -179,23 +189,32 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
             ("chase_stall_timeout_ms", "grasp_stage_timeout_s"),
         ):
             _take(sm, human, si, _MS)
+        # One chase/close gate: [dx, dy, dz] mm → metres.
+        if "grasp_xyz_ok_mm" in sm:
+            raw = list(sm.pop("grasp_xyz_ok_mm"))
+            if len(raw) != 3:
+                raise ValueError(
+                    f"grasp_xyz_ok_mm needs [dx, dy, dz]; got {raw!r}"
+                )
+            sm["grasp_xyz_ok"] = [_scale(v, _MM) for v in raw]
+        elif "grasp_xyz_ok" in sm:
+            raise ValueError(
+                "legacy key 'grasp_xyz_ok' is not supported; write "
+                "'grasp_xyz_ok_mm' instead (mm in the yaml)"
+            )
         # lengths
         for human, si in (
-            ("hover_above_object_mm", "hover_z"),
-            ("start_lowering_xy_mm", "z_release_radius"),
-            ("riding_xy_ok_mm", "track_xy_tol"),
-            ("riding_z_ok_mm", "approach_z_tol"),
-            ("grasp_xy_ok_mm", "grasp_xy_tol"),
-            ("grasp_z_ok_mm", "grasp_z_tol"),
-            ("physics_grasp_z_ok_mm", "physics_grasp_z_tol"),
             ("wrist_close_depth_mm", "close_depth_m"),
             ("lift_height_mm", "lift_height"),
             ("slip_if_farther_mm", "slip_dist_m"),
             ("near_enough_xy_mm", "servo_xy_tol"),
+            ("arrived_z_ok_mm", "place_z_tol"),
             ("drop_above_rest_mm", "drop_z_gap"),
             ("drop_below_rim_mm", "drop_rim_clear_m"),
             ("in_box_xy_ok_mm", "place_xy_tol"),
             ("home_z_ok_mm", "home_z_tol"),
+            ("release_retreat_mm", "release_retreat_m"),
+            ("release_step_mm", "release_step_m"),
         ):
             _take(sm, human, si, _MM)
         # speeds (cm/s → m/s)
@@ -206,13 +225,6 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
             sm["intercept_iters"] = int(sm.pop("aim_refine_iters"))
         elif "intercept_iters" not in sm:
             pass  # optional; expert defaults to 3
-        if "grasp_tol_grows_k" in sm:
-            sm["grasp_tol_step_k"] = float(sm.pop("grasp_tol_grows_k"))
-        elif "grasp_tol_step_k" in sm:
-            raise ValueError(
-                "legacy key 'grasp_tol_step_k' renamed to 'grasp_tol_grows_k' "
-                "(see state_machine_params in sim/phase0_cfg.yaml)"
-            )
 
     sim = cfg.get("sim")
     if isinstance(sim, dict):

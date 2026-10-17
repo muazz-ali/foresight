@@ -1,8 +1,8 @@
 # `PickPlaceStateMachine.step()` flow
 
-Code: [`sim/state_machine.py` lines 364–574](../sim/state_machine.py#L364).
+Code: [`sim/state_machine.py`](../sim/state_machine.py) (`PickPlaceStateMachine.step`).
 
-Called once per sim tick from [`collect.run_episode`](../sim/collect.py#L188).
+Called once per sim tick from [`collect.run_episode`](../sim/collect.py).
 
 ---
 
@@ -38,37 +38,36 @@ flowchart TD
     D --> E{self.stage ?}
 ```
 
-`ee_quat` is passed in for logging / future use but **not used** in decisions (`del ee_quat`).
+`ee_quat` is passed in for logging / future use but **not used** in decisions.
 
 ---
 
 ## All stages (main flow)
+
+Happy path: `0 → 1 → 3 → 4 → 5 → 6 → 7 → 8 → 9`.  
+Stage **2 (go down)** is unused; intercept closes on the same `grasp_xyz_ok` gate.
 
 ```mermaid
 flowchart TD
     START([step called]) --> READ[Read ee, obj, vel, speed]
     READ --> SW{stage}
 
-    SW -->|0 RESET| R0["Target: arm home pose"]
+    SW -->|0 start| R0["Target: arm home pose"]
     R0 --> R1{timer ≥ settle_s?}
     R1 -->|yes| R2["→ stage 1 INTERCEPT"]
     R1 -->|no| OUT
 
-    SW -->|1 INTERCEPT| I0["Blend Z down as XY closes<br/>lead_s = _intercept_lead_s<br/>aim = forecast at lead_s"]
-    I0 --> I1{Hand over object<br/>+ held track_hold_s?}
+    SW -->|1 INTERCEPT| I0["lead_s = _intercept_lead_s<br/>aim = forecast at lead_s<br/>target Z = object Z"]
+    I0 --> I1{grasp_xyz_ok<br/>GT |dx|,|dy|,|dz|}
     I1 -->|no| I2{grasp_stage_timeout?}
     I2 -->|yes| RET["_restart_approach"]
     I2 -->|no| OUT
     I1 -->|yes| I3{bounce_clear?}
     I3 -->|no| OUT
-    I3 -->|yes| I4["→ stage 2 GO DOWN"]
+    I3 -->|yes| I4["Log grasp_err, grasp_speed<br/>→ stage 3 CLOSE"]
 
-    SW -->|2 GO DOWN| D0["Ride object XY (tau lead)<br/>Z onto object"]
-    D0 --> D1{Grasp gate OK?<br/>XY + Z + speed tol}
-    D1 -->|yes| D2["Log grasp_err, grasp_speed<br/>→ stage 3 CLOSE"]
-    D1 -->|no| D3{stage_timeout?}
-    D3 -->|yes| RET
-    D3 -->|no| OUT
+    SW -->|2 GO DOWN unused| U0["Same chase logic as stage 1<br/>(happy path never enters)"]
+    U0 --> I1
 
     SW -->|3 CLOSE| C0["Gripper closed, attach object"]
     C0 --> C1{timer ≥ close_gripper_s?}
@@ -94,7 +93,7 @@ flowchart TD
     O1 -->|yes| O2["→ stage 8 HOME"]
     O1 -->|timeout| O3["→ stage 8 HOME"]
 
-    SW -->|8 HOME| H0["_home_target: climb clear, then home"]
+    SW -->|8 HOME| H0["_home_target: retreat straight up, climb, then home"]
     H0 --> H1{At home + object in box?}
     H1 -->|yes| H2["→ stage 9 DONE"]
 
@@ -103,7 +102,6 @@ flowchart TD
     RET --> I0
     R2 --> OUT
     I4 --> OUT
-    D2 --> OUT
     C2 --> OUT
     L2 --> OUT
     Y2 --> OUT
@@ -121,37 +119,23 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[Measure hand-to-object XY error] --> B["z_frac = min(old, err / z_release_radius)<br/>ratchet — height only drops"]
-    B --> C["target_z = object Z + hover_z × z_frac"]
-    C --> D["_intercept_lead_s(ee, obj, vel)"]
-    D --> E["_forecast(obj, vel, lead_s) → aim XY"]
-    E --> F["target = aim XY + target_z"]
+    A[Measure hand / object] --> B["target_z = object Z<br/>(no hover)"]
+    B --> C["_intercept_lead_s(ee, obj, vel, goal_z)"]
+    C --> D["_forecast(obj, vel, lead_s) → aim XY"]
+    D --> E["target = aim XY + target_z"]
 
-    F --> G{err_xy < track_xy_tol<br/>AND err_z < approach_z_tol?}
-    G -->|yes| H["lock_s += dt"]
-    G -->|no| I["lock_s = 0"]
-
-    H --> J{lock_s ≥ track_hold_s?}
-    I --> OUT[Keep intercepting]
-    J -->|no| OUT
-    J -->|yes| K{_bounce_clear?}
+    E --> F{_grasp_gate_ok?<br/>|dx|,|dy|,|dz| or wrist depth}
+    F -->|no| OUT[Keep intercepting]
+    F -->|yes| K{_bounce_clear?}
     K -->|no| OUT
-    K -->|yes| L["→ GO DOWN"]
+    K -->|yes| L["Log grasp stats → CLOSE (3)"]
 ```
 
 ---
 
-## Stage 2 GO DOWN (detail)
+## Stage 2 GO DOWN (unused)
 
-```mermaid
-flowchart TD
-    A["aim = forecast(obj, vel, tau)<br/>lag-only lead in XY"] --> B["target XY = aim, target Z = object Z"]
-    B --> C{err_xy < grasp_tol_xy(speed)<br/>AND err_z < grasp_z_tol?}
-    C -->|yes| D["Save grasp_err_xy, grasp_err_z, grasp_speed<br/>→ CLOSE"]
-    C -->|no| E{stage_timeout?}
-    E -->|yes| F["_restart_approach"]
-    E -->|no| G[Keep descending]
-```
+Id kept for old logs / failure labels. Happy path never enters it. If entered, the same branch as stage 1 runs (`STAGE_APPROACH` and `STAGE_DESCEND` share code).
 
 ---
 
@@ -159,7 +143,7 @@ flowchart TD
 
 | Stage | gripper | object slide | attach | freeze |
 |------:|:-------:|:------------:|:------:|:------:|
-| 0–2 intercept / go down | open | yes | no | no |
+| 0–1 start / intercept (2 unused) | open | yes | no | no |
 | 3 close | **closed** | no | **yes** | no |
 | 4–6 lift / carry / lower | closed | no | yes | no |
 | 7 open | open | no | no | **yes** |
@@ -171,7 +155,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    FAIL["Intercept or go-down failed / timed out"] --> R["_restart_approach"]
+    FAIL["Intercept failed / timed out / slip"] --> R["_restart_approach"]
     R --> C{retries > max_retries?}
     C -->|yes| H["→ HOME (give up grasp)"]
     C -->|no| I["→ INTERCEPT (try again)"]

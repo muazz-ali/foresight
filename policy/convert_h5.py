@@ -79,14 +79,28 @@ def pack_action(action_pos: np.ndarray, action_quat: np.ndarray, gripper_open: f
     return pack_proprio(action_pos, action_quat, gripper_open)
 
 
-def list_success_episodes(input_dir: Path, *, success_only: bool = True) -> list[tuple[Path, Path]]:
+def clean_reject_reason(meta: dict, f) -> str | None:
+    """Why a success is not a clean demo (None = clean). Rule: sim/success.py."""
+    from sim.success import clean_reject_reason as _rule
+
+    if "clean_reject" in meta:  # recorded at collect time
+        return meta["clean_reject"]
+    episode = {k: np.asarray(f[k][:]) for k in ("stage", "object_pos", "ee_pos")}
+    return _rule(episode, meta.get("retries"))
+
+
+def list_success_episodes(
+    input_dir: Path, *, success_only: bool = True, clean_only: bool = False
+) -> list[tuple[Path, Path]]:
     """Return (h5, json) pairs under input_dir (recursive).
 
     By default keep only episodes the expert finished (success). Learning from
     failed demos would teach the policy to fail. Skip files that lack cameras
-    or the object numbers, since training needs both.
+    or the object numbers, since training needs both. ``clean_only`` also drops
+    successes that retried, skipped the open stage, or dragged the object.
     """
     pairs: list[tuple[Path, Path]] = []
+    rejected: dict[str, int] = {}
     for h5_path in sorted(input_dir.rglob("*.h5")):
         js = h5_path.with_suffix(".json")
         if not js.exists():
@@ -103,7 +117,14 @@ def list_success_episodes(input_dir: Path, *, success_only: bool = True) -> list
             if "conditioning" not in f or "oracle_state" not in f:
                 logger.warning("skip %s (missing conditioning/oracle)", h5_path.name)
                 continue
+            if clean_only:
+                why = clean_reject_reason(meta, f)
+                if why is not None:
+                    rejected[why] = rejected.get(why, 0) + 1
+                    continue
         pairs.append((h5_path, js))
+    if clean_only:
+        logger.info("clean filter kept %d, dropped %s", len(pairs), rejected or "none")
     return pairs
 
 
@@ -112,6 +133,27 @@ def episode_language(meta: dict) -> str:
     if meta.get("language"):
         return str(meta["language"])
     return default_language(meta.get("category"), meta.get("container_category"))
+
+
+def episodes_done_in_root(root: Path) -> int:
+    """How many episodes a prior convert already wrote (from meta/info.json)."""
+    info = root / "meta" / "info.json"
+    if not info.exists():
+        raise FileNotFoundError(f"no LeRobot info at {info}")
+    n = int(json.loads(info.read_text())["total_episodes"])
+    if n < 0:
+        raise ValueError(f"bad total_episodes in {info}: {n}")
+    return n
+
+
+def prefer_fast_pairs(pairs: list[tuple[Path, Path]]) -> list[tuple[Path, Path]]:
+    """Fast speeds first so a mid-run OOM still keeps 15–20 cm/s demos."""
+
+    def speed_key(pair: tuple[Path, Path]) -> float:
+        meta = json.loads(pair[1].read_text())
+        return float(meta.get("speed_m_s", 0.0))
+
+    return sorted(pairs, key=speed_key, reverse=True)
 
 
 def convert_episodes(
@@ -146,8 +188,11 @@ def convert_episodes(
         use_videos=False,
         image_writer_threads=4,
     )
+    # Sidecar for later skip/merge: one line per saved episode → source H5.
+    source_log = root / "meta" / "source_h5.jsonl"
+    source_log.parent.mkdir(parents=True, exist_ok=True)
 
-    for h5_path, js_path in tqdm(pairs, desc="convert"):
+    for ep_i, (h5_path, js_path) in enumerate(tqdm(pairs, desc="convert")):
         meta = json.loads(js_path.read_text())
         task = episode_language(meta)
         with h5py.File(h5_path, "r") as f:
@@ -174,6 +219,18 @@ def convert_episodes(
                 }
                 ds.add_frame(frame, task=task)
         ds.save_episode()
+        with source_log.open("a") as sf:
+            sf.write(
+                json.dumps(
+                    {
+                        "episode_index": ep_i,
+                        "h5": str(h5_path.resolve()),
+                        "speed_m_s": float(meta.get("speed_m_s", -1)),
+                        "category": meta.get("category"),
+                    }
+                )
+                + "\n"
+            )
         logger.info("saved %s frames=%d task=%s", h5_path.name, T, task)
 
     logger.info(
@@ -196,11 +253,48 @@ def main() -> None:
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--max-episodes", type=int, default=None)
     p.add_argument("--include-failures", action="store_true")
+    p.add_argument(
+        "--clean-only",
+        action="store_true",
+        help="drop successes that retried, skipped the open stage, or dragged the object on release",
+    )
+    p.add_argument(
+        "--skip-from-root",
+        type=Path,
+        default=None,
+        help="skip the first N sorted clean episodes already written into this LeRobot root "
+        "(N = that root's meta/info.json total_episodes). Write remaining to --root.",
+    )
+    p.add_argument(
+        "--prefer-fast",
+        action="store_true",
+        help="after skip, convert highest speed_m_s first (keeps 20 cm/s if run dies early)",
+    )
     args = p.parse_args()
 
     root = args.root or (Path.home() / ".cache" / "huggingface" / "lerobot" / args.repo_id)
-    pairs = list_success_episodes(args.input_dir, success_only=not args.include_failures)
+    pairs = list_success_episodes(
+        args.input_dir, success_only=not args.include_failures, clean_only=args.clean_only
+    )
     logger.info("found %d episodes under %s", len(pairs), args.input_dir)
+    if args.skip_from_root is not None:
+        n_done = episodes_done_in_root(args.skip_from_root)
+        if n_done > len(pairs):
+            raise RuntimeError(
+                f"skip-from-root has {n_done} episodes but only {len(pairs)} convertible now"
+            )
+        pairs = pairs[n_done:]
+        logger.info(
+            "skip-from-root %s: skipped %d already converted, %d remaining",
+            args.skip_from_root,
+            n_done,
+            len(pairs),
+        )
+    if args.prefer_fast:
+        pairs = prefer_fast_pairs(pairs)
+        if pairs:
+            speeds = [float(json.loads(js.read_text()).get("speed_m_s", -1)) for _, js in pairs[:5]]
+            logger.info("prefer-fast: first speeds %s ... last %s", speeds, float(json.loads(pairs[-1][1].read_text()).get("speed_m_s", -1)))
     convert_episodes(
         pairs,
         repo_id=args.repo_id,

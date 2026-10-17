@@ -54,16 +54,14 @@ def _mm(m: float) -> str:
 
 
 def gates_from_expert(expert: Any) -> dict[str, float]:
-    """Copy the expert's descend / close gates for the video footer."""
+    """Copy the expert's one grasp gate for the video footer."""
+    ok = np.asarray(expert.grasp_xyz_ok, dtype=np.float64).reshape(3)
     return {
-        "track_xy_tol": float(expert.track_xy_tol),
-        "approach_z_tol": float(expert.approach_z_tol),
-        "track_hold_s": float(expert.track_hold_s),
-        "grasp_xy_tol": float(expert.grasp_xy_tol),
-        "grasp_z_tol": float(expert.grasp_z_tol),
-        "grasp_tol_step_k": float(expert.grasp_tol_step_k),
+        "grasp_dx": float(ok[0]),
+        "grasp_dy": float(ok[1]),
+        "grasp_dz": float(ok[2]),
         "close_gripper_s": float(expert.close_gripper_s),
-        "hover_z": float(expert.hover_z),
+        "close_depth_m": float(expert.close_depth_m),
         "dt": float(expert.dt),
     }
 
@@ -78,17 +76,14 @@ def _gates_from_cfg() -> dict[str, float]:
     physics = bool(scene.get("use_house", False)) and not bool(
         scene.get("use_weld_grasp", not bool(scene.get("use_house", False)))
     )
-    grasp_z = float(sm["physics_grasp_z_tol"] if physics else sm["grasp_z_tol"])
     close_s = float(sm["physics_close_s"] if physics else sm["close_gripper_s"])
+    ok = sm["grasp_xyz_ok"]
     return {
-        "track_xy_tol": float(sm["track_xy_tol"]),
-        "approach_z_tol": float(sm["approach_z_tol"]),
-        "track_hold_s": float(sm["track_hold_s"]),
-        "grasp_xy_tol": float(sm["grasp_xy_tol"]),
-        "grasp_z_tol": grasp_z,
-        "grasp_tol_step_k": float(sm["grasp_tol_step_k"]),
+        "grasp_dx": float(ok[0]),
+        "grasp_dy": float(ok[1]),
+        "grasp_dz": float(ok[2]),
         "close_gripper_s": close_s,
-        "hover_z": float(sm["hover_z"]),
+        "close_depth_m": float(sm.get("close_depth_m", 0.0)),
         "dt": float(cfg["sim"]["dt"]),
     }
 
@@ -103,12 +98,6 @@ def _resolve_gates(
     if isinstance(stored, dict) and stored:
         return {k: float(v) for k, v in stored.items()}
     return _gates_from_cfg()
-
-
-def _grasp_tol_xy_m(gates: dict[str, float], vel_xy_m_s: float) -> float:
-    """Same floor as the expert: max(base, k * speed * dt)."""
-    step = float(gates["grasp_tol_step_k"]) * float(vel_xy_m_s) * float(gates["dt"])
-    return max(float(gates["grasp_xy_tol"]), step)
 
 
 def _state_lines(episode: dict[str, Any], t: int) -> list[str]:
@@ -136,53 +125,28 @@ def _state_lines(episode: dict[str, Any], t: int) -> list[str]:
 def _gate_lines(
     episode: dict[str, Any], t: int, gates: dict[str, float]
 ) -> list[str]:
-    """Bottom footer: live hand–object gap vs the descend / close gates."""
+    """Top-left gate report: live hand–object gap vs the one grasp_xyz_ok box."""
     if "ee_pos" not in episode or "object_pos" not in episode:
         return []
 
     ee = np.asarray(episode["ee_pos"][t], dtype=np.float64).reshape(-1)
     obj = np.asarray(episode["object_pos"][t], dtype=np.float64).reshape(-1)
-    gap_xy = float(np.linalg.norm(ee[:2] - obj[:2]))
+    gap_dx = abs(float(ee[0] - obj[0]))
+    gap_dy = abs(float(ee[1] - obj[1]))
     gap_z = abs(float(ee[2] - obj[2]))
 
-    vel_xy = 0.0
-    if "object_vel" in episode:
-        vel = np.asarray(episode["object_vel"][t], dtype=np.float64).reshape(-1)
-        vel_xy = float(np.linalg.norm(vel[:2]))
-
-    lock_xy = float(gates["track_xy_tol"])
-    lock_z = float(gates["approach_z_tol"])
-    close_xy = _grasp_tol_xy_m(gates, vel_xy)
-    close_z = float(gates["grasp_z_tol"])
-    hold_ms = 1000.0 * float(gates["track_hold_s"])
-    dwell_ms = 1000.0 * float(gates["close_gripper_s"])
-    hover_mm = _mm(gates["hover_z"])
-
-    stage = int(episode["stage"][t]) if "stage" in episode else -1
-    # Which gate is "active" for this stage (helps fine-tune that knob).
-    # Intercept lock Z is vs the aim height (hover blend), not object top.
-    if stage == 1:
-        need = (
-            f"need lock XY<{_mm(lock_xy)} + Z-to-aim<{_mm(lock_z)} "
-            f"then hold {hold_ms:.0f} ms → descend"
-        )
-    elif stage == 2:
-        need = f"need close XY<{_mm(close_xy)} Z<{_mm(close_z)} → grip"
-    elif stage == 3:
-        need = f"holding; close dwell {dwell_ms:.0f} ms → lift"
+    # Support old episode stashes that still use track_*/grasp_* keys.
+    if "grasp_dx" in gates:
+        gdx = float(gates["grasp_dx"])
+        gdy = float(gates["grasp_dy"])
+        gdz = float(gates["grasp_dz"])
     else:
-        need = (
-            f"lock XY<{_mm(lock_xy)} Z-aim<{_mm(lock_z)} | "
-            f"close XY<{_mm(close_xy)} Z<{_mm(close_z)}"
-        )
+        gdx = gdy = float(gates.get("grasp_xy_tol", gates.get("track_xy_tol", 0.01)))
+        gdz = float(gates.get("grasp_z_tol", gates.get("approach_z_tol", 0.015)))
 
     return [
-        f"gap XY {_mm(gap_xy)} / Z {_mm(gap_z)} mm   {need}",
-        (
-            f"gates mm: lock {_mm(lock_xy)}/{_mm(lock_z)}  "
-            f"close {_mm(close_xy)}/{_mm(close_z)}  "
-            f"hold {hold_ms:.0f}ms  dwell {dwell_ms:.0f}ms  hover {hover_mm}"
-        ),
+        f"gap dx/dy/z {_mm(gap_dx)}/{_mm(gap_dy)}/{_mm(gap_z)} mm   "
+        f"gates mm: grasp {_mm(gdx)}/{_mm(gdy)}/{_mm(gdz)}",
     ]
 
 
@@ -193,30 +157,35 @@ def _overlay_text(
     anchor: str,
     color: tuple[int, int, int] = _YELLOW_BGR,
 ) -> np.ndarray:
-    """Draw text top-right or bottom-left. ``anchor`` is 'top' or 'bottom'."""
+    """Draw text on a dark box. ``anchor`` is 'top' (top-right) or 'top_left'."""
     if not lines:
         return frame
     import cv2
 
     out = np.ascontiguousarray(frame)
-    margin, scale, thickness = 10, 0.5, 1
+    margin, pad, scale, thickness = 10, 4, 0.5, 1
     font = cv2.FONT_HERSHEY_SIMPLEX
     img_h, img_w = out.shape[0], out.shape[1]
     sizes = [cv2.getTextSize(line, font, scale, thickness)[0] for line in lines]
-    line_h = max((th for _, th in sizes), default=12) + margin
+    max_tw = max((tw for tw, _ in sizes), default=0)
+    line_gap = margin
+    block_h = sum(th for _, th in sizes) + line_gap * (len(lines) - 1) + 2 * pad
 
-    if anchor == "bottom":
-        y = img_h - margin - (len(lines) - 1) * line_h
-        for line, (tw, th) in zip(lines, sizes):
-            x = margin
-            cv2.putText(out, line, (x, y + th), font, scale, color, thickness, cv2.LINE_AA)
-            y += line_h
+    if anchor == "top_left":
+        x0 = margin - pad
     else:
-        y = margin
-        for line, (tw, th) in zip(lines, sizes):
-            x = max(margin, img_w - tw - margin)
-            cv2.putText(out, line, (x, y + th), font, scale, color, thickness, cv2.LINE_AA)
-            y += th + margin
+        x0 = max(0, img_w - max_tw - margin - pad)
+    y0 = max(0, margin - pad)
+    x1 = min(img_w, x0 + max_tw + 2 * pad)
+    y1 = min(img_h, y0 + block_h)
+    # Dark underlay so cyan text stays readable on bright house walls.
+    cv2.rectangle(out, (x0, y0), (x1, y1), (0, 0, 0), thickness=-1)
+
+    y = margin
+    for line, (tw, th) in zip(lines, sizes):
+        x = margin if anchor == "top_left" else max(margin, img_w - tw - margin)
+        cv2.putText(out, line, (x, y + th), font, scale, color, thickness, cv2.LINE_AA)
+        y += th + line_gap
     return out
 
 
@@ -262,7 +231,7 @@ def stitch_episode_frames(
         if overlay:
             frame = _overlay_text(frame, _state_lines(episode, t), anchor="top")
             frame = _overlay_text(
-                frame, _gate_lines(episode, t, gate_vals), anchor="bottom", color=_YELLOW_BGR
+                frame, _gate_lines(episode, t, gate_vals), anchor="top_left", color=_YELLOW_BGR
             )
         frames.append(frame)
     return frames
@@ -299,7 +268,7 @@ def write_debug_mp4(
     """One call: stitch table + wrist views with text overlay, save MP4.
 
     Returns False (and warns) if the log had no camera frames.
-    Pass ``gates`` (or stash ``episode['overlay_gates']``) so the footer
+    Pass ``gates`` (or stash ``episode['overlay_gates']``) so the gate text
     matches the expert that ran; else yaml defaults are used.
     """
     frames = stitch_episode_frames(episode, overlay=True, gates=gates)

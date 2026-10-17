@@ -8,7 +8,7 @@ model: inherit
 Use with Task tool. Always include `WORKSTREAM: <tag>` in the prompt.
 
 ## sim-scene
-In-repo Isaac scene, cameras, **Foresight** four-stage scripted expert (plan §4), episode logging. Gate G0.
+In-repo Isaac scene, cameras, **Foresight** scripted expert (plan §4 jobs → stage ids 0–9), episode logging. Gate G0.
 Read: `foresight_plan.md` §4, `ppt.md` (connect only), `.cursor/rules/15-own-the-stack.mdc`.
 Do **not** drive episodes through DynamicVLA `PickPlaceStateMachine` / `simulate`.
 

@@ -497,40 +497,41 @@ def main() -> None:
     if getattr(args, "device", None):
         cfg.setdefault("sim", {})["device"] = args.device
 
-    # asset_seed picks the object / box meshes: same --seed, same assets.
-    scene = Phase0Scene(
-        cfg,
-        enable_cameras=bool(args.enable_cameras),
-        object_usd=args.object_usd,
-        container_usd=args.container_usd,
-        asset_seed=int(args.seed),
-    )
-    expert = ExpertClass(cfg, dt=scene.dt)
-    log_event(log, f"Expert intercept-servo. Step time {expert.dt:.3f} s. Look-ahead {expert.lookahead_s:.2f} s.")
-    log_event(
-        log,
-        f"Robot approach pad {expert.robot_approach_pad_s:.3f} s (tau {expert.tau:.3f} s), "
-        f"hand speed cap {expert.ee_speed_max:.2f} m/s, "
-        f"bounce guard {expert.bounce_guard_s:.2f} s.",
-    )
-    log_how_to_read(
-        log,
-        lookahead_s=float(expert.lookahead_s),
-        names=expert.stage_schema.names,
-        why=expert.stage_schema.why,
-    )
-    log_blank(log)
-    # Try block is responsible for running the expert and scene.
+    exit_code = 0
     try:
+        # asset_seed picks the object / box meshes: same --seed, same assets.
+        scene = Phase0Scene(
+            cfg,
+            enable_cameras=bool(args.enable_cameras),
+            object_usd=args.object_usd,
+            container_usd=args.container_usd,
+            asset_seed=int(args.seed),
+        )
+        expert = ExpertClass(cfg, dt=scene.dt)
+        log_event(log, f"Expert intercept-servo. Step time {expert.dt:.3f} s. Look-ahead {expert.lookahead_s:.2f} s.")
+        log_event(
+            log,
+            f"Robot approach pad {expert.robot_approach_pad_s:.3f} s (tau {expert.tau:.3f} s), "
+            f"hand speed cap {expert.ee_speed_max:.2f} m/s, "
+            f"bounce guard {expert.bounce_guard_s:.2f} s.",
+        )
+        log_how_to_read(
+            log,
+            lookahead_s=float(expert.lookahead_s),
+            names=expert.stage_schema.names,
+            why=expert.stage_schema.why,
+        )
+        log_blank(log)
         run(args, scene, expert)
     except Exception:
         logging.exception("Phase 0 run failed")
-        raise
+        exit_code = 1
     finally:
         # Hard exit: Isaac's normal close often hangs when headless. Safe here
         # because the report and metrics are already written to disk.
-        log_event(log, "Exiting (skip app.close hang)")
-        os._exit(0)
+        # Pass the real status so launchers see failures (not always 0).
+        log_event(log, f"Exiting code={exit_code} (skip app.close hang)")
+        os._exit(exit_code)
 
 
 if __name__ == "__main__":

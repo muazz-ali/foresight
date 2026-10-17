@@ -1,12 +1,17 @@
 # Foresight SmolVLA: images + robot pose + text + 4 live future numbers (XY p̂/v̂).
-# Loaded by policy/train_smolvla.py (--policy-cfg). Keep delta_min == delta_max
-# while Δ is not packed; value must match sim/phase0_cfg.yaml conditioning_delta_s.
-repo_id: foresight/p1          # name of the converted LeRobot dataset
-dataset_root: null  # set at CLI
+# Loaded by policy/train_smolvla.py (--policy-cfg). CLI flags override these.
+# Keep delta_min == delta_max while Δ is not packed; value must match
+# sim/phase0_cfg.yaml policy_look_ahead_ms (250 ms).
+repo_id: foresight/p1          # hint only — pass --repo-id on the CLI
+dataset_root: null             # hint only — pass --dataset-root on the CLI
 pretrained: lerobot/smolvla_base  # start weights (public SmolVLA)
 steps: 20000                   # how many train steps
 batch_size: 8                  # samples per step
 lr: 1.0e-4                     # learning rate
+# Metrics → runs/<run>/metrics.jsonl + curves.png. Soft fit hints only — not a gate.
+log_every: 50                  # train loss mean every N steps
+eval_every: 100                # held-out val loss every N steps (0 = skip)
+val_fraction: 0.05             # hold out every N-th episode (N≈1/fraction); 0 = no val
 # Look-ahead Δ in seconds: "where will the object be this far ahead?"
 # Train, collect, and eval must use the same value.
 delta_min: 0.25

@@ -17,6 +17,7 @@ Why this file exists:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
@@ -64,6 +65,48 @@ class AugConfig:
     vel_noise_std: float = _AUG_YAML["vel_noise_std"]
     seed: int = 0  # makes the noise repeatable
     zero_conditioning: bool = False  # eval sanity: force zeros on the 4 cond dims
+    # Frames (see POLICY_FRAMES): "abs" = world numbers as before.
+    # cond_frame "rel": p̂ minus hand XY ("object will be 2 cm ahead of you").
+    # action_frame "delta": hand XYZ targets minus hand XYZ at the obs frame.
+    cond_frame: str = "abs"
+    action_frame: str = "abs"
+    # Noise (m) on the hand XYZ the model reads. Rel cond / delta action use the
+    # clean hand, so this only stops "copy my hand + offset" shortcuts.
+    ee_noise_std: float = 0.0
+
+
+POLICY_FRAMES = {"cond_frame": ("abs", "rel"), "action_frame": ("abs", "delta")}
+# Saved next to each checkpoint so eval rebuilds the same inputs / outputs.
+FRAMES_FILE = "foresight_policy.json"
+
+
+def cond_to_model(cond_abs: np.ndarray, ee_xyz: np.ndarray, cond_frame: str) -> np.ndarray:
+    """World 4-number pack → what the model reads. Train and eval share this."""
+    out = np.asarray(cond_abs, dtype=np.float64).copy()
+    if cond_frame == "rel":
+        out[0:2] -= np.asarray(ee_xyz, dtype=np.float64).reshape(-1)[0:2]
+    elif cond_frame != "abs":
+        raise ValueError(f"cond_frame must be abs|rel, got {cond_frame!r}")
+    return out
+
+
+def action_from_model(chunk: np.ndarray, ee_xyz: np.ndarray, action_frame: str) -> np.ndarray:
+    """Model action chunk (T, 8) → world hand targets. Inverse of the train-side shift."""
+    out = np.asarray(chunk, dtype=np.float64).copy()
+    if action_frame == "delta":
+        out[..., 0:3] += np.asarray(ee_xyz, dtype=np.float64).reshape(-1)[0:3]
+    elif action_frame != "abs":
+        raise ValueError(f"action_frame must be abs|delta, got {action_frame!r}")
+    return out
+
+
+def load_frames(checkpoint: str | Path) -> dict[str, Any]:
+    """Frames a checkpoint was trained with. Old checkpoints (no file) = abs / abs."""
+    import json
+
+    p = Path(checkpoint) / FRAMES_FILE
+    d = json.loads(p.read_text()) if p.is_file() else {}
+    return {"cond_frame": d.get("cond_frame", "abs"), "action_frame": d.get("action_frame", "abs"), **d}
 
 
 def oracle_flat_to_state(flat: np.ndarray | torch.Tensor) -> ObjectState:
@@ -167,6 +210,25 @@ class PolicyDataset(Dataset):
             raise KeyError(
                 "PolicyDataset needs observation.oracle_state or observation.conditioning"
             )
+        # Frames: rel cond and delta action both use the clean hand pose.
+        ee_clean = state_last[0:3].numpy().astype(np.float64)
+        if not self.aug.zero_conditioning:
+            cond = cond_to_model(cond, ee_clean, self.aug.cond_frame)
+        if self.aug.action_frame != "abs" and "action" in item:
+            act = torch.as_tensor(item["action"], dtype=torch.float32).clone()
+            act[..., 0:3] -= torch.as_tensor(ee_clean, dtype=torch.float32)
+            item["action"] = act
+        if self.apply_aug and self.aug.ee_noise_std > 0:
+            # Noisy copy of the hand XYZ only in what the model reads.
+            shake = torch.as_tensor(
+                rng.normal(0.0, self.aug.ee_noise_std, size=3), dtype=torch.float32
+            )
+            if state_seq is not None:
+                state_seq = state_seq.clone()
+                state_seq[..., 0:3] += shake
+            else:
+                state_last = state_last.clone()
+                state_last[0:3] += shake
         cond_t = torch.as_tensor(cond, dtype=torch.float32).reshape(CONDITIONING_DIM)
         # Glue: [8 robot | 4 object] -> 12. Order matters; infer must match.
         if state_seq is not None:
@@ -242,4 +304,79 @@ def expand_state_stats(stats: dict) -> dict:
     if "count" in st:
         merged["count"] = st["count"]
     out["observation.state"] = merged
+    return out
+
+
+def frame_stats(
+    stats: dict,
+    dataset_root: str | Path,
+    *,
+    cond_frame: str,
+    action_frame: str,
+    chunk_size: int,
+    n_samples: int = 400_000,
+    seed: int = 0,
+) -> dict:
+    """Replace normalization stats for rel cond / delta action (abs frames: unchanged).
+
+    ``stats`` is the 12-D output of ``expand_state_stats``. Reads only the number
+    columns of the LeRobot parquet files (no images), so it takes seconds.
+    Delta action = action[t+k] - hand[t], k in [0, chunk), clipped at episode end,
+    the same pairing the chunked training samples use.
+    """
+    if cond_frame == "abs" and action_frame == "abs":
+        return stats
+    import pyarrow.parquet as pq
+
+    files = sorted(Path(dataset_root).glob("data/*/*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"no parquet under {dataset_root}/data")
+    states, conds, acts, ep_start, ep_len = [], [], [], [], []
+    n = 0
+    for f in files:
+        t = pq.read_table(f, columns=["observation.state", "observation.conditioning", "action"])
+        s = np.stack(t.column("observation.state").to_numpy(zero_copy_only=False))
+        states.append(s)
+        conds.append(np.stack(t.column("observation.conditioning").to_numpy(zero_copy_only=False)))
+        acts.append(np.stack(t.column("action").to_numpy(zero_copy_only=False)))
+        ep_start.append(np.full(len(s), n))
+        ep_len.append(np.full(len(s), len(s)))
+        n += len(s)
+    S, C, A = np.concatenate(states), np.concatenate(conds), np.concatenate(acts)
+    start, length = np.concatenate(ep_start), np.concatenate(ep_len)
+
+    def _summ(x: np.ndarray) -> dict:
+        return {
+            "min": x.min(0).astype(np.float32),
+            "max": x.max(0).astype(np.float32),
+            "mean": x.mean(0).astype(np.float32),
+            "std": np.maximum(x.std(0), 1e-6).astype(np.float32),
+        }
+
+    out = dict(stats)
+    st = {k: np.asarray(v).copy() for k, v in stats["observation.state"].items()}
+    if cond_frame == "rel":
+        rel = C.copy()
+        rel[:, 0:2] -= S[:, 0:2]
+        cs = _summ(rel)
+        for k in ("min", "max", "mean", "std"):
+            st[k][PROPRIO_DIM:] = cs[k]
+    out["observation.state"] = st
+    if action_frame == "delta":
+        rng = np.random.default_rng(seed)
+        t = rng.integers(0, len(S), size=min(n_samples, len(S)))
+        k = rng.integers(0, chunk_size, size=len(t))
+        j = np.minimum(t + k, start[t] + length[t] - 1)
+        d = A[j].copy()
+        d[:, 0:3] -= S[t, 0:3]
+        a_old = {kk: np.asarray(v) for kk, v in stats["action"].items()}
+        a_new = _summ(d)
+        # Rotation / gripper columns keep their original stats (std 0 stays 0).
+        for kk in ("min", "max", "mean", "std"):
+            col = a_old[kk].astype(np.float32).copy()
+            col[0:3] = a_new[kk][0:3]
+            a_new[kk] = col
+        if "count" in a_old:
+            a_new["count"] = a_old["count"]
+        out["action"] = a_new
     return out

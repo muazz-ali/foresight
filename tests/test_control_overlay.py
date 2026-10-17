@@ -54,7 +54,7 @@ def test_overlay_closes_when_near():
         timestamp=0.0,
         valid=True,
     )
-    # Stage 2 (descend): may steer, but must not force attach yet.
+    # Stage 2 (unused go-down id): may steer, but must not force attach yet.
     cmd = _Cmd(
         position=ee.copy(),
         quat_wxyz=np.array([0.0, 1.0, 0.0, 0.0]),

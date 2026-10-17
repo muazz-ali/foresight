@@ -27,6 +27,28 @@ def test_container_hold_gate():
     assert not container_can_hold(fruit, plate)  # too shallow
     tiny = np.array([0.04, 0.04, 0.08])
     assert not container_can_hold(fruit, tiny)  # too narrow
+    # Open bowl: fruit may stick above the rim — XY only.
+    shallow_bowl = np.array([0.15, 0.15, 0.042])
+    tall_fruit = np.array([0.061, 0.060, 0.070])
+    assert not container_can_hold(tall_fruit, shallow_bowl, min_clearance_m=0.01)
+    assert container_can_hold(
+        tall_fruit, shallow_bowl, min_clearance_m=0.01, open_top=True
+    )
+    assert not container_can_hold(
+        tall_fruit, tiny, min_clearance_m=0.01, open_top=True
+    )  # still too narrow
+
+
+def test_container_needs_finger_room_across_y():
+    """Closed fingers span the object + two pads along world Y."""
+    potato = np.array([0.066, 0.066, 0.090])
+    lime = np.array([0.061, 0.056, 0.065])
+    narrow_box = np.array([0.242, 0.122, 0.120])
+    wide_box = np.array([0.236, 0.167, 0.101])
+    assert container_can_hold(potato, narrow_box)  # old rule: object alone fits
+    assert not container_can_hold(potato, narrow_box, finger_clearance_m=0.06)
+    assert container_can_hold(lime, narrow_box, finger_clearance_m=0.06)
+    assert container_can_hold(potato, wide_box, finger_clearance_m=0.06)
 
 
 def test_exclude_prefix_and_category():

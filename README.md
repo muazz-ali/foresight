@@ -114,7 +114,7 @@ python scripts/g2_perception_report.py       # G2a report from recorded episodes
 
 ## Scripted expert (plan §4)
 
-Stages: **go above the moving object** (look ~0.25 s ahead, hover ~10 cm) → **down, grasp, lift** → **place** → **reset**. If the object drops, go back to approach.
+Stages (ids 0–9): **intercept** the moving object (look ahead, Z on object) → **close, lift** → **carry, lower, open** → **home / done**. Stage 2 (go down) is unused. Missed grasp retries intercept.
 
 Success = lift + hold / place rules in `sim/success.py`.  
 Failure labels each episode:  

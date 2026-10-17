@@ -8,16 +8,38 @@
 #   bash scripts/launch_p1_collect.sh 4000 --debug      # mp4 + save failures too
 #   DEBUG=0 bash scripts/launch_p1_collect.sh 4000      # same as --no-debug
 #
-# Env: FORESIGHT_PYTHON, OUT, SEED_BASE, DEVICE, CFG,
+# Env: FORESIGHT_PYTHON, OUT, SEED_BASE, DEVICE, CFG, CHUNK,
 #      SMOKE_OBJECT, SMOKE_CONTAINER, DEBUG, SAVE_FAILURES
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${FORESIGHT_PYTHON:-/home/gpuadmin/anaconda3/envs/dynamicVLA_isaac/bin/python}"
 export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
 
-# Categories match sim/phase0_cfg.yaml (enabled object / container lists).
-OBJECTS=(apple avocado egg kiwi lemon lime onion orange peach potato tangerine tomato)
-CONTAINERS=(bowl box plate tray)
+# Conda Isaac needs its own numpy; ~/.local often shadows it and breaks startup.
+export PYTHONNOUSERSITE=1
+
+# Same GPU rule as scripts/run_g0.sh: DEVICE=cuda:N hides the other GPUs so
+# Isaac/Vulkan never probes a full card. Inside the process that GPU is cuda:0.
+DEVICE_ARGS=()
+if [[ -n "${DEVICE:-}" ]]; then
+  if [[ "$DEVICE" =~ ^cuda:([0-9]+)$ ]]; then
+    export CUDA_VISIBLE_DEVICES="${BASH_REMATCH[1]}"
+    DEVICE_ARGS=(--device cuda:0)
+    echo "[p1] DEVICE=$DEVICE → CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES --device cuda:0"
+  else
+    DEVICE_ARGS=(--device "$DEVICE")
+  fi
+fi
+
+# House, table, light, object mesh and container mesh are fixed per process
+# (asset_seed = --seed). Split each category into chunks of CHUNK successes,
+# each its own process and seed, so the dataset sees many worlds, not 13.
+CHUNK="${CHUNK:-25}"
+
+# Keep in sync with scene.object_categories / container_categories in phase0_cfg.yaml
+# (exclude tomato/beer/bottle/cup/potato/plate/tray — see phase0_cfg exclude_usd_*).
+OBJECTS=(apple avocado can egg kiwi lemon lime onion orange peach tangerine)
+CONTAINERS=(bowl box)
 SEED_BASE="${SEED_BASE:-1000}"
 CFG="${CFG:-$ROOT/sim/phase0_cfg.yaml}"
 
@@ -75,13 +97,17 @@ _resolve_debug() {
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [smoke|diag-container|diag-timeout|N] [--debug|--no-debug] [--save-failures]
+Usage: $(basename "$0") [smoke|diag-container|N] [--debug|--no-debug] [--save-failures]
 
   smoke           5 successes (0/10/15/20 + extra 15); debug ON by default
-  diag-container  onion+bowl @ default stage_timeout
-  diag-timeout    onion+bowl @ stage_timeout_s=3.0
-  N               stratified collect ≈N successes across categories
+  diag-container  onion+bowl smoke (fit / place check)
+  N               stratified collect ≈N CLEAN successes across categories,
+                  CHUNK successes per Isaac process (default 25; each process
+                  draws its own house / light / meshes). Default OUT=data/p3_throw.
                   debug OFF by default (successes only, no mp4)
+
+Misses that leave the table abort the episode (sim/collect.py off_table stop).
+There is no separate stage-timeout diag — that path was a no-op under the mm/ms loader.
 
 Flags (also via env):
   --debug / --no-debug     write .mp4 and (with debug) save failures
@@ -94,7 +120,7 @@ Examples:
   DEBUG=1 bash scripts/launch_p1_collect.sh 4000
   bash scripts/launch_p1_collect.sh smoke --no-debug
 
-Env: OUT, SEED_BASE, DEVICE, FORESIGHT_PYTHON, CFG,
+Env: OUT, SEED_BASE, DEVICE (e.g. cuda:1), CHUNK, FORESIGHT_PYTHON, CFG,
      SMOKE_OBJECT, SMOKE_CONTAINER
 EOF
 }
@@ -120,7 +146,7 @@ _run_smoke() {
     --headless --enable_cameras \
     "${DEBUG_FLAG[@]}" \
     "${FAIL_FLAG[@]}" \
-    ${DEVICE:+--device "$DEVICE"}
+    "${DEVICE_ARGS[@]}"
   echo "[p1] $label collect done → $out"
   if [[ "$DEBUG" == "1" ]] || [[ -n "$(find "$out" -name '*.h5' 2>/dev/null | head -1)" ]]; then
     "$PY" "$ROOT/scripts/check_collect_recordings.py" --root "$out" -c "$cfg" || true
@@ -135,6 +161,7 @@ case "$CMD" in
   smoke)
     _resolve_debug 1
     OUT="${OUT:-$ROOT/data/p1_smoke}"
+    # Default apple+bowl: bowls are open-top (XY fit only) in phase0_cfg.yaml.
     _run_smoke "smoke" "$OUT" "$CFG" \
       "${SMOKE_OBJECT:-apple}" "${SMOKE_CONTAINER:-bowl}"
     ;;
@@ -144,19 +171,10 @@ case "$CMD" in
     _run_smoke "diag-container" "$OUT" "$CFG" onion bowl
     ;;
   diag-timeout)
-    _resolve_debug 1
-    OUT="${OUT:-$ROOT/data/p1_diag_onion_bowl_timeout3}"
-    mkdir -p "$ROOT/data"
-    TMP_CFG="$ROOT/data/phase0_timeout3.yaml"
-    "$PY" - "$CFG" "$TMP_CFG" <<'PY'
-import sys, yaml
-src, dst = sys.argv[1], sys.argv[2]
-cfg = yaml.load(open(src), Loader=yaml.FullLoader)
-cfg["state_machine_params"]["stage_timeout_s"] = 3.0
-yaml.dump(cfg, open(dst, "w"), default_flow_style=False, sort_keys=False)
-print(f"wrote {dst} stage_timeout_s=3.0")
-PY
-    _run_smoke "diag-timeout" "$OUT" "$TMP_CFG" onion bowl
+    echo "[p1] diag-timeout removed: writing stage_timeout_s was a no-op (mm/ms loader)." >&2
+    echo "[p1] Off-table misses already abort the episode in sim/collect.py." >&2
+    echo "[p1] Use: bash scripts/launch_p1_collect.sh diag-container" >&2
+    exit 2
     ;;
   *)
     if ! [[ "$CMD" =~ ^[0-9]+$ ]]; then
@@ -167,30 +185,58 @@ PY
     # Large collects: no mp4 / successes-only unless user opts in.
     _resolve_debug 0
     TARGET_TOTAL="$CMD"
-    OUT="${OUT:-$ROOT/data/p1-retrain}"
+    # Not data/p1-retrain: that name belongs to the old bounce-box dataset that
+    # select_box_episodes.py and the plan's old-data mix still read.
+    OUT="${OUT:-$ROOT/data/p3_throw}"
     N_OBJ=${#OBJECTS[@]}
     PER=$(( (TARGET_TOTAL + N_OBJ - 1) / N_OBJ ))
-    echo "[p1] target_total=$TARGET_TOTAL per_category≈$PER out=$OUT"
+    if ! [[ "$CHUNK" =~ ^[0-9]+$ ]] || [[ "$CHUNK" -lt 1 ]]; then
+      echo "[p1] bad CHUNK=$CHUNK (positive integer)" >&2; exit 1
+    fi
+    N_CHUNKS=$(( (PER + CHUNK - 1) / CHUNK ))
+    echo "[p1] target_total=$TARGET_TOTAL per_category≈$PER chunk=$CHUNK chunks/category=$N_CHUNKS out=$OUT"
+    echo "[p1] objects=${OBJECTS[*]}"
+    echo "[p1] containers=${CONTAINERS[*]}"
     mkdir -p "$OUT"
     i=0
+    fails=0
     for obj in "${OBJECTS[@]}"; do
-      ctr="${CONTAINERS[$((i % ${#CONTAINERS[@]}))]}"
-      seed=$((SEED_BASE + i * 10000))
-      echo "[p1] category=$obj container=$ctr seed=$seed n=$PER"
-      "$PY" "$ROOT/scripts/run_phase1_collect.py" \
-        --target-successes "$PER" \
-        --speed-mode stratified \
-        --seed "$seed" \
-        --object-usd "$obj" \
-        --container-usd "$ctr" \
-        -c "$CFG" \
-        -o "$OUT" \
-        --headless --enable_cameras \
-        "${DEBUG_FLAG[@]}" \
-        "${FAIL_FLAG[@]}" \
-        ${DEVICE:+--device "$DEVICE"}
+      left=$PER
+      for (( c=0; c<N_CHUNKS; c++ )); do
+        n=$(( left < CHUNK ? left : CHUNK ))
+        left=$(( left - n ))
+        # Alternate containers per chunk so every category sees bowl and box.
+        ctr="${CONTAINERS[$(( (i + c) % ${#CONTAINERS[@]} ))]}"
+        # Category stride 100000, chunk stride 1000: a chunk walks one seed per
+        # attempt (≤ max(3n, n+50)), so seeds never overlap for CHUNK ≤ 333.
+        seed=$((SEED_BASE + i * 100000 + c * 1000))
+        echo "[p1] category=$obj chunk=$((c + 1))/$N_CHUNKS container=$ctr seed=$seed n=$n"
+        # Do not stop the whole job if one pairing has no usable meshes.
+        set +e
+        "$PY" "$ROOT/scripts/run_phase1_collect.py" \
+          --target-successes "$n" \
+          --speed-mode stratified \
+          --seed "$seed" \
+          --object-usd "$obj" \
+          --container-usd "$ctr" \
+          -c "$CFG" \
+          -o "$OUT" \
+          --headless --enable_cameras \
+          "${DEBUG_FLAG[@]}" \
+          "${FAIL_FLAG[@]}" \
+          "${DEVICE_ARGS[@]}"
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then
+          echo "[p1] WARN: category=$obj chunk=$((c + 1)) container=$ctr failed (exit $rc); continuing" >&2
+          fails=$((fails + 1))
+        fi
+      done
       i=$((i + 1))
     done
-    echo "[p1] collection launcher done"
+    echo "[p1] collection launcher done (chunk_failures=$fails)"
+    if [[ "$fails" -gt 0 ]]; then
+      exit 1
+    fi
     ;;
 esac

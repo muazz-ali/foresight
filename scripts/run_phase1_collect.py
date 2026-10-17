@@ -25,7 +25,7 @@ import numpy as np
 
 FORESIGHT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CFG = FORESIGHT_ROOT / "sim" / "phase0_cfg.yaml"
-DEFAULT_OUT = FORESIGHT_ROOT / "data" / "p1-retrain"
+DEFAULT_OUT = FORESIGHT_ROOT / "data" / "g3-smoke"
 
 # So `import sim...` / `import eval...` work when run as a script.
 sys.path.insert(0, str(FORESIGHT_ROOT))
@@ -37,7 +37,7 @@ def _build_parser() -> argparse.ArgumentParser:
     """Command-line flags (Isaac's own flags are added later in main)."""
     p = argparse.ArgumentParser(description="Foresight Phase 1 oracle collection")
     # We stop at N successful demos, not N tries. Failures are skipped for training.
-    p.add_argument("--target-successes", type=int, default=20)
+    p.add_argument("--target-successes", type=int, default=20, help="clean wins to collect (sim/success.clean_reject_reason)")
     p.add_argument("--max-attempts", type=int, default=None, help="Safety cap (default 3x target)")
     p.add_argument(
         "--speed-mode",
@@ -142,7 +142,12 @@ def run_collection(args, scene, expert) -> dict:
     rate is on record even though training only uses the wins.
     """
     from sim.collect import episode_for_json, run_episode, write_episode_h5
-    from sim.success import classify_failure, episode_diagnostics, episode_success
+    from sim.success import (
+        classify_failure,
+        clean_reject_reason,
+        episode_diagnostics,
+        episode_success,
+    )
 
     out_root = Path(args.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -164,26 +169,30 @@ def run_collection(args, scene, expert) -> dict:
     rng = np.random.default_rng(int(args.seed))
     seed = int(args.seed)
 
-    successes = attempts = 0
+    # ``target`` counts CLEAN wins (first-try grasp, real open, no release drag),
+    # the same rule as convert --clean-only, so N here means N usable demos.
+    successes = attempts = clean = 0
+    clean_rejects: dict[str, int] = {}
     t0 = time.time()
     # Always save images for policy training.
     save_images = True
 
     # Loop on successes, not attempts: a failed try does not count toward the target.
-    while successes < target and attempts < max_attempts:
+    while clean < target and attempts < max_attempts:
         speed = _sample_speed(
             speed_mode,
             rng,
             fixed=float(args.speed),
             speed_max=float(args.speed_max),
             speed_list=speed_list,
-            success_idx=successes,
+            success_idx=clean,
         )
         logging.info(
-            "P1 collect attempt=%d success=%d/%d seed=%d speed=%.3f",
+            "P1 collect attempt=%d clean=%d/%d (wins %d) seed=%d speed=%.3f",
             attempts + 1,
-            successes,
+            clean,
             target,
+            successes,
             seed,
             speed,
         )
@@ -220,8 +229,14 @@ def run_collection(args, scene, expert) -> dict:
             success = False
 
         attempts += 1
+        clean_reject = None
         if success:
             successes += 1
+            clean_reject = clean_reject_reason(episode, meta.get("retries"))
+            if clean_reject is None:
+                clean += 1
+            else:
+                clean_rejects[clean_reject] = clean_rejects.get(clean_reject, 0) + 1
 
         # Facts (farthest stage, object height low/high/end) kept so a failure
         # label can be double-checked later.
@@ -257,6 +272,12 @@ def run_collection(args, scene, expert) -> dict:
             "z_max": diag["z_max"],
             "z_end": diag["z_end"],
             "z_min": diag["z_min"],
+            "grasp_err_xy": meta.get("grasp_err_xy"),
+            "grasp_err_z": meta.get("grasp_err_z"),
+            "grasp_speed_m_s": meta.get("grasp_speed_m_s"),
+            "retries": meta.get("retries"),
+            "clean": bool(success and clean_reject is None),
+            "clean_reject": clean_reject,
             "language": meta.get("language"),
             "category": meta.get("category"),
             "container_category": meta.get("container_category"),
@@ -276,6 +297,8 @@ def run_collection(args, scene, expert) -> dict:
                 "robot": "franka",
                 "success": success,
                 "failure": failure,
+                "clean": bool(success and clean_reject is None),
+                "clean_reject": clean_reject,
                 **meta,
                 **{k: record[k] for k in ("max_stage", "z_max", "z_end", "z_min")},
                 **episode_for_json(episode),
@@ -326,6 +349,8 @@ def run_collection(args, scene, expert) -> dict:
         "phase": "P1_collect",
         "target_successes": target,
         "successes": successes,
+        "clean_successes": clean,
+        "clean_rejects": clean_rejects,
         "attempts": attempts,
         "success_rate": successes / attempts if attempts else 0.0,
         "elapsed_s": elapsed,
@@ -336,8 +361,11 @@ def run_collection(args, scene, expert) -> dict:
         "seed_start": int(args.seed),
         "seed_end": seed - 1,
     }
-    report_path = out_root / "collect_report.json"
+    # One report per process: the launcher runs many chunks into one folder.
+    report_path = out_root / f"collect_report_seed{int(args.seed)}.json"
     with open(report_path, "w") as fp:
+        json.dump(report, fp, indent=2)
+    with open(out_root / "collect_report.json", "w") as fp:  # latest, for old readers
         json.dump(report, fp, indent=2)
     logging.info("Wrote %s", report_path)
     print(json.dumps(report, indent=2))
@@ -376,29 +404,32 @@ def main() -> None:
     if getattr(args, "device", None):
         cfg.setdefault("sim", {})["device"] = args.device
 
-    scene = Phase0Scene(
-        cfg,
-        enable_cameras=True,
-        object_usd=args.object_usd,
-        container_usd=args.container_usd,
-        asset_seed=int(args.seed),
-    )
-    expert = PickPlaceStateMachine(cfg, dt=scene.dt)
-    logging.info(
-        "P1 scene ready object=%s container=%s",
-        getattr(scene, "_active_usd", None),
-        getattr(scene, "_container_usd", None),
-    )
+    exit_code = 0
     try:
+        scene = Phase0Scene(
+            cfg,
+            enable_cameras=True,
+            object_usd=args.object_usd,
+            container_usd=args.container_usd,
+            asset_seed=int(args.seed),
+        )
+        expert = PickPlaceStateMachine(cfg, dt=scene.dt)
+        logging.info(
+            "P1 scene ready object=%s container=%s",
+            getattr(scene, "_active_usd", None),
+            getattr(scene, "_container_usd", None),
+        )
         run_collection(args, scene, expert)
     except Exception:
         logging.exception("Phase1 collect failed")
-        raise
+        exit_code = 1
     finally:
         # Hard exit: Isaac's normal close often hangs when headless. Safe here
         # because metrics and the report are already written to disk.
-        logging.info("exiting (skip app.close hang)")
-        os._exit(0)
+        # Must pass the real status — a bare os._exit(0) made the launcher
+        # think every crash was a success.
+        logging.info("exiting code=%d (skip app.close hang)", exit_code)
+        os._exit(exit_code)
 
 
 if __name__ == "__main__":

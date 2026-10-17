@@ -17,7 +17,7 @@ import yaml
 FORESIGHT_ROOT = Path(__file__).resolve().parents[1]
 # Sim settings: robot, gripper, look-ahead Δ.
 DEFAULT_SIM_CFG = FORESIGHT_ROOT / "sim" / "phase0_cfg.yaml"
-# Policy training settings: noise sizes for the 4 numbers.
+# Policy training settings: steps / batch / lr / val + noise sizes.
 DEFAULT_POLICY_CFG = FORESIGHT_ROOT / "policy" / "configs" / "smolvla.yaml"
 
 
@@ -82,4 +82,22 @@ def policy_aug_defaults(
         "delta_max": delta,
         "pos_noise_std": float(pol.get("pos_noise_std", 0.015)),
         "vel_noise_std": float(pol.get("vel_noise_std", 0.03)),
+    }
+
+
+def policy_train_defaults(policy_path: str | Path | None = None) -> dict[str, Any]:
+    """Run length / batch / lr / log+val knobs from ``smolvla.yaml``.
+
+    CLI flags override these when set. Missing keys fall back to the same
+    numbers the trainer used to hard-code.
+    """
+    pol = load_yaml(policy_path or DEFAULT_POLICY_CFG)
+    return {
+        "pretrained": str(pol.get("pretrained", "lerobot/smolvla_base")),
+        "steps": int(pol.get("steps", 20000)),
+        "batch_size": int(pol.get("batch_size", 8)),
+        "lr": float(pol.get("lr", 1.0e-4)),
+        "log_every": int(pol.get("log_every", 50)),
+        "eval_every": int(pol.get("eval_every", 100)),
+        "val_fraction": float(pol.get("val_fraction", 0.05)),
     }
