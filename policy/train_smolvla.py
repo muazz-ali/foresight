@@ -32,6 +32,7 @@ import json
 import logging
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -151,7 +152,8 @@ def _eval_loss(policy, loader: DataLoader | None, device: str, max_batches: int 
         if i >= max_batches:
             break
         batch = _to_device(batch, device)
-        loss, _ = policy.forward(batch)
+        with torch.no_grad():  # val needs no autograd graph (was building one)
+            loss, _ = policy.forward(batch)
         total += float(loss.detach())
         n += 1
     if was_training:
@@ -287,16 +289,71 @@ def train(args: argparse.Namespace) -> Path:
         policy.save_pretrained(path)
         (path / FRAMES_FILE).write_text(json.dumps(frames_meta, indent=2) + "\n")
 
-    # Only train weights that are not frozen.
-    optim = torch.optim.AdamW(
-        [p for p in policy.parameters() if p.requires_grad],
-        lr=args.lr,
-        weight_decay=1e-10,
+    # ----- Precision -----
+    # SmolVLA builds its action expert from the VLM config, which says bfloat16, so
+    # the trainable weights arrive in bf16. AdamW on bf16 weights loses small
+    # updates (lr * update is below bf16 resolution): before this fix the expert
+    # norm weights never moved and 14 % of down_proj entries stayed unchanged.
+    # Fix = fp32 master weights for everything that trains + bf16 autocast for
+    # the forward pass (the frozen VLM stays bf16 to save memory).
+    trainable = [p for p in policy.parameters() if p.requires_grad]
+    if args.precision == "fp32-master":
+        for prm in trainable:
+            prm.data = prm.data.float()
+    dtypes: dict = {}
+    for prm in trainable:
+        dtypes[str(prm.dtype)] = dtypes.get(str(prm.dtype), 0) + prm.numel()
+    logger.info("trainable params by dtype: %s (precision=%s)", dtypes, args.precision)
+    dev_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    amp = (
+        (lambda: torch.autocast(device_type=dev_type, dtype=torch.bfloat16))
+        if args.precision == "fp32-master"
+        else nullcontext
     )
+
+    # ----- Optimizer + schedule: SmolVLA presets (lerobot SmolVLAConfig) -----
+    # betas (0.9, 0.95), eps 1e-8, weight decay 1e-10, grad clip 10,
+    # 1k linear warm-up then cosine to 2.5e-6. Decay length defaults to the run
+    # length (capped at the preset 30k) so a 20k run actually finishes its decay.
+    from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+
+    decay_steps = int(args.scheduler_decay_steps or min(cfg.scheduler_decay_steps, args.steps))
+    warmup = int(args.warmup_steps if args.warmup_steps is not None else cfg.scheduler_warmup_steps)
+    optim = torch.optim.AdamW(
+        trainable,
+        lr=args.lr,
+        betas=tuple(cfg.optimizer_betas),
+        eps=cfg.optimizer_eps,
+        weight_decay=cfg.optimizer_weight_decay,
+    )
+    sched = CosineDecayWithWarmupSchedulerConfig(
+        num_warmup_steps=warmup,
+        num_decay_steps=decay_steps,
+        peak_lr=args.lr,
+        decay_lr=cfg.scheduler_decay_lr,
+    ).build(optim, args.steps)
+    clip_norm = float(args.grad_clip if args.grad_clip is not None else cfg.optimizer_grad_clip_norm)
+    train_cfg = {
+        "precision": args.precision,
+        "trainable_dtypes": dtypes,
+        "lr": args.lr,
+        "betas": list(cfg.optimizer_betas),
+        "eps": cfg.optimizer_eps,
+        "weight_decay": cfg.optimizer_weight_decay,
+        "grad_clip": clip_norm,
+        "warmup_steps": warmup,
+        "decay_steps": decay_steps,
+        "decay_lr": cfg.scheduler_decay_lr,
+        "steps": args.steps,
+        "batch_size": args.batch_size,
+        **frames_meta,
+    }
+    logger.info("optimizer/schedule: %s", train_cfg)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "model_type.txt").write_text("model")  # small tag file, read by tools/diag
+    (out_dir / "train_config.json").write_text(json.dumps(train_cfg, indent=2) + "\n")
     metrics = MetricsLogger(out_dir)
 
     step = 0
@@ -309,15 +366,16 @@ def train(args: argparse.Namespace) -> Path:
             for batch in loader:
                 t0 = time.perf_counter()
                 batch = _to_device(batch, device)
-                loss, _ = policy.forward(batch)
+                with amp():
+                    loss, _ = policy.forward(batch)
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
                 # Cap big jumps so one bad batch cannot wreck the weights.
                 # Return value = grad norm before the clip (cheap signal).
-                grad_norm = float(
-                    torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-                )
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, clip_norm))
+                lr_used = float(optim.param_groups[0]["lr"])  # the lr this step used
                 optim.step()
+                sched.step()
                 step_s = time.perf_counter() - t0
 
                 loss_f = float(loss.detach())
@@ -338,13 +396,14 @@ def train(args: argparse.Namespace) -> Path:
                     fields: dict = {
                         "train_loss": mean_train,
                         "train_loss_last": loss_f,
-                        "lr": float(optim.param_groups[0]["lr"]),
+                        "lr": lr_used,
                         "grad_norm": grad_norm,
                         "step_s": step_s,
                         "samples_per_s": bs / max(step_s, 1e-9),
                     }
                     if do_eval:
-                        vloss = _eval_loss(policy, val_loader, device)
+                        with amp():
+                            vloss = _eval_loss(policy, val_loader, device)
                         if vloss is not None:
                             fields["val_loss"] = vloss
                             logger.info(
@@ -462,8 +521,8 @@ def main() -> None:
     p.add_argument(
         "--ee-noise-std",
         type=float,
-        default=0.0,
-        help="train-only noise (m) on the hand XYZ the model reads",
+        default=None,
+        help="train-only noise (m) on the hand XYZ the model reads (default: yaml)",
     )
     p.add_argument(
         "--chunk-size",
@@ -471,6 +530,21 @@ def main() -> None:
         default=50,
         help="SmolVLA action chunk length (must match delta_timestamps)",
     )
+    p.add_argument(
+        "--precision",
+        choices=["fp32-master", "legacy-bf16"],
+        default="fp32-master",
+        help="fp32-master: trainable weights in fp32, forward under bf16 autocast. "
+        "legacy-bf16: the old behaviour (bf16 weights, small updates lost) — for A/B only.",
+    )
+    p.add_argument("--warmup-steps", type=int, default=None, help="default: SmolVLA preset (1000)")
+    p.add_argument(
+        "--scheduler-decay-steps",
+        type=int,
+        default=None,
+        help="cosine length; default min(SmolVLA preset 30000, --steps)",
+    )
+    p.add_argument("--grad-clip", type=float, default=None, help="default: SmolVLA preset (10)")
     args = p.parse_args()
     from interfaces.config import policy_aug_defaults, policy_train_defaults
 
@@ -498,6 +572,8 @@ def main() -> None:
         args.pos_noise_std = aug["pos_noise_std"]
     if args.vel_noise_std is None:
         args.vel_noise_std = aug["vel_noise_std"]
+    if args.ee_noise_std is None:
+        args.ee_noise_std = aug["ee_noise_std"]
     # Δ is not one of the packed numbers yet. A spread of Δ would blur the
     # position the model sees and it could not know which Δ was used.
     if abs(float(args.delta_min) - float(args.delta_max)) > 1e-12:
@@ -518,11 +594,12 @@ def main() -> None:
         args.pretrained,
     )
     logger.info(
-        "aug from %s: delta=%.3f pos_noise=%.4f vel_noise=%.4f",
+        "aug from %s: delta=%.3f pos_noise=%.4f vel_noise=%.4f ee_noise=%.4f",
         args.policy_cfg,
         args.delta_min,
         args.pos_noise_std,
         args.vel_noise_std,
+        args.ee_noise_std,
     )
     torch.manual_seed(args.seed)
     train(args)

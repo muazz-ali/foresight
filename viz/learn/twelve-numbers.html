@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>What the 12 numbers are</title>
+<style>
+  :root {
+    --bg: #0c1218; --panel: #141c26; --ink: #e7eef6; --muted: #93a4b8;
+    --line: #2a3a4c; --cyan: #5ec8e6; --gold: #e2b15a; --green: #7dcea0;
+    --rose: #e07a86; --violet: #b9a6e8; --hand: #f0a46a; --ball: #6ec6e8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
+    background: radial-gradient(900px 420px at 10% -10%, #1a2c3d, var(--bg));
+    color: var(--ink);
+    min-height: 100vh;
+  }
+  header, main, footer { width: min(1100px, calc(100% - 32px)); margin: 0 auto; }
+  header { padding: 22px 0 8px; }
+  h1 { font-size: 1.55rem; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .lede { color: var(--muted); margin: 0; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 14px 0; }
+  button {
+    background: #1c2836; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 999px; padding: 8px 14px; font: 600 14px/1 "Segoe UI", sans-serif;
+    cursor: pointer;
+  }
+  button.primary { background: #164e63; border-color: #2a7d99; }
+  button[aria-pressed="true"] { background: #24506a; border-color: var(--cyan); }
+  button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+  .count { color: var(--muted); margin-left: auto; font-size: 14px; }
+  .rail { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 14px; }
+  .rail button { width: 28px; height: 28px; padding: 0; border-radius: 7px; font-size: 12px; }
+  .rail button.on { background: var(--cyan); color: #06202a; border-color: var(--cyan); }
+  main {
+    display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.15fr);
+    gap: 16px; align-items: start;
+  }
+  article, .stage {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+    padding: 16px 18px 18px;
+  }
+  h2 { margin: 0 0 10px; font-size: 1.2rem; }
+  p { margin: 0 0 10px; line-height: 1.45; }
+  .note { color: var(--muted); font-size: 0.92rem; }
+  .stage h3 { margin: 0 0 8px; font-size: 0.95rem; color: var(--gold); font-weight: 650; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .name { width: 118px; font-size: 13px; color: var(--muted); }
+  .track { flex: 1; height: 16px; background: #0d141c; border-radius: 8px; overflow: hidden; }
+  .fill { height: 100%; width: 0; border-radius: 8px; transition: width .4s ease; }
+  .fill.hand { background: var(--hand); }
+  .fill.ball { background: var(--ball); }
+  .fill.mix { background: var(--violet); }
+  .fill.green { background: var(--green); }
+  .num { width: 72px; text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; }
+  .slots { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+  .slot {
+    background: #0e1620; border: 1px solid var(--line); border-radius: 12px; padding: 10px;
+  }
+  .slot strong { display: block; font-size: 13px; margin-bottom: 4px; }
+  .slot .idx { color: var(--gold); font-size: 12px; }
+  .math {
+    font-family: ui-monospace, "Cascadia Code", monospace;
+    background: #0e1620; border-radius: 10px; padding: 10px 12px; font-size: 13px;
+    line-height: 1.55; overflow-x: auto;
+  }
+  .strip { display: flex; gap: 3px; flex-wrap: wrap; margin-top: 8px; }
+  .chip {
+    border-radius: 6px; padding: 6px 7px; font-size: 11px; font-weight: 650;
+    border: 1px solid var(--line); min-width: 42px; text-align: center;
+  }
+  .chip.hand { background: rgba(240,164,106,.18); color: #ffd2a8; }
+  .chip.ball { background: rgba(110,198,232,.18); color: #b7e7f7; }
+  .chip.off { opacity: 0.35; }
+  footer { color: var(--muted); font-size: 13px; padding: 16px 0 28px; }
+  @media (max-width: 800px) {
+    main { grid-template-columns: 1fr; }
+    .count { margin-left: 0; width: 100%; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>What the 12 numbers are</h1>
+  <p class="lede">The model reads one list: 8 numbers about the hand, then 4 about the ball. This page names every slot. Same order as <code>policy/features.py</code>.</p>
+  <div class="controls">
+    <button id="reset" type="button">Reset</button>
+    <button id="prev" type="button">Back</button>
+    <button id="play" class="primary" type="button" aria-pressed="false">Play</button>
+    <button id="pause" type="button">Pause</button>
+    <button id="next" type="button">Next</button>
+    <span class="count" id="count"></span>
+  </div>
+  <div class="rail" id="rail"></div>
+</header>
+<main>
+  <article>
+    <h2 id="title"></h2>
+    <div id="story"></div>
+  </article>
+  <section class="stage" aria-live="polite">
+    <h3 id="stage-title"></h3>
+    <div id="stage"></div>
+  </section>
+</main>
+<footer>
+  Hand: XYZ place, four turn numbers (w x y z), one gripper. Ball pack: future XY place, XY speed. Glue order is always robot first, ball second. Z of the ball, covariance, and “valid” stay out of this pack.
+</footer>
+<script>
+(function () {
+  // Toy sample values — layout matches PROPRIO_NAMES + CONDITIONING_NAMES.
+  var HAND = [
+    { name: "ee_pos_x", plain: "Hand left/right", unit: "m", v: 0.42, group: "place" },
+    { name: "ee_pos_y", plain: "Hand forward/back", unit: "m", v: 0.11, group: "place" },
+    { name: "ee_pos_z", plain: "Hand up/down", unit: "m", v: 0.18, group: "place" },
+    { name: "ee_rot_qw", plain: "Turn part W", unit: "", v: 0.96, group: "turn" },
+    { name: "ee_rot_qx", plain: "Turn part X", unit: "", v: 0.00, group: "turn" },
+    { name: "ee_rot_qy", plain: "Turn part Y", unit: "", v: 0.28, group: "turn" },
+    { name: "ee_rot_qz", plain: "Turn part Z", unit: "", v: 0.00, group: "turn" },
+    { name: "gripper", plain: "Fingers open", unit: "0–1", v: 1.00, group: "grip" }
+  ];
+  var BALL = [
+    { name: "p_hat_x", plain: "Ball will be X", unit: "m", v: 0.51 },
+    { name: "p_hat_y", plain: "Ball will be Y", unit: "m", v: -0.08 },
+    { name: "v_hat_x", plain: "Ball speed X", unit: "m/s", v: 0.15 },
+    { name: "v_hat_y", plain: "Ball speed Y", unit: "m/s", v: -0.02 }
+  ];
+  var OBJ = { p: [0.47, -0.07, 0.03], v: [0.15, -0.02, 0.0] };
+  var DELTA = 0.25;
+
+  var STEPS = [
+    { id: "overview", title: "The whole list" },
+    { id: "object", title: "Object state" },
+    { id: "look", title: "Look ahead" },
+    { id: "four", title: "The 4 ball numbers" },
+    { id: "hand", title: "The 8 hand numbers" },
+    { id: "place", title: "Hand place (XYZ)" },
+    { id: "turn", title: "Hand turn (4 numbers)" },
+    { id: "grip", title: "Gripper (1 number)" },
+    { id: "glue", title: "Glue: 8 + 4 = 12" },
+    { id: "vec", title: "12-D state the model reads" }
+  ];
+
+  var step = 0;
+  var playing = false;
+  var timer = null;
+  var gripAnim = null;
+  var gripV = 1;
+
+  function fmt(n) { return (Math.round(n * 100) / 100).toFixed(2); }
+  function bar(label, value, max, cls, text) {
+    var pct = Math.max(0, Math.min(100, (Math.abs(value) / max) * 100));
+    return '<div class="row"><span class="name">' + label + '</span><div class="track"><div class="fill ' + cls + '" data-w="' + pct + '" style="width:0%"></div></div><span class="num">' + text + '</span></div>';
+  }
+  function slotCard(item, cls, idx) {
+    return '<div class="slot"><span class="idx">slot ' + idx + '</span><strong>' + item.plain + '</strong><p class="note">' + item.name + (item.unit ? " · " + item.unit : "") + "</p><p class='math'>" + fmt(item.v) + "</p></div>";
+  }
+  function strip(highlight) {
+    var chips = HAND.map(function (h, i) {
+      var on = !highlight || highlight === "all" || highlight === h.group || (highlight === "hand");
+      return '<span class="chip hand' + (on ? "" : " off") + '">H' + (i + 1) + "</span>";
+    }).join("") + BALL.map(function (b, i) {
+      var on = !highlight || highlight === "all" || highlight === "ball";
+      return '<span class="chip ball' + (on ? "" : " off") + '">B' + (i + 1) + "</span>";
+    }).join("");
+    return '<div class="strip" aria-label="12 slots">' + chips + "</div>";
+  }
+
+  function storyOverview() {
+    return "<p>When people say “8 hand numbers,” they mean the robot’s own pose, not the ball.</p><p><b>3</b> numbers = where the hand is (X, Y, Z).<br><b>4</b> numbers = which way the hand is turned (a rotation written as w, x, y, z).<br><b>1</b> number = how open the fingers are.</p><p>Then we glue on <b>4</b> ball numbers. That makes the <b>12</b>-number state the policy reads.</p><p class='note'>Play walks every slot. Pause stops. Reset returns here.</p>";
+  }
+  function storyObject() {
+    return "<p>Object state is the ball right now: place and speed in 3D.</p><p class='math'>p = (" + fmt(OBJ.p[0]) + ", " + fmt(OBJ.p[1]) + ", " + fmt(OBJ.p[2]) + ") m<br>v = (" + fmt(OBJ.v[0]) + ", " + fmt(OBJ.v[1]) + ", " + fmt(OBJ.v[2]) + ") m/s</p><p>The sim can give the true ball (oracle). Later a filter can give a noisy guess. Both must pack the same 4 live numbers.</p>";
+  }
+  function storyLook() {
+    var fx = OBJ.p[0] + OBJ.v[0] * DELTA;
+    var fy = OBJ.p[1] + OBJ.v[1] * DELTA;
+    return "<p>Look ahead asks: if the ball keeps its speed, where will it be in 0.25 seconds?</p><p class='math'>p̂ = p + v × 0.25<br>p̂_x = " + fmt(OBJ.p[0]) + " + " + fmt(OBJ.v[0]) + " × 0.25 = " + fmt(fx) + "<br>p̂_y = " + fmt(OBJ.p[1]) + " + " + fmt(OBJ.v[1]) + " × 0.25 = " + fmt(fy) + "</p><p>We keep Z out of the live pack. The hand still needs Z for grasping, but this 4-number pack is XY only.</p>";
+  }
+  function storyFour() {
+    return "<p>These four are the “live pack”:</p><p>1. <b>p_hat_x</b> — future ball X<br>2. <b>p_hat_y</b> — future ball Y<br>3. <b>v_hat_x</b> — ball speed X now<br>4. <b>v_hat_y</b> — ball speed Y now</p><p>The 0.25 s clock is fixed in the yaml, so it is not a 5th number yet.</p>";
+  }
+  function storyHand() {
+    return "<p>These eight are the robot pose the model sees as “state” before glue:</p><p>1–3. Hand place X, Y, Z (meters)<br>4–7. Hand turn as a quaternion W, X, Y, Z<br>8. Gripper: <b>1 = open</b>, <b>0 = closed</b> (in between = partly shut)</p><p class='note'>The same 8-slot layout is also used for the action the model outputs: where the hand should go next, plus gripper.</p>";
+  }
+  function storyPlace() {
+    return "<p>The first three numbers are ordinary table coordinates.</p><p><b>X</b> left/right, <b>Y</b> forward/back, <b>Z</b> up/down. Units are meters.</p><p>If someone says “the hand is at (0.42, 0.11, 0.18),” those are slots 1–3.</p>";
+  }
+  function storyTurn() {
+    return "<p>Turning a hand in 3D needs more than one angle. This project stores the turn as four numbers (w, x, y, z). Together they are one rotation.</p><p>You do not need to multiply quaternions by hand. Just remember: slots 4–7 mean “which way the gripper faces,” not “where it is.”</p><p>In demos the hand often points down while it chases, so W is near 1 and the others stay small.</p>";
+  }
+  function storyGrip() {
+    return "<p>Slot 8 is one number for the fingers.</p><p class='math'>1.0 → open<br>0.0 → closed<br>0.5 → half way</p><p>During a grab the expert drives this toward 0. During open / go-home it goes back toward 1. The model learns the same slot when it predicts actions.</p>";
+  }
+  function storyGlue() {
+    return "<p>Glue means: stick the lists together in a fixed order.</p><p class='math'>observation.state = [ 8 hand | 4 ball ]</p><p>Slots 1–8 are the robot. Slots 9–12 are the ball pack. Train and eval must glue the same way, or the model reads the wrong meaning in each slot.</p>";
+  }
+  function storyVec() {
+    return "<p>After glue, the policy sees one 12-wide list. A linear layer turns that list into one state token for the vision-language side.</p><p>Cameras are separate inputs. This page is only the number list.</p><p class='note'>Source of truth: <code>policy/features.py</code> — PROPRIO_NAMES (8) + CONDITIONING_LAYOUT (4).</p>";
+  }
+
+  var STORIES = [storyOverview, storyObject, storyLook, storyFour, storyHand, storyPlace, storyTurn, storyGrip, storyGlue, storyVec];
+
+  function stageFor() {
+    var id = STEPS[step].id;
+    if (id === "overview") {
+      return strip("all") + "<p class='note'>Orange chips = hand. Blue chips = ball. Click Play to walk each group.</p>";
+    }
+    if (id === "object") {
+      return bar("p_x", OBJ.p[0], 0.8, "ball", fmt(OBJ.p[0]) + " m") +
+        bar("p_y", OBJ.p[1], 0.8, "ball", fmt(OBJ.p[1]) + " m") +
+        bar("p_z", OBJ.p[2], 0.8, "ball", fmt(OBJ.p[2]) + " m") +
+        bar("v_x", OBJ.v[0], 0.3, "green", fmt(OBJ.v[0]) + " m/s") +
+        bar("v_y", OBJ.v[1], 0.3, "green", fmt(OBJ.v[1]) + " m/s");
+    }
+    if (id === "look") {
+      var fx = OBJ.p[0] + OBJ.v[0] * DELTA;
+      var fy = OBJ.p[1] + OBJ.v[1] * DELTA;
+      return bar("now X", OBJ.p[0], 0.8, "ball", fmt(OBJ.p[0])) +
+        bar("future X", fx, 0.8, "mix", fmt(fx)) +
+        bar("now Y", OBJ.p[1], 0.8, "ball", fmt(OBJ.p[1])) +
+        bar("future Y", fy, 0.8, "mix", fmt(fy)) +
+        "<p class='note'>Arrow of time: 0.25 s ahead. Z dropped from the pack.</p>";
+    }
+    if (id === "four") {
+      return "<div class='slots'>" + BALL.map(function (b, i) { return slotCard(b, "ball", i + 9); }).join("") + "</div>" + strip("ball");
+    }
+    if (id === "hand") {
+      return "<div class='slots'>" + HAND.map(function (h, i) { return slotCard(h, "hand", i + 1); }).join("") + "</div>" + strip("hand");
+    }
+    if (id === "place") {
+      return HAND.filter(function (h) { return h.group === "place"; }).map(function (h) {
+        return bar(h.plain, h.v, 0.6, "hand", fmt(h.v) + " m");
+      }).join("") + strip("place");
+    }
+    if (id === "turn") {
+      return HAND.filter(function (h) { return h.group === "turn"; }).map(function (h) {
+        return bar(h.name, h.v, 1, "hand", fmt(h.v));
+      }).join("") + strip("turn");
+    }
+    if (id === "grip") {
+      return bar("gripper", gripV, 1, "hand", fmt(gripV)) +
+        "<div class='controls'><button type='button' id='open-g'>Open = 1</button><button type='button' id='close-g'>Close = 0</button><button type='button' id='wiggle-g'>Wiggle</button></div>" +
+        "<p class='note'>Watch the bar: open is full, closed is empty.</p>" + strip("grip");
+    }
+    if (id === "glue") {
+      return "<p class='math'>[ " + HAND.map(function (h) { return fmt(h.v); }).join(", ") + "  |  " + BALL.map(function (b) { return fmt(b.v); }).join(", ") + " ]</p>" + strip("all") +
+        "<p class='note'>Left of the bar = robot half. Right = ball half.</p>";
+    }
+    if (id === "vec") {
+      var all = HAND.concat(BALL);
+      return all.map(function (item, i) {
+        var cls = i < 8 ? "hand" : "ball";
+        var max = i < 8 ? 1 : 0.8;
+        return bar((i + 1) + ". " + item.name, item.v, max, cls, fmt(item.v));
+      }).join("") + strip("all");
+    }
+    return "";
+  }
+
+  function render() {
+    document.getElementById("title").textContent = STEPS[step].title;
+    document.getElementById("stage-title").textContent = "Picture · " + STEPS[step].title;
+    document.getElementById("story").innerHTML = STORIES[step]();
+    document.getElementById("stage").innerHTML = stageFor();
+    document.getElementById("count").textContent = "Step " + (step + 1) + " of " + STEPS.length;
+    document.getElementById("play").setAttribute("aria-pressed", playing ? "true" : "false");
+    document.getElementById("play").textContent = playing ? "Playing" : "Play";
+    document.getElementById("rail").innerHTML = STEPS.map(function (s, i) {
+      return "<button type='button' data-step='" + i + "' class='" + (i === step ? "on" : "") + "' title='" + s.title + "'>" + (i + 1) + "</button>";
+    }).join("");
+    requestAnimationFrame(function () {
+      document.querySelectorAll("#stage .fill").forEach(function (el) {
+        el.style.width = el.getAttribute("data-w") + "%";
+      });
+    });
+  }
+
+  function go(n) {
+    step = Math.max(0, Math.min(STEPS.length - 1, n));
+    history.replaceState(null, "", "#" + STEPS[step].id);
+    render();
+  }
+  function stopPlay() {
+    playing = false;
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
+  function startPlay() {
+    if (playing) return;
+    playing = true;
+    render();
+    timer = setInterval(function () {
+      if (step >= STEPS.length - 1) { stopPlay(); render(); return; }
+      go(step + 1);
+    }, 4000);
+  }
+
+  document.getElementById("next").onclick = function () { stopPlay(); go(step + 1); };
+  document.getElementById("prev").onclick = function () { stopPlay(); go(step - 1); };
+  document.getElementById("play").onclick = startPlay;
+  document.getElementById("pause").onclick = function () { stopPlay(); render(); };
+  document.getElementById("reset").onclick = function () {
+    stopPlay();
+    if (gripAnim) clearInterval(gripAnim);
+    gripV = 1;
+    go(0);
+  };
+  document.getElementById("rail").onclick = function (ev) {
+    var b = ev.target.closest("[data-step]");
+    if (!b) return;
+    stopPlay();
+    go(Number(b.getAttribute("data-step")));
+  };
+  document.getElementById("stage").onclick = function (ev) {
+    if (ev.target.id === "open-g") { gripV = 1; render(); }
+    if (ev.target.id === "close-g") { gripV = 0; render(); }
+    if (ev.target.id === "wiggle-g") {
+      if (gripAnim) clearInterval(gripAnim);
+      var t = 0;
+      gripAnim = setInterval(function () {
+        t += 1;
+        gripV = 0.5 + 0.5 * Math.cos(t / 4);
+        if (STEPS[step].id === "grip") render();
+        if (t > 24) { clearInterval(gripAnim); gripAnim = null; }
+      }, 120);
+    }
+  };
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "ArrowRight") { stopPlay(); go(step + 1); }
+    if (ev.key === "ArrowLeft") { stopPlay(); go(step - 1); }
+    if (ev.key === " ") { ev.preventDefault(); if (playing) { stopPlay(); render(); } else startPlay(); }
+  });
+
+  var hash = (location.hash || "").replace("#", "");
+  var startAt = STEPS.findIndex(function (s) { return s.id === hash; });
+  if (hash === "robot" || hash === "proprio") startAt = STEPS.findIndex(function (s) { return s.id === "hand"; });
+  if (startAt < 0) startAt = 0;
+  go(startAt);
+})();
+</script>
+</body>
+</html>

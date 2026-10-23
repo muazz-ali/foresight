@@ -8,6 +8,13 @@ first ``--k`` actions, world frame) moves:
   hand gain  — tell the model its hand is 3 cm elsewhere (object unchanged).
                Copying the hand ("hand + offset") ⇒ gain ≈ 1. Wanted: ≈ 0.
   static / wrist gray — swap that camera for a gray frame; aim shift in cm.
+  E0 additions (all in-distribution unless noted):
+  cond_swap  — the 4 numbers from a *different* episode (a real, plausible object).
+               follow = projection of the aim shift on (donor p̂ - own p̂) / |.|² ⇒ 1 = follows.
+  static/wrist_swap — that camera's frame from a different episode (aim shift, cm).
+  lang_*     — other object name / generic / blank / unrelated task text (aim shift, cm).
+  noise_floor — same inputs, different flow-matching noise (aim shift, cm): the
+               sensitivity any input change must beat to count as "used".
 
 Inputs are rebuilt exactly as eval does (``cond_to_model`` / ``action_from_model``
 with the checkpoint's saved frames), so abs and rel/delta checkpoints compare 1:1.
@@ -23,6 +30,7 @@ import argparse
 import glob
 import json
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -52,7 +60,8 @@ def _img(a: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(a[..., :3])).permute(2, 0, 1).float() / 255.0
 
 
-def probe_frame(pol, cfg, frames, f, i: int, lang: str, device: str, k: int, seed: int) -> dict:
+def probe_frame(pol, cfg, frames, f, i: int, lang: str, device: str, k: int, seed: int, donor: dict | None = None,
+                langs: dict | None = None) -> dict:
     """All perturbations for one frame in one batched forward pass."""
     from policy.convert_h5 import pack_proprio
     from policy.transforms import action_from_model, cond_to_model
@@ -65,8 +74,13 @@ def probe_frame(pol, cfg, frames, f, i: int, lang: str, device: str, k: int, see
     sx, sy = np.array([SHIFT_M, 0.0]), np.array([0.0, SHIFT_M])
 
     # (name, hand the model is told, world cond, static, wrist)
+    d = donor or {"cond": cond_w, "static": static, "wrist": wrist}
+    cond_swap = np.r_[np.asarray(d["cond"], dtype=np.float64)[0:2], cond_w[2:4]]  # donor p̂, own v̂
     cases = [
         ("base", ee, cond_w, static, wrist),
+        ("cond_swap", ee, cond_swap, static, wrist),
+        ("static_swap", ee, cond_w, d["static"], wrist),
+        ("wrist_swap", ee, cond_w, static, d["wrist"]),
         ("cond_x", ee, cond_w + np.r_[sx, 0, 0], static, wrist),
         ("cond_y", ee, cond_w + np.r_[sy, 0, 0], static, wrist),
         ("hand_x", ee + np.r_[sx, 0], cond_w, static, wrist),
@@ -80,15 +94,31 @@ def probe_frame(pol, cfg, frames, f, i: int, lang: str, device: str, k: int, see
         states.append(np.r_[st, cond_to_model(cw, hand, frames["cond_frame"])])
         s_imgs.append(_img(si))
         w_imgs.append(_img(wi))
+    case_lang = [lang] * len(cases)
+    for name, text in (langs or {}).items():  # language counterfactuals: same state and images as base
+        cases.append((name, ee, cond_w, static, wrist))
+        st = pack_proprio(ee, quat, grip)
+        states.append(np.r_[st, cond_to_model(cond_w, ee, frames["cond_frame"])])
+        s_imgs.append(_img(static))
+        w_imgs.append(_img(wrist))
+        case_lang.append(text)
+    cases.append(("noise_floor", ee, cond_w, static, wrist))
+    st = pack_proprio(ee, quat, grip)
+    states.append(np.r_[st, cond_to_model(cond_w, ee, frames["cond_frame"])])
+    s_imgs.append(_img(static))
+    w_imgs.append(_img(wrist))
+    case_lang.append(lang)
     n = len(cases)
     batch = {
         "observation.state": torch.tensor(np.stack(states), dtype=torch.float32, device=device),
         "observation.images.static_cam": torch.stack(s_imgs).to(device),
         "observation.images.wrist_cam": torch.stack(w_imgs).to(device),
-        "task": [lang if lang.endswith("\n") else lang + "\n"] * n,
+        "task": [t if t.endswith("\n") else t + "\n" for t in case_lang],
     }
     g = torch.Generator(device="cpu").manual_seed(seed)
-    noise = torch.randn((1, cfg.chunk_size, cfg.max_action_dim), generator=g).repeat(n, 1, 1).to(device)
+    noise = torch.randn((1, cfg.chunk_size, cfg.max_action_dim), generator=g).repeat(n, 1, 1)
+    noise[-1] = torch.randn((cfg.chunk_size, cfg.max_action_dim), generator=g)  # noise_floor case
+    noise = noise.to(device)
     with torch.inference_mode():
         out = pol.predict_action_chunk(batch, noise=noise).float().cpu().numpy()
     aims = {}
@@ -105,7 +135,19 @@ def probe_frame(pol, cfg, frames, f, i: int, lang: str, device: str, k: int, see
         "hand_gain": [float((aims["hand_x"] - base)[0] / SHIFT_M), float((aims["hand_y"] - base)[1] / SHIFT_M)],
         "static_gray_cm": float(np.linalg.norm(aims["static_gray"] - base) * 100),
         "wrist_gray_cm": float(np.linalg.norm(aims["wrist_gray"] - base) * 100),
+        "cond_swap_follow": _follow(aims["cond_swap"] - base, cond_swap[0:2] - cond_w[0:2]),
+        "cond_swap_dist_cm": float(np.linalg.norm(cond_swap[0:2] - cond_w[0:2]) * 100),
+        "static_swap_cm": float(np.linalg.norm(aims["static_swap"] - base) * 100),
+        "wrist_swap_cm": float(np.linalg.norm(aims["wrist_swap"] - base) * 100),
+        "noise_floor_cm": float(np.linalg.norm(aims["noise_floor"] - base) * 100),
+        **{f"{name}_cm": float(np.linalg.norm(aims[name] - base) * 100) for name in (langs or {})},
     }
+
+
+def _follow(shift: np.ndarray, target: np.ndarray) -> float:
+    """How much of the move toward ``target`` the aim made (1 = all of it)."""
+    d2 = float(target @ target)
+    return float(shift @ target / d2) if d2 > 1e-8 else float("nan")
 
 
 def _language(h5: str) -> str:
@@ -142,9 +184,12 @@ def main() -> None:
     files = sorted(glob.glob(a.h5))
     random.Random(a.seed).shuffle(files)
     pol, cfg, frames = _load(a.checkpoint, a.device)
-    rows = []
+    from policy.features import default_language
+
+    # Pass 1: pick frames. Pass 2: probe each frame with a donor from another episode.
+    picks = []
     for h5 in files:
-        if len(rows) >= a.n * len(a.before_close):
+        if len(picks) >= a.n * len(a.before_close):
             break
         if a.success_only:
             js = Path(h5).with_suffix(".json")
@@ -158,15 +203,29 @@ def main() -> None:
             if not (g < 0.5).any():
                 continue
             ic = int(np.argmax(g < 0.5))
-            lang = _language(h5)
-            speed = float(np.asarray(f["speed_m_s"]).reshape(-1)[0]) if "speed_m_s" in f else float("nan")
             for b in a.before_close:
-                i = ic - b
-                if i < 0:
-                    continue
-                r = probe_frame(pol, cfg, frames, f, i, lang, a.device, a.k, a.seed)
-                r.update(h5=h5, frame=i, before_close=b, speed=speed)
-                rows.append(r)
+                if ic - b >= 0:
+                    picks.append((h5, ic - b, b))
+    rows = []
+    for j, (h5, i, b) in enumerate(picks):
+        dh5, di, _ = picks[(j + len(a.before_close)) % len(picks)]  # a frame from another episode
+        if dh5 == h5:
+            dh5, di, _ = picks[(j + 2 * len(a.before_close) + 1) % len(picks)]
+        with h5py.File(dh5, "r") as fd:
+            donor = {"cond": fd["conditioning"][di][:], "static": fd["static_cam_rgb"][di][:], "wrist": fd["wrist_cam_rgb"][di][:]}
+        lang = _language(h5)
+        other = "tomato" if "tangerine" not in lang else "lemon"
+        langs = {
+            "lang_obj": re.sub(r"Pick the (.+?) and", f"Pick the {other} and", lang),
+            "lang_generic": "Pick the object and place it in the container.",
+            "lang_blank": "",
+            "lang_other": "Open the drawer and push the button.",
+        }
+        with h5py.File(h5, "r") as f:
+            speed = float(np.asarray(f["speed_m_s"]).reshape(-1)[0]) if "speed_m_s" in f else float("nan")
+            r = probe_frame(pol, cfg, frames, f, i, lang, a.device, a.k, a.seed + j, donor=donor, langs=langs)
+        r.update(h5=h5, frame=i, before_close=b, speed=speed, donor=dh5, lang=lang)
+        rows.append(r)
 
     def med(key, j=None):
         v = [r[key] if j is None else r[key][j] for r in rows]
@@ -180,6 +239,15 @@ def main() -> None:
         "hand_gain_xy": [med("hand_gain", 0), med("hand_gain", 1)],
         "static_gray_cm": med("static_gray_cm"),
         "wrist_gray_cm": med("wrist_gray_cm"),
+        "cond_swap_follow": med("cond_swap_follow"),
+        "cond_swap_dist_cm": med("cond_swap_dist_cm"),
+        "static_swap_cm": med("static_swap_cm"),
+        "wrist_swap_cm": med("wrist_swap_cm"),
+        "noise_floor_cm": med("noise_floor_cm"),
+        **{f"{k}_cm": med(f"{k}_cm") for k in ("lang_obj", "lang_generic", "lang_blank", "lang_other")},
+        "p90": {k: float(np.percentile([r[k] for r in rows], 90)) for k in
+                ("noise_floor_cm", "static_gray_cm", "wrist_gray_cm", "static_swap_cm", "wrist_swap_cm",
+                 "lang_obj_cm", "lang_generic_cm", "lang_blank_cm", "lang_other_cm")} if rows else {},
         "abs_aim_minus_obj_cm": float(np.median([np.linalg.norm(r["aim_minus_obj_cm"]) for r in rows])) if rows else None,
         "abs_aim_minus_label_cm": float(np.median([np.linalg.norm(r["aim_minus_label_cm"]) for r in rows])) if rows else None,
     }

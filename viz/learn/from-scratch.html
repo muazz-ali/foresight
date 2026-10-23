@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Inside attention, from scratch</title>
+<style>
+  :root {
+    --bg: #0c1218;
+    --panel: #141c26;
+    --ink: #e7eef6;
+    --muted: #93a4b8;
+    --line: #2a3a4c;
+    --cyan: #5ec8e6;
+    --gold: #e2b15a;
+    --green: #7dcea0;
+    --rose: #e07a86;
+    --violet: #b9a6e8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
+    background: radial-gradient(900px 420px at 10% -10%, #1a2c3d, var(--bg));
+    color: var(--ink);
+    min-height: 100vh;
+  }
+  header, main, footer { width: min(1100px, calc(100% - 32px)); margin: 0 auto; }
+  header { padding: 22px 0 8px; }
+  h1 { font-size: 1.55rem; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .lede { color: var(--muted); margin: 0; }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    margin: 14px 0;
+  }
+  button, .who button {
+    background: #1c2836; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 999px; padding: 8px 14px; font: 600 14px/1 "Segoe UI", sans-serif;
+    cursor: pointer;
+  }
+  button.primary { background: #164e63; border-color: #2a7d99; }
+  button[aria-pressed="true"] { background: #24506a; border-color: var(--cyan); }
+  button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+  .count { color: var(--muted); margin-left: auto; font-size: 14px; }
+  .rail { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 14px; }
+  .rail button {
+    width: 28px; height: 28px; padding: 0; border-radius: 7px; font-size: 12px;
+  }
+  .rail button.on { background: var(--cyan); color: #06202a; border-color: var(--cyan); }
+  main {
+    display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.15fr);
+    gap: 16px; align-items: start;
+  }
+  article, .stage {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+    padding: 16px 18px 18px;
+  }
+  h2 { margin: 0 0 10px; font-size: 1.2rem; }
+  p { margin: 0 0 10px; line-height: 1.45; }
+  .note { color: var(--muted); font-size: 0.92rem; }
+  .stage h3 { margin: 0 0 8px; font-size: 0.95rem; color: var(--gold); font-weight: 650; }
+  .who { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .name { width: 92px; font-size: 13px; color: var(--muted); }
+  .track { flex: 1; height: 16px; background: #0d141c; border-radius: 8px; overflow: hidden; }
+  .fill { height: 100%; width: 0; border-radius: 8px; transition: width .45s ease; }
+  .fill.q { background: var(--cyan); }
+  .fill.k { background: var(--gold); }
+  .fill.v { background: var(--green); }
+  .fill.bad { background: var(--rose); }
+  .fill.mix { background: var(--violet); }
+  .num { width: 64px; text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+  .card {
+    background: #0e1620; border: 1px solid var(--line); border-radius: 12px; padding: 8px 10px;
+  }
+  .card strong { display: block; margin-bottom: 4px; font-size: 13px; }
+  .math {
+    font-family: ui-monospace, "Cascadia Code", monospace;
+    background: #0e1620; border-radius: 10px; padding: 10px 12px; font-size: 13px;
+    line-height: 1.55; overflow-x: auto;
+  }
+  .line {
+    position: relative; height: 72px; margin: 18px 8px 8px; background: linear-gradient(#243244, #243244) center/100% 2px no-repeat;
+  }
+  .dot {
+    position: absolute; top: 22px; width: 28px; height: 28px; border-radius: 50%;
+    background: var(--cyan); transform: translateX(-50%);
+    transition: left .35s ease;
+  }
+  .ends { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
+  .stack { display: flex; gap: 6px; align-items: flex-end; height: 140px; }
+  .layer {
+    flex: 1; border-radius: 6px 6px 2px 2px; min-height: 8px;
+  }
+  .sa { background: #3d6f86; }
+  .ca { background: #8a6a32; }
+  .layer.on { outline: 2px solid var(--ink); }
+  footer { color: var(--muted); font-size: 13px; padding: 16px 0 28px; }
+  @media (max-width: 800px) {
+    main { grid-template-columns: 1fr; }
+    .count { margin-left: 0; width: 100%; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Inside attention, from scratch</h1>
+  <p class="lede">A tiny made-up example that uses the same steps as the action expert. Two numbers per token, so you can watch the arithmetic. The real expert uses a much longer list, and the same moves.</p>
+  <div class="controls">
+    <button id="reset" type="button">Reset</button>
+    <button id="prev" type="button">Back</button>
+    <button id="play" class="primary" type="button" aria-pressed="false">Play</button>
+    <button id="pause" type="button">Pause</button>
+    <button id="next" type="button">Next</button>
+    <span class="count" id="count"></span>
+  </div>
+  <div class="rail" id="rail"></div>
+</header>
+<main>
+  <article>
+    <h2 id="title"></h2>
+    <div id="story"></div>
+  </article>
+  <section class="stage" aria-live="polite">
+    <h3 id="stage-title"></h3>
+    <div id="stage"></div>
+  </section>
+</main>
+<footer>
+  Toy numbers, real order of steps. Even layers look backward (self-attention). Odd layers read the frozen memory (cross-attention). Ten small steps walk noise toward a hand path. This page is not an Archify diagram: Archify can light up boxes, and this lesson can play, pause, and reset the numbers.
+</footer>
+<script>
+(function () {
+  var MOVES = [
+    { name: "Move 1", v: [1.0, 0.2] },
+    { name: "Move 2", v: [0.5, 0.9] },
+    { name: "Move 3", v: [0.1, 1.0] }
+  ];
+  var MEMORY = [
+    { name: "Image", v: [1.0, 0.0] },
+    { name: "State", v: [0.0, 1.0] }
+  ];
+  var SCALE = Math.sqrt(2);
+  var STEPS = [
+    { id: "job", title: "The job" },
+    { id: "token", title: "A token" },
+    { id: "row", title: "A row of tokens" },
+    { id: "linear", title: "A weight table" },
+    { id: "qkv", title: "Query, key, value" },
+    { id: "score", title: "Match score" },
+    { id: "scale", title: "Calm the scores" },
+    { id: "mask", title: "Hide the future" },
+    { id: "softmax", title: "Shares of 1" },
+    { id: "mix", title: "Mix the values" },
+    { id: "heads", title: "Several slices" },
+    { id: "rope", title: "Turn for position" },
+    { id: "residual", title: "Add the old list back" },
+    { id: "saca", title: "Two kinds of look" },
+    { id: "stack", title: "Even, then odd" },
+    { id: "flow", title: "Ten small steps" }
+  ];
+
+  var step = 0;
+  var asker = 1;
+  var mode = "self";
+  var playing = false;
+  var timer = null;
+  var flowTick = 0;
+  var flowTimer = null;
+  var stackOn = 0;
+  var stackTimer = null;
+
+  function dot(a, b) { return a[0] * b[0] + a[1] * b[1]; }
+  function fmt(n) {
+    if (!isFinite(n)) return "blocked";
+    return (Math.round(n * 100) / 100).toFixed(2);
+  }
+  function softmax(xs) {
+    var finite = xs.filter(function (x) { return x > -1e8; });
+    var m = Math.max.apply(null, finite);
+    var ex = xs.map(function (x) { return x < -1e8 ? 0 : Math.exp(x - m); });
+    var z = ex.reduce(function (s, x) { return s + x; }, 0);
+    return ex.map(function (e) { return e / z; });
+  }
+  function keysFor(kind) { return kind === "cross" ? MEMORY : MOVES; }
+  function scoresFor(who, kind, scaled, masked) {
+    var q = MOVES[who].v;
+    var keys = keysFor(kind);
+    return keys.map(function (k, j) {
+      var s = dot(q, k.v);
+      if (scaled) s = s / SCALE;
+      if (masked && kind === "self" && j > who) return -1e9;
+      return s;
+    });
+  }
+  function mixOf(who, kind) {
+    var sc = scoresFor(who, kind, true, true);
+    var w = softmax(sc);
+    var keys = keysFor(kind);
+    var out = [0, 0];
+    w.forEach(function (weight, j) {
+      out[0] += weight * keys[j].v[0];
+      out[1] += weight * keys[j].v[1];
+    });
+    return { w: w, out: out, sc: sc };
+  }
+
+  function bar(label, value, max, cls, text) {
+    var pct = Math.max(0, Math.min(100, (value / max) * 100));
+    return '<div class="row"><span class="name">' + label + '</span><div class="track"><div class="fill ' + cls + '" data-w="' + pct + '" style="width:0%"></div></div><span class="num">' + text + '</span></div>';
+  }
+  function tokenBars(items, cls) {
+    var max = 1.2;
+    return items.map(function (it) {
+      return '<div class="card"><strong>' + it.name + '</strong>' +
+        bar("number 1", it.v[0], max, cls, fmt(it.v[0])) +
+        bar("number 2", it.v[1], max, cls, fmt(it.v[1])) +
+        "</div>";
+    }).join("");
+  }
+
+  function storyJob() {
+    return "<p>The action expert's job is to turn a noisy guess of the next hand moves into a cleaner guess.</p><p>The part people call attention is how one list of numbers looks at other lists and copies a mix of them.</p><p>Self-attention looks at other hand moves. Cross-attention looks at the frozen camera and state memory.</p><p class='note'>Use Play to walk the lesson. Pause stops it. Reset goes back to this page.</p>";
+  }
+  function storyToken() {
+    return "<p>A token is not a word here. It is a list of numbers that stands for one thing.</p><p>In this toy, each future hand move is two numbers. In the real expert, the list is hundreds of numbers long. The steps stay the same.</p><p>Move 1 is mostly its first number. Move 3 is mostly its second number. That makes the matches easy to see.</p>";
+  }
+  function storyRow() {
+    return "<p>The expert does not look at one move. It looks at a row of them. The real chunk is 50 future moves.</p><p>This toy uses 3 so the picture fits on one screen.</p><p>Order matters. Move 1 is earlier than Move 3. Later you will see that an earlier move is not allowed to peek at a later one.</p>";
+  }
+  function storyLinear() {
+    var x = MOVES[0].v;
+    var y0 = 0.4 * x[0] + 0.1 * x[1];
+    var y1 = 0.0 * x[0] + 0.8 * x[1];
+    return "<p>A linear layer is a small table of weights. Each output number is a weighted sum of the input numbers.</p><p>Take Move 1, which is " + fmt(x[0]) + " and " + fmt(x[1]) + ".</p><p class='math'>new 1 = 0.40×" + fmt(x[0]) + " + 0.10×" + fmt(x[1]) + " = " + fmt(y0) + "<br>new 2 = 0.00×" + fmt(x[0]) + " + 0.80×" + fmt(x[1]) + " = " + fmt(y1) + "</p><p>The real expert learns these tables. This toy picks easy tables so the sums stay readable. No extra added number (no bias) in the toy.</p>";
+  }
+  function storyQkv() {
+    return "<p>The same token is copied through three different tables.</p><p><b>Query</b> is what this move is asking. <b>Key</b> is the label on something it might look at. <b>Value</b> is the content it will copy if the label matches.</p><p>In this toy the three tables are the identity: query, key, and value stay equal to the token. That way a match score is just \"do these two moves point the same way?\"</p><p class='note'>The real net uses three different tables, so query and key are not the raw token. The comparison step is still the same.</p>";
+  }
+  function storyScore() {
+    var q = MOVES[asker].v;
+    var k = MOVES[0].v;
+    var s = dot(q, k);
+    return "<p>A match score is a dot product. Multiply the pairs, then add.</p><p class='math'>" + MOVES[asker].name + " · Move 1 = " + fmt(q[0]) + "×" + fmt(k[0]) + " + " + fmt(q[1]) + "×" + fmt(k[1]) + " = " + fmt(s) + "</p><p>A bigger positive score means \"these two point the same way.\" A score near 0 means \"they point different ways.\"</p><p>Pick who is asking. The bars are that query against every key.</p>";
+  }
+  function storyScale() {
+    return "<p>A long list makes dot products huge even when the match is ordinary. The fix is to divide by the square root of the list length.</p><p>This toy length is 2, so every score is divided by √2 ≈ " + fmt(SCALE) + ".</p><p>The real code divides by the square root of the head size, which is the length of one slice. Same idea.</p>";
+  }
+  function storyMask() {
+    return "<p>In self-attention, a move may look at itself and at earlier moves. It may not look at later moves.</p><p>If " + MOVES[asker].name + " is asking, every move after it is blocked. The code does not delete them. It sets that score to a huge negative number, about as low as the computer can store.</p><p>Move 1 can only see itself. Move 3 can see all three. That is the causal mask.</p>";
+  }
+  function storySoft() {
+    var pack = mixOf(asker, "self");
+    var lines = pack.w.map(function (w, j) {
+      return MOVES[j].name + " share " + fmt(w);
+    }).join("<br>");
+    return "<p>Shares have to add up to 1. The step that does this is called softmax.</p><p>Raise e (about 2.718) to the power of each score. Then divide each one by the total. A blocked score becomes a share of 0.</p><p class='math'>" + lines + "<br>sum = " + fmt(pack.w.reduce(function (s, x) { return s + x; }, 0)) + "</p><p>The bars on the right are those shares. Press Replay under the picture to watch them settle.</p>";
+  }
+  function storyMix() {
+    var pack = mixOf(asker, "self");
+    return "<p>Each share multiplies that move's value, and the results add up. That sum is the new list for the asking move.</p><p class='math'>new = " + pack.w.map(function (w, j) {
+      return fmt(w) + "×(" + fmt(MOVES[j].v[0]) + ", " + fmt(MOVES[j].v[1]) + ")";
+    }).join(" + ") + "<br>= (" + fmt(pack.out[0]) + ", " + fmt(pack.out[1]) + ")</p><p>In this toy the value is the token itself. So the new list is a blend of the moves it was allowed to see.</p>";
+  }
+  function storyHeads() {
+    return "<p>The real list is split into slices called heads. Each head runs the same score, mask, share, and mix on its own short list. Then the slices are glued back into one list.</p><p>Why: one slice can care about timing while another cares about grip. They do not have to share one score.</p><p>The picture uses 4 numbers cut into 2 heads of 2. The toy above used 1 head of 2, so you could read every sum. The real expert uses many heads. The count comes from the vision-language model, not from a number we should invent here.</p>";
+  }
+  function storyRope() {
+    return "<p>After the split into query and key, the code rotates pairs of numbers. The angle depends on where the token sits in the row.</p><p>Move 1 turns a little. Move 3 turns more. A match then depends on the lists and on their places, not only on the raw numbers.</p><p>The real rotation uses a sine and a cosine on each pair. The picture uses an even turn of 0°, 25°, and 50° so you can see the arrow move. Same idea, simpler angle.</p>";
+  }
+  function storyResidual() {
+    return "<p>Attention is not allowed to throw away the token it started with. The code adds the input list back onto the attention result.</p><p>Then it rescales the list (a norm), runs a small two-layer mixer (the MLP), and adds the list back a second time.</p><p>Even layers and odd layers both do this after they look. A final rescaling happens once, after the last layer, before the direction head.</p>";
+  }
+  function storySaca() {
+    return "<p><b>Self-attention</b> (even layers 0, 2, 4…): query, key, and value all come from the move tokens. Keys from the saved memory are placed in front, and the mask still blocks future moves.</p><p><b>Cross-attention</b> (odd layers 1, 3, 5…): the query still comes from the moves. The key and the value come only from the frozen memory (image, words, state), after a table squeezes them down to the expert's width. Other moves are not in that room.</p><p>Use the two buttons in the picture. The bars change because the room of keys changes.</p>";
+  }
+  function storyStack() {
+    return "<p>The expert stack has 16 layers, the same count as the vision-language layers it is allowed to read. The rest of that tower is skipped.</p><p>Layer 0 looks backward. Layer 1 reads the memory. That pair repeats. Press Run the stack to watch the highlight walk down.</p><p>The expert's list is 0.75 times as wide as the vision-language list, so this half stays cheaper.</p>";
+  }
+  function storyFlow() {
+    return "<p>Training teaches a direction: noise minus the recorded hand moves. At run time the chunk starts as pure noise, with the clock at 1.</p><p>Each pass predicts a direction v. The chunk steps by one tenth of the way: x ← x − v / 10. The clock drops by 0.1. After 10 passes, a constant direction lands on the clean move.</p><p>This picture uses one number instead of 50 moves. Noise starts at 1.00. The clean move is 0.20. Direction v = 1.00 − 0.20 = 0.80. Ten steps of −0.08 land on 0.20.</p><p class='note'>Training does not walk the ten steps. It picks one random clock and checks the direction once.</p>";
+  }
+
+  var STORIES = [storyJob, storyToken, storyRow, storyLinear, storyQkv, storyScore, storyScale, storyMask, storySoft, storyMix, storyHeads, storyRope, storyResidual, storySaca, storyStack, storyFlow];
+
+  function whoButtons() {
+    return "<div class='who' role='group' aria-label='Who is asking'>" + MOVES.map(function (m, i) {
+      return "<button type='button' data-ask='" + i + "' aria-pressed='" + (i === asker ? "true" : "false") + "'>" + m.name + "</button>";
+    }).join("") + "</div>";
+  }
+  function scorePicture(scaled, masked) {
+    var sc = scoresFor(asker, "self", scaled, masked);
+    var max = 1.2;
+    var html = whoButtons();
+    html += sc.map(function (s, j) {
+      var blocked = s < -1e8;
+      return bar(MOVES[j].name, blocked ? 0 : Math.abs(s), max, blocked ? "bad" : "k", blocked ? "blocked" : fmt(s));
+    }).join("");
+    return html;
+  }
+
+  function stageFor() {
+    var id = STEPS[step].id;
+    if (id === "job") return "<p>You will watch one asking move score every key, block the future, turn scores into shares, and blend the values.</p>";
+    if (id === "token" || id === "row" || id === "qkv") {
+      return "<div class='grid3'>" + tokenBars(MOVES, "q") + "</div>";
+    }
+    if (id === "linear") {
+      var x = MOVES[0].v;
+      var y = [0.4 * x[0] + 0.1 * x[1], 0.8 * x[1]];
+      return tokenBars([MOVES[0], { name: "After table", v: y }], "v");
+    }
+    if (id === "score") return scorePicture(false, false);
+    if (id === "scale") return scorePicture(true, false);
+    if (id === "mask") return scorePicture(true, true);
+    if (id === "softmax" || id === "mix") {
+      var pack = mixOf(asker, "self");
+      var html = whoButtons();
+      html += "<p class='note'>Shares for " + MOVES[asker].name + "</p>";
+      html += pack.w.map(function (w, j) {
+        return bar(MOVES[j].name, w, 1, "v", fmt(w));
+      }).join("");
+      if (id === "mix") {
+        html += "<p class='note'>Blended value</p>";
+        html += bar("number 1", pack.out[0], 1.2, "mix", fmt(pack.out[0]));
+        html += bar("number 2", pack.out[1], 1.2, "mix", fmt(pack.out[1]));
+      }
+      html += "<div class='controls'><button type='button' id='replay'>Replay the shares</button></div>";
+      return html;
+    }
+    if (id === "heads") {
+      return "<div class='grid3'><div class='card'><strong>Head A</strong><p class='note'>numbers 1 and 2</p></div><div class='card'><strong>Head B</strong><p class='note'>numbers 3 and 4</p></div><div class='card'><strong>Glued</strong><p class='note'>one list again</p></div></div><p class='note'>Each head has its own scores. This picture only shows the cut, not a second full sum.</p>";
+    }
+    if (id === "rope") {
+      return "<div class='who'><button type='button' id='spin'>Spin the three moves</button></div><div id='arrows'></div>";
+    }
+    if (id === "residual") {
+      var pack = mixOf(1, "self");
+      var input = MOVES[1].v;
+      var sum = [input[0] + pack.out[0], input[1] + pack.out[1]];
+      return "<p class='note'>Move 2, input plus blended value</p>" +
+        bar("input 1", input[0], 2, "q", fmt(input[0])) +
+        bar("blend 1", pack.out[0], 2, "v", fmt(pack.out[0])) +
+        bar("sum 1", sum[0], 2, "mix", fmt(sum[0]));
+    }
+    if (id === "saca") {
+      var kind = mode;
+      var pack = mixOf(asker, kind);
+      var labels = keysFor(kind);
+      var html = "<div class='who'><button type='button' data-mode='self' aria-pressed='" + (mode === "self" ? "true" : "false") + "'>Self-attention</button><button type='button' data-mode='cross' aria-pressed='" + (mode === "cross" ? "true" : "false") + "'>Cross-attention</button></div>";
+      html += whoButtons();
+      html += pack.w.map(function (w, j) {
+        return bar(labels[j].name, w, 1, kind === "self" ? "k" : "v", fmt(w));
+      }).join("");
+      html += "<p class='note'>" + (kind === "self" ? "Keys are the moves, with the future blocked." : "Keys are only Image and State. Other moves are not here.") + "</p>";
+      return html;
+    }
+    if (id === "stack") {
+      var html = "<div class='stack'>";
+      for (var i = 0; i < 16; i++) {
+        html += "<div class='layer " + (i % 2 === 0 ? "sa" : "ca") + (i === stackOn ? " on" : "") + "' style='height:" + (24 + i * 6) + "px' title='layer " + i + "'></div>";
+      }
+      html += "</div><p class='note'>Layer " + stackOn + " is " + (stackOn % 2 === 0 ? "self-attention" : "cross-attention") + ".</p>";
+      html += "<div class='controls'><button type='button' id='run-stack'>Run the stack</button><button type='button' id='stop-stack'>Stop</button></div>";
+      return html;
+    }
+    if (id === "flow") {
+      var x = 1 - flowTick * 0.08;
+      var left = ((x - 0.2) / 0.8) * 100;
+      return "<div class='line'><div class='dot' style='left:" + left + "%'></div></div><div class='ends'><span>clean 0.20</span><span>now " + fmt(x) + "</span><span>noise 1.00</span></div><p class='note'>Step " + flowTick + " of 10. Each step subtracts 0.08.</p><div class='controls'><button type='button' id='run-flow'>Run the 10 steps</button><button type='button' id='stop-flow'>Stop</button><button type='button' id='reset-flow'>Reset picture</button></div>";
+    }
+    return "";
+  }
+
+  function render() {
+    document.getElementById("title").textContent = STEPS[step].title;
+    document.getElementById("stage-title").textContent = "Picture · " + STEPS[step].title;
+    document.getElementById("story").innerHTML = STORIES[step]();
+    document.getElementById("stage").innerHTML = stageFor();
+    document.getElementById("count").textContent = "Step " + (step + 1) + " of " + STEPS.length;
+    document.getElementById("play").setAttribute("aria-pressed", playing ? "true" : "false");
+    document.getElementById("play").textContent = playing ? "Playing" : "Play";
+    var rail = document.getElementById("rail");
+    rail.innerHTML = STEPS.map(function (s, i) {
+      return "<button type='button' data-step='" + i + "' class='" + (i === step ? "on" : "") + "' title='" + s.title + "'>" + (i + 1) + "</button>";
+    }).join("");
+    if (STEPS[step].id === "rope") drawArrows(false);
+    requestAnimationFrame(function () {
+      document.querySelectorAll("#stage .fill").forEach(function (el) {
+        el.style.width = el.getAttribute("data-w") + "%";
+      });
+    });
+  }
+
+  function drawArrows(spin) {
+    var box = document.getElementById("arrows");
+    if (!box) return;
+    var angles = spin ? [0, 25, 50] : [0, 0, 0];
+    box.innerHTML = "<div class='grid3'>" + MOVES.map(function (m, i) {
+      var rad = angles[i] * Math.PI / 180;
+      var x = m.v[0] * Math.cos(rad) - m.v[1] * Math.sin(rad);
+      var y = m.v[0] * Math.sin(rad) + m.v[1] * Math.cos(rad);
+      return "<div class='card'><strong>" + m.name + "</strong><p class='note'>turn " + angles[i] + "°</p><p class='math'>(" + fmt(x) + ", " + fmt(y) + ")</p></div>";
+    }).join("") + "</div>";
+    if (!spin) {
+      box.dataset.spun = "";
+    } else {
+      box.dataset.spun = "1";
+    }
+  }
+
+  function go(n) {
+    step = Math.max(0, Math.min(STEPS.length - 1, n));
+    history.replaceState(null, "", "#" + STEPS[step].id);
+    render();
+  }
+  function stopPlay() {
+    playing = false;
+    if (timer) clearInterval(timer);
+    timer = null;
+    var btn = document.getElementById("play");
+    if (btn) btn.setAttribute("aria-pressed", "false");
+  }
+  function startPlay() {
+    if (playing) return;
+    playing = true;
+    document.getElementById("play").setAttribute("aria-pressed", "true");
+    document.getElementById("play").textContent = "Playing";
+    timer = setInterval(function () {
+      if (step >= STEPS.length - 1) { stopPlay(); render(); return; }
+      go(step + 1);
+    }, 4200);
+  }
+
+  document.getElementById("next").onclick = function () { stopPlay(); go(step + 1); };
+  document.getElementById("prev").onclick = function () { stopPlay(); go(step - 1); };
+  document.getElementById("play").onclick = startPlay;
+  document.getElementById("pause").onclick = function () { stopPlay(); render(); };
+  document.getElementById("reset").onclick = function () {
+    stopPlay();
+    if (flowTimer) clearInterval(flowTimer);
+    if (stackTimer) clearInterval(stackTimer);
+    flowTick = 0;
+    stackOn = 0;
+    asker = 1;
+    mode = "self";
+    go(0);
+  };
+  document.getElementById("rail").onclick = function (ev) {
+    var b = ev.target.closest("[data-step]");
+    if (!b) return;
+    stopPlay();
+    go(Number(b.getAttribute("data-step")));
+  };
+  document.getElementById("stage").onclick = function (ev) {
+    var ask = ev.target.closest("[data-ask]");
+    if (ask) { asker = Number(ask.getAttribute("data-ask")); render(); return; }
+    var md = ev.target.closest("[data-mode]");
+    if (md) { mode = md.getAttribute("data-mode"); render(); return; }
+    if (ev.target.id === "replay") { render(); return; }
+    if (ev.target.id === "spin") { drawArrows(true); return; }
+    if (ev.target.id === "run-flow") {
+      if (flowTimer) clearInterval(flowTimer);
+      flowTimer = setInterval(function () {
+        if (flowTick >= 10) { clearInterval(flowTimer); flowTimer = null; return; }
+        flowTick += 1;
+        if (STEPS[step].id === "flow") render();
+      }, 450);
+      return;
+    }
+    if (ev.target.id === "stop-flow") { if (flowTimer) clearInterval(flowTimer); flowTimer = null; return; }
+    if (ev.target.id === "reset-flow") { flowTick = 0; if (flowTimer) clearInterval(flowTimer); render(); return; }
+    if (ev.target.id === "run-stack") {
+      if (stackTimer) clearInterval(stackTimer);
+      stackTimer = setInterval(function () {
+        stackOn = (stackOn + 1) % 16;
+        if (STEPS[step].id === "stack") render();
+      }, 500);
+      return;
+    }
+    if (ev.target.id === "stop-stack") { if (stackTimer) clearInterval(stackTimer); stackTimer = null; }
+  };
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "ArrowRight") { stopPlay(); go(step + 1); }
+    if (ev.key === "ArrowLeft") { stopPlay(); go(step - 1); }
+    if (ev.key === " ") { ev.preventDefault(); if (playing) { stopPlay(); render(); } else startPlay(); }
+  });
+
+  var hash = (location.hash || "").replace("#", "");
+  var startAt = STEPS.findIndex(function (s) { return s.id === hash; });
+  if (hash === "self" || hash === "cross") {
+    startAt = STEPS.findIndex(function (s) { return s.id === "saca"; });
+    mode = hash === "cross" ? "cross" : "self";
+  }
+  if (startAt < 0) startAt = 0;
+  go(startAt);
+})();
+</script>
+</body>
+</html>

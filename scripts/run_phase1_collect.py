@@ -281,6 +281,10 @@ def run_collection(args, scene, expert) -> dict:
             "language": meta.get("language"),
             "category": meta.get("category"),
             "container_category": meta.get("container_category"),
+            # Throw geometry (E6: split realistic toward-robot throws from the rest offline).
+            "init_pos": meta.get("init_pos"),
+            "init_vel": meta.get("init_vel"),
+            "container_pos": meta.get("container_pos"),
         }
         with open(metrics_path, "a") as fp:
             fp.write(json.dumps(record) + "\n")

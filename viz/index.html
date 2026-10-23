@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Foresight visuals</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a222c;
+    --ink: #e8eef4;
+    --muted: #8b9aab;
+    --accent: #5b9fd4;
+    --line: #2a3542;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+    background: radial-gradient(900px 480px at 8% -10%, #1c2a3a, var(--bg));
+    color: var(--ink);
+    line-height: 1.45;
+    min-height: 100vh;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 2rem 1.5rem 3rem; }
+  h1 { font-size: 1.6rem; margin: 0 0 0.4rem; letter-spacing: -0.02em; }
+  .lede { color: var(--muted); margin: 0 0 1.5rem; }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 1rem 1.15rem;
+    margin-bottom: 1rem;
+  }
+  h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 0.75rem; font-weight: 600; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { border-top: 1px solid var(--line); }
+  li:first-child { border-top: 0; }
+  a {
+    display: block;
+    padding: 0.75rem 0.15rem;
+    color: var(--ink);
+    text-decoration: none;
+  }
+  a:hover { color: var(--accent); }
+  .title { font-weight: 600; }
+  .meta { display: block; color: var(--muted); font-size: 0.82rem; margin-top: 0.15rem; }
+  code { font-size: 0.85em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Foresight visuals</h1>
+  <p class="lede">All interactive diagrams live under <code>viz/</code>. New Archify runs also land here via the <code>.archify → viz</code> link.</p>
+
+  <section>
+    <h2>Whole process (Oct 19)</h2>
+    <ul>
+      <li>
+        <a href="workflow-experiments-claims-20261019-213209/experiments-claims.html">
+          <span class="title">Experiments and claims so far</span>
+          <span class="meta">Archify workflow · G0→G2 pass · throw/V2 · Stage · E0–E6 open</span>
+        </a>
+      </li>
+      <li>
+        <a href="architecture-frozen-smolvla-20261019-213209/frozen-smolvla.html">
+          <span class="title">Frozen SmolVLA + 4 numbers → action expert</span>
+          <span class="meta">Archify architecture · what is frozen · how the pack enters · train loop</span>
+        </a>
+      </li>
+      <li>
+        <a href="learn/from-scratch.html">
+          <span class="title">Inside attention, from scratch</span>
+          <span class="meta">16 steps · play, pause, reset · bars, mask, shares, ten small steps</span>
+        </a>
+      </li>
+      <li>
+        <a href="learn/twelve-numbers.html">
+          <span class="title">What the 12 numbers are</span>
+          <span class="meta">8 hand (XYZ + turn + grip) + 4 ball · named slots · play/pause</span>
+        </a>
+      </li>
+      <li>
+        <a href="learn/pipeline-rest.html">
+          <span class="title">The rest of the pipeline</span>
+          <span class="meta">H5, convert, freeze, checkpoint, load, scene step, score</span>
+        </a>
+      </li>
+      <li>
+        <a href="learn/pace-lab.html">
+          <span class="title">Pace Lab — poke the live pack</span>
+          <span class="meta">Insert / delete / zero / reset · Tangle story · B-zero · share link</span>
+        </a>
+      </li>
+      <li>
+        <a href="architecture-action-expert-20261019-222638/action-expert.html">
+          <span class="title">Inside the action expert, step by step</span>
+          <span class="meta">Click a block · noise, clock, even/odd layers, 10 steps, loss</span>
+        </a>
+      </li>
+      <li>
+        <a href="workflow-e2e-pipeline-20261019-213209/e2e-pipeline.html">
+          <span class="title">End-to-end pipeline</span>
+          <span class="meta">Click Expert SM, the 4 numbers, or Train / Infer for the inner page</span>
+        </a>
+      </li>
+      <li>
+        <a href="lifecycle-expert-stages-20261019-233950/expert-stages.html">
+          <span class="title">Expert teacher: throw to done</span>
+          <span class="meta">Click Intercept for one chase tick · misses retry, then go home</span>
+        </a>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>v2 speed drop (Oct 17)</h2>
+    <ul>
+      <li>
+        <a href="dashboard-v2-speed-drop-20261017-143755/v2-bottleneck-charts.html">
+          <span class="title">Bottleneck charts</span>
+          <span class="meta">Success vs speed · failure stacks · close distance</span>
+        </a>
+      </li>
+      <li>
+        <a href="workflow-v2-speed-drop-20261017-143755/v2-speed-drop.html">
+          <span class="title">Why 0 → 20 cm/s drops</span>
+          <span class="meta">Archify workflow · Still / Fast / Not-the-filter views</span>
+        </a>
+      </li>
+      <li>
+        <a href="lifecycle-v2-trial-funnel-20261017-143755/v2-trial-funnel.html">
+          <span class="title">Trial funnel</span>
+          <span class="meta">Archify lifecycle · where trials die after close</span>
+        </a>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Earlier</h2>
+    <ul>
+      <li>
+        <a href="lifecycle-expert-sm-20261015-185627/expert-sm.html">
+          <span class="title">Expert state machine</span>
+          <span class="meta">Archify lifecycle · Oct 15</span>
+        </a>
+      </li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

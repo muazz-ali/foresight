@@ -69,6 +69,22 @@ STAGE_SCHEMA = StageSchema(
 )
 
 
+
+def _yaw_about_z(q_down_wxyz: np.ndarray, heading: float) -> np.ndarray:
+    """Rotate the hand about world Z so the pad axis (hand local x = world x at yaw 0)
+    points along ``heading``. The gripper is symmetric, so use the smaller turn."""
+    psi = (heading + np.pi / 2) % np.pi - np.pi / 2  # wrap to [-90, 90) deg
+    h = 0.5 * psi
+    qz = np.array([np.cos(h), 0.0, 0.0, np.sin(h)])
+    w1, x1, y1, z1 = qz
+    w2, x2, y2, z2 = np.asarray(q_down_wxyz, dtype=np.float64)
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ])
+
 def _require(cfg: dict, *keys: str) -> Any:
     """Nested yaml lookup. Logs the missing path and raises KeyError.
 
@@ -137,6 +153,10 @@ class PickPlaceStateMachine:
         scene = cfg.get("scene") or {}
 
         self.dt = float(dt if dt is not None else sim_dt(cfg))
+        # E6 option (default off = old behaviour): "along" turns the hand about world Z
+        # so the finger pads line up with the object's motion during approach/close/lift.
+        self.grasp_yaw_mode = str(self._p.get("grasp_yaw_mode", "fixed"))
+        self._grasp_quat: np.ndarray | None = None
 
         # --- timings -----------------------------------------------------
         self.settle_s = self._f("settle_s")
@@ -264,6 +284,7 @@ class PickPlaceStateMachine:
 
     def reset(self) -> None:
         """Back to stage 0 and clear all per-episode memory (timers, retries, grasp stats)."""
+        self._grasp_quat = None
         self.stage = STAGE_RESET
         self.timer_s = 0.0  # time spent in the current stage
         self.retries = 0
@@ -512,6 +533,11 @@ class PickPlaceStateMachine:
         grip, kin, attach, freeze = 1.0, True, False, False
         target = ee.copy()  # default = stay put
         quat = self._down_quat.copy()
+        if self.grasp_yaw_mode == "along" and self.stage in (STAGE_APPROACH, STAGE_DESCEND, STAGE_CLOSE, STAGE_LIFT):
+            if self.stage in (STAGE_APPROACH, STAGE_DESCEND) and speed > 0.02:
+                self._grasp_quat = _yaw_about_z(self._down_quat, float(np.arctan2(vel[1], vel[0])))
+            if self._grasp_quat is not None:
+                quat = self._grasp_quat.copy()
 
         self.timer_s += self.dt
 

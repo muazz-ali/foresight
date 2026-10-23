@@ -58,6 +58,9 @@ class FakeScene:
     def get_gripper_open(self):
         return 1.0
 
+    def get_finger_gap_m(self):
+        return 0.08  # fully open
+
     def set_ee_target(self, pos, quat, grip):
         self.targets.append(np.asarray(pos, dtype=float).copy())
 

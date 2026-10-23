@@ -181,3 +181,121 @@ class BlobTracker:
         similar = (0.4 * self.ref_area, 2.5 * self.ref_area)
         hit = self._nearest(rgb, self.mode, uv_near, area_range=similar, inside=inside)
         return None if hit is None else hit[0]
+
+
+if __name__ == "__main__":
+    """Standalone smoke: one demo episode → overlays under perception/track_debug/.
+
+    Runs the real glue (StaticCamEstimator = BlobTracker → lift → Kalman), same
+    as eval ``--cond-source filter``. No Isaac.
+
+      python perception/track.py
+      python perception/track.py path/to/episode.h5
+    """
+    import json
+    import sys
+    from pathlib import Path
+
+    import h5py
+
+    root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root))
+    from interfaces.config import load_yaml
+    from perception.estimator import StaticCamEstimator
+
+    default = Path("/home/gpuadmin/Desktop/foresight/data/eval/p3_throw_n100/eval_model_v0.20_s9293_cond.h5")
+    if not default and len(sys.argv) < 2:
+        raise SystemExit("No demo .h5 under data/p3_throw; pass a path with static_cam_rgb")
+    #/home/gpuadmin/Desktop/foresight/data/eval/p3_throw_n100/eval_model_v0.20_s9293_cond.h5
+    h5_path = Path(sys.argv[1] if len(sys.argv) > 1 else default)
+    out_dir = Path(__file__).resolve().parent / "track_debug" / h5_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(h5_path, "r") as f:
+        rgb = np.asarray(f["static_cam_rgb"])  # (T,H,W,3) RGB uint8
+        oracle = np.asarray(f["oracle_state"], dtype=np.float64)
+        ts = np.asarray(f["timestamp"], dtype=np.float64).reshape(-1)
+        holding = (
+            np.asarray(f["holding"]).reshape(-1).astype(bool) if "holding" in f else None
+        )
+
+    import imageio.v3
+
+    cfg = load_yaml(root / "sim" / "phase0_cfg.yaml")
+    est = StaticCamEstimator.from_cfg(cfg)
+    start_ok = est.start(rgb[0], oracle[0, :3])
+    fps = int(cfg.get("static_camera", {}).get("fps", 25))
+
+    hits, rows, frames = 0, [], []
+    for t in range(len(rgb)):
+        if holding is not None and bool(holding[t]):
+            break  # free-object frames only (object not in the hand)
+        est.step(rgb[t], float(ts[t]))
+        uv = est.last_uv
+        uv_true = est.camera.project(oracle[t, :3])
+        frame = np.ascontiguousarray(rgb[t][..., :3]).copy()
+        # Green = sim truth pixel. Red ring = tracker blob (missing = lost).
+        cv2.circle(
+            frame,
+            (int(round(uv_true[0])), int(round(uv_true[1]))),
+            6,
+            (40, 220, 40),
+            2,
+        )
+        hit = uv is not None
+        hits += int(hit)
+        if hit:
+            cv2.circle(
+                frame,
+                (int(round(uv[0])), int(round(uv[1]))),
+                10,
+                (220, 40, 40),
+                2,
+            )
+            err_px = float(np.linalg.norm(uv - uv_true))
+        else:
+            err_px = float("nan")
+        label = f"t={t} mode={est.tracker.mode} hit={hit} err_px={err_px:.1f}"
+        cv2.putText(
+            frame, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
+        )
+        frames.append(frame)  # RGB — imageio writes H.264 (IDE-playable)
+        rows.append(
+            {
+                "t": t,
+                "hit": hit,
+                "err_px": err_px,
+                "uv": None if uv is None else [float(uv[0]), float(uv[1])],
+            }
+        )
+        # Keep a few stills: start, mid-ish, and the first miss (if any).
+        if t in (0, 10, 20) or (not hit and not any(not r["hit"] for r in rows[:-1])):
+            cv2.imwrite(
+                str(out_dir / f"frame_{t:04d}.png"),
+                cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+            )
+    # libx264 (not OpenCV mp4v) so Cursor / browsers can play it.
+    imageio.v3.imwrite(
+        str(out_dir / "overlay.mp4"),
+        frames,
+        fps=fps,
+        codec="libx264",
+        macro_block_size=1,
+    )
+
+    err = np.asarray([r["err_px"] for r in rows], dtype=np.float64)
+    summary = {
+        "episode": str(h5_path),
+        "out_dir": str(out_dir),
+        "start_ok": bool(start_ok),
+        "mode": est.tracker.mode,
+        "ref_area": None if est.tracker.ref_area is None else float(est.tracker.ref_area),
+        "n_free_frames": len(rows),
+        "track_rate": hits / max(len(rows), 1),
+        "median_err_px": float(np.nanmedian(err)) if len(rows) else None,
+        "n_redetects": int(est.n_redetects),
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps(summary, indent=2))
+
+

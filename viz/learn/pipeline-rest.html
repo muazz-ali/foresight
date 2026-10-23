@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>The rest of the pipeline</title>
+<style>
+  :root {
+    --bg: #0c1218; --panel: #141c26; --ink: #e7eef6; --muted: #93a4b8;
+    --line: #2a3a4c; --cyan: #5ec8e6; --gold: #e2b15a; --green: #7dcea0;
+    --rose: #e07a86; --violet: #b9a6e8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
+    background: radial-gradient(900px 420px at 10% -10%, #1a2c3d, var(--bg));
+    color: var(--ink); min-height: 100vh;
+  }
+  header, main, footer { width: min(1100px, calc(100% - 32px)); margin: 0 auto; }
+  header { padding: 22px 0 8px; }
+  h1 { font-size: 1.55rem; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .lede { color: var(--muted); margin: 0; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 14px 0; }
+  button {
+    background: #1c2836; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 999px; padding: 8px 14px; font: 600 14px/1 "Segoe UI", sans-serif; cursor: pointer;
+  }
+  button.primary { background: #164e63; border-color: #2a7d99; }
+  button[aria-pressed="true"] { background: #24506a; border-color: var(--cyan); }
+  .count { color: var(--muted); margin-left: auto; font-size: 14px; }
+  .rail { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 14px; }
+  .rail button { width: 28px; height: 28px; padding: 0; border-radius: 7px; font-size: 12px; }
+  .rail button.on { background: var(--cyan); color: #06202a; border-color: var(--cyan); }
+  main {
+    display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.15fr);
+    gap: 16px; align-items: start;
+  }
+  article, .stage {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+    padding: 16px 18px 18px;
+  }
+  h2 { margin: 0 0 10px; font-size: 1.2rem; }
+  p { margin: 0 0 10px; line-height: 1.45; }
+  .note { color: var(--muted); font-size: 0.92rem; }
+  .stage h3 { margin: 0 0 8px; font-size: 0.95rem; color: var(--gold); font-weight: 650; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .name { width: 140px; font-size: 13px; color: var(--muted); }
+  .track { flex: 1; height: 16px; background: #0d141c; border-radius: 8px; overflow: hidden; }
+  .fill { height: 100%; width: 0; border-radius: 8px; transition: width .4s ease; background: var(--cyan); }
+  .fill.gold { background: var(--gold); }
+  .fill.green { background: var(--green); }
+  .fill.rose { background: var(--rose); }
+  .fill.violet { background: var(--violet); }
+  .num { width: 64px; text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; }
+  .math {
+    font-family: ui-monospace, "Cascadia Code", monospace;
+    background: #0e1620; border-radius: 10px; padding: 10px 12px; font-size: 13px; line-height: 1.55;
+  }
+  .slots { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+  .slot { background: #0e1620; border: 1px solid var(--line); border-radius: 12px; padding: 10px; }
+  .slot strong { display: block; font-size: 13px; margin-bottom: 4px; }
+  footer { color: var(--muted); font-size: 13px; padding: 16px 0 28px; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } .count { margin-left: 0; width: 100%; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>The rest of the pipeline</h1>
+  <p class="lede">Deep pages for the end-to-end blocks that were still only labels: demos file, convert, freeze, checkpoint, load, scene step, and score.</p>
+  <div class="controls">
+    <button id="reset" type="button">Reset</button>
+    <button id="prev" type="button">Back</button>
+    <button id="play" class="primary" type="button" aria-pressed="false">Play</button>
+    <button id="pause" type="button">Pause</button>
+    <button id="next" type="button">Next</button>
+    <span class="count" id="count"></span>
+  </div>
+  <div class="rail" id="rail"></div>
+</header>
+<main>
+  <article>
+    <h2 id="title"></h2>
+    <div id="story"></div>
+  </article>
+  <section class="stage" aria-live="polite">
+    <h3 id="stage-title"></h3>
+    <div id="stage"></div>
+  </section>
+</main>
+<footer>
+  Expert SM, the 4 numbers, and the action expert have their own pages. This lesson fills the leftover end-to-end boxes so every pipeline block can open a new tab.
+</footer>
+<script>
+(function () {
+  var STEPS = [
+    { id: "h5", title: "H5 demos — what is in the file" },
+    { id: "convert", title: "Convert LeRobot" },
+    { id: "freeze", title: "Freeze the vision-language model" },
+    { id: "ckpt", title: "Checkpoint" },
+    { id: "load", title: "Load the policy" },
+    { id: "step", title: "Scene.step — apply the move" },
+    { id: "score", title: "Score by speed bin" }
+  ];
+  var step = 0, playing = false, timer = null, freezeOn = true, nTrials = 20;
+
+  function bar(label, value, max, cls, text) {
+    var pct = Math.max(0, Math.min(100, (value / max) * 100));
+    return '<div class="row"><span class="name">' + label + '</span><div class="track"><div class="fill ' + (cls||'') + '" data-w="' + pct + '" style="width:0%"></div></div><span class="num">' + text + '</span></div>';
+  }
+
+  function storyH5() {
+    return "<p>After a collect run, each episode is saved as an H5 demo file.</p><p>Inside, roughly:</p><p class='math'>cameras: static RGB + wrist RGB<br>8 hand numbers (place, turn, grip)<br>4 live ball numbers (future XY + speed XY)<br>oracle object state (for later noise rebuild)<br>actions the teacher commanded</p><p>The policy does not train on the raw H5 forever. Convert turns it into a LeRobot dataset first.</p>";
+  }
+  function storyConvert() {
+    return "<p><code>policy/convert_h5.py</code> reads those demos and writes a LeRobot dataset.</p><p>It keeps the feature layout from <code>policy/features.py</code>: 8 robot slots as state, 4 ball numbers on the side (conditioning), same image sizes.</p><p>If convert and train disagree on slot order, the model learns nonsense with no crash. That is why one file owns the names.</p>";
+  }
+  function storyFreeze() {
+    return "<p>Training turns two switches on:</p><p class='math'>freeze_vision_encoder = True<br>train_expert_only = True</p><p>Vision and language stay off. Only the action expert (and the small projectors) get AdamW updates.</p><p>That is on purpose. If success collapses when we zero the 4 ball numbers, we know the model was using the pack — not a frozen camera shortcut we “fixed” by unfreezing vision.</p>";
+  }
+  function storyCkpt() {
+    return "<p>When train finishes a run, weights land under something like:</p><p class='math'>runs/&lt;run_name&gt;/pretrained_model/</p><p>That folder is the checkpoint. Eval loads from there. It is not a new model type — it is the same SmolVLA shape with the trained expert.</p>";
+  }
+  function storyLoad() {
+    return "<p><code>scripts/eval_policy.py</code> loads that checkpoint with <code>from_pretrained</code>.</p><p>Then each tick builds the same 12-number state the train loop used (hand + pack), plus the two camera images, and asks for an action chunk.</p><p>Load does not run the expert state machine. Policy eval uses its own success labels (glued / lift / place), not expert stage names.</p>";
+  }
+  function storyStep() {
+    return "<p>Scene.step is the sim tick after the policy (or the teacher) picks a hand target.</p><p class='math'>set hand target → write to sim → physics step → read cameras / poses</p><p>During collect, the teacher fills those targets. During eval, the policy chunk does. Same scene. Different who is driving.</p>";
+  }
+  function storyScore() {
+    return "<p>We score success by object speed bin (for example 0, 10, 15, 20 cm/s).</p><p><b>n = 20</b> per bin is a scout. It can hint. It cannot pass or fail a gate.</p><p><b>n ≥ 80</b> per bin is what you need to claim. Print Wilson intervals with the rates.</p><p>Policy runs report glued / lift / place style labels. Do not paste expert tags like early-close onto a policy eval.</p>";
+  }
+  var STORIES = [storyH5, storyConvert, storyFreeze, storyCkpt, storyLoad, storyStep, storyScore];
+
+  function stageFor() {
+    var id = STEPS[step].id;
+    if (id === "h5") {
+      return "<div class='slots'>" +
+        ["static cam","wrist cam","8 hand","4 ball","oracle","actions"].map(function (t) {
+          return "<div class='slot'><strong>" + t + "</strong><p class='note'>saved per frame / episode</p></div>";
+        }).join("") + "</div>";
+    }
+    if (id === "convert") {
+      return bar("H5 episodes", 80, 100, "gold", "in") +
+        bar("LeRobot frames", 95, 100, "green", "out") +
+        "<p class='note'>Same slot names before and after. Convert must not reorder them.</p>";
+    }
+    if (id === "freeze") {
+      return bar("Vision encoder", freezeOn ? 0 : 80, 100, freezeOn ? "rose" : "green", freezeOn ? "frozen" : "training") +
+        bar("Language tower", freezeOn ? 0 : 80, 100, freezeOn ? "rose" : "green", freezeOn ? "frozen" : "training") +
+        bar("Action expert", 90, 100, "cyan", "trains") +
+        "<div class='controls'><button type='button' id='tog-freeze'>" + (freezeOn ? "Show bad: unfreeze vision" : "Restore freeze") + "</button></div>";
+    }
+    if (id === "ckpt") {
+      return "<p class='math'>runs/<br>&nbsp;&nbsp;my_run/<br>&nbsp;&nbsp;&nbsp;&nbsp;pretrained_model/<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;config.json<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;model.safetensors</p>" +
+        bar("expert weights", 100, 100, "violet", "saved");
+    }
+    if (id === "load") {
+      return bar("read checkpoint", 100, 100, "gold", "ok") +
+        bar("build 12-D state", 100, 100, "cyan", "ok") +
+        bar("predict chunk", 100, 100, "green", "ok") +
+        "<p class='note'>No expert stages here. Policy labels only.</p>";
+    }
+    if (id === "step") {
+      return "<div class='slots'>" +
+        ["1. set target","2. write sim","3. physics","4. read sensors"].map(function (t,i) {
+          return "<div class='slot'><strong>Tick " + (i+1) + "</strong><p class='note'>" + t + "</p></div>";
+        }).join("") + "</div>";
+    }
+    if (id === "score") {
+      var claim = nTrials >= 80;
+      return bar("trials / bin", nTrials, 100, claim ? "green" : "gold", String(nTrials)) +
+        "<p class='note'>" + (claim ? "n≥80: strong enough to claim with Wilson intervals." : "n=20: scout only. Do not pass/fail a gate.") + "</p>" +
+        "<div class='controls'><button type='button' id='n20'>Scout n=20</button><button type='button' id='n80'>Claim n=80</button></div>";
+    }
+    return "";
+  }
+
+  function render() {
+    document.getElementById("title").textContent = STEPS[step].title;
+    document.getElementById("stage-title").textContent = "Picture · " + STEPS[step].title;
+    document.getElementById("story").innerHTML = STORIES[step]();
+    document.getElementById("stage").innerHTML = stageFor();
+    document.getElementById("count").textContent = "Step " + (step + 1) + " of " + STEPS.length;
+    document.getElementById("play").setAttribute("aria-pressed", playing ? "true" : "false");
+    document.getElementById("play").textContent = playing ? "Playing" : "Play";
+    document.getElementById("rail").innerHTML = STEPS.map(function (s, i) {
+      return "<button type='button' data-step='" + i + "' class='" + (i === step ? "on" : "") + "' title='" + s.title + "'>" + (i + 1) + "</button>";
+    }).join("");
+    requestAnimationFrame(function () {
+      document.querySelectorAll("#stage .fill").forEach(function (el) {
+        el.style.width = el.getAttribute("data-w") + "%";
+      });
+    });
+  }
+  function go(n) {
+    step = Math.max(0, Math.min(STEPS.length - 1, n));
+    history.replaceState(null, "", "#" + STEPS[step].id);
+    render();
+  }
+  function stopPlay() { playing = false; if (timer) clearInterval(timer); timer = null; }
+  function startPlay() {
+    if (playing) return;
+    playing = true; render();
+    timer = setInterval(function () {
+      if (step >= STEPS.length - 1) { stopPlay(); render(); return; }
+      go(step + 1);
+    }, 4200);
+  }
+  document.getElementById("next").onclick = function () { stopPlay(); go(step + 1); };
+  document.getElementById("prev").onclick = function () { stopPlay(); go(step - 1); };
+  document.getElementById("play").onclick = startPlay;
+  document.getElementById("pause").onclick = function () { stopPlay(); render(); };
+  document.getElementById("reset").onclick = function () { stopPlay(); freezeOn = true; nTrials = 20; go(0); };
+  document.getElementById("rail").onclick = function (ev) {
+    var b = ev.target.closest("[data-step]"); if (!b) return; stopPlay(); go(Number(b.getAttribute("data-step")));
+  };
+  document.getElementById("stage").onclick = function (ev) {
+    if (ev.target.id === "tog-freeze") { freezeOn = !freezeOn; render(); }
+    if (ev.target.id === "n20") { nTrials = 20; render(); }
+    if (ev.target.id === "n80") { nTrials = 80; render(); }
+  };
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "ArrowRight") { stopPlay(); go(step + 1); }
+    if (ev.key === "ArrowLeft") { stopPlay(); go(step - 1); }
+    if (ev.key === " ") { ev.preventDefault(); if (playing) { stopPlay(); render(); } else startPlay(); }
+  });
+  var hash = (location.hash || "").replace("#", "");
+  var startAt = STEPS.findIndex(function (s) { return s.id === hash; });
+  go(startAt < 0 ? 0 : startAt);
+})();
+</script>
+</body>
+</html>

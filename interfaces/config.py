@@ -82,6 +82,7 @@ def policy_aug_defaults(
         "delta_max": delta,
         "pos_noise_std": float(pol.get("pos_noise_std", 0.015)),
         "vel_noise_std": float(pol.get("vel_noise_std", 0.03)),
+        "ee_noise_std": float(pol.get("ee_noise_std", 0.0)),
     }
 
 

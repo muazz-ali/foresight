@@ -291,6 +291,7 @@ class Phase0Scene:
         object_usd: Path | str | None = None,
         container_usd: Path | str | None = None,
         asset_seed: int = 40,
+        distractor_usd: Path | str | None = None,
     ):
         """Build everything once: arm, table, object, box, cameras, IK.
 
@@ -494,6 +495,25 @@ class Phase0Scene:
 
         if not self._weld:
             bind_grip_material("/World/Object", float(_require(cfg, "scene", "object_friction")))
+
+        # E3 option: a second, static object on the table (a distractor for language tests).
+        # Kinematic and never grasp-tracked; logged in meta only. Off unless a USD is given.
+        self.distractor: RigidObject | None = None
+        self._distractor_usd: Path | None = Path(distractor_usd) if distractor_usd else None
+        self._distractor_half_height = 0.0
+        if self._distractor_usd is not None:
+            dsize = usd_bbox_size(self._distractor_usd)
+            self._distractor_half_height = half_height_from_size(dsize)
+            self.distractor = self._make_rigid(
+                prim_path="/World/Distractor",
+                usd_path=self._distractor_usd,
+                pos=np.array([0.50, 0.30, self._table_z + self._distractor_half_height]),
+                lin_vel=np.zeros(3),
+                mass=float(_require(cfg, "scene", "object_mass")),
+                kinematic=True,
+                primitive_sphere=False,
+            )
+        self._distractor_pos: np.ndarray | None = None
 
         self.container: RigidObject | None = None
         self._container_usd: Path | None = None
@@ -1079,6 +1099,14 @@ class Phase0Scene:
             self.container.write_root_state_to_sim(croot)
             self.container.write_data_to_sim()
 
+        if self.distractor is not None:
+            self._distractor_pos = self._place_distractor(pos, rng)
+            droot = torch.zeros((1, 13), device=self.robot.device, dtype=torch.float32)
+            droot[0, 0:3] = torch.tensor(self._distractor_pos, device=self.robot.device)
+            droot[0, 3:7] = torch.tensor(quat, device=self.robot.device)
+            self.distractor.write_root_state_to_sim(droot)
+            self.distractor.write_data_to_sim()
+
         self.robot.write_data_to_sim()
 
         # A few idle control steps so everything settles before the episode starts.
@@ -1120,6 +1148,9 @@ class Phase0Scene:
             "container_category": (
                 self._container_usd.parent.name if self._container_usd else None
             ),
+            "distractor_usd": str(self._distractor_usd) if self._distractor_usd else None,
+            "distractor_category": self._distractor_usd.parent.name if self._distractor_usd else None,
+            "distractor_pos": None if self._distractor_pos is None else self._distractor_pos.tolist(),
             "container_half_height": float(self._container_half_height),
             "container_pos": self._container_pos.tolist(),
             "carry_pose": self.get_carry_pose().tolist(),
@@ -1136,6 +1167,25 @@ class Phase0Scene:
             **(self._house_meta if self._use_house else {}),
         }
         return dict(self._meta)
+
+    def _place_distractor(self, target_pos: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        """Static distractor 12-16 cm from the target's start, inside the play bounds and
+        clear of the container. Tries side-by-side positions first (same distance to the arm)."""
+        (xmin, xmax), (ymin, ymax) = self._xy_bounds
+        pad = self._spawn_xy_pad
+        z = self._table_z + self._distractor_half_height
+        r = float(rng.uniform(0.12, 0.16))
+        sign = 1.0 if rng.random() < 0.5 else -1.0
+        cands = [(0.0, sign * r), (0.0, -sign * r), (r, 0.0), (-r, 0.0)]
+        for dx, dy in cands:
+            x, y = float(target_pos[0] + dx), float(target_pos[1] + dy)
+            if not (xmin + pad <= x <= xmax - pad and ymin + pad <= y <= ymax - pad):
+                continue
+            if self.container is not None and np.linalg.norm(np.array([x, y]) - self._container_pos[:2]) < 0.15:
+                continue
+            return np.array([x, y, z], dtype=np.float64)
+        dx, dy = cands[0]
+        return np.array([float(target_pos[0] + dx), float(target_pos[1] + dy), z], dtype=np.float64)
 
     def get_ee_pose(self) -> tuple[np.ndarray, np.ndarray]:
         """Where the fingertip point (TCP) is in the world: (position, quaternion wxyz)."""

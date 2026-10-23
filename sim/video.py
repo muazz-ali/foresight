@@ -122,6 +122,23 @@ def _state_lines(episode: dict[str, Any], t: int) -> list[str]:
     return lines
 
 
+def _policy_input_lines(episode: dict[str, Any], t: int) -> list[str]:
+    """What the policy was fed at step ``t`` (eval logs): text, 4 numbers, gripper."""
+    lines = list(episode.get("overlay_info") or [])
+    if "conditioning" in episode and len(episode["conditioning"]) > t:
+        c = np.asarray(episode["conditioning"][t], dtype=np.float64)
+        lines.append(
+            f"Fed p-hat mm: {1000 * c[0]:.0f} {1000 * c[1]:.0f}   v-hat cm/s: {100 * c[2]:.1f} {100 * c[3]:.1f}"
+        )
+    if "gripper" in episode and len(episode["gripper"]) > t:
+        cmd = "OPEN" if float(episode["gripper"][t]) > 0.5 else "CLOSE"
+        gap = ""
+        if "finger_gap" in episode and len(episode["finger_gap"]) > t:
+            gap = f"   finger gap {1000 * float(episode['finger_gap'][t]):.0f} mm"
+        lines.append(f"Gripper cmd: {cmd}{gap}")
+    return lines
+
+
 def _gate_lines(
     episode: dict[str, Any], t: int, gates: dict[str, float]
 ) -> list[str]:
@@ -157,7 +174,7 @@ def _overlay_text(
     anchor: str,
     color: tuple[int, int, int] = _YELLOW_BGR,
 ) -> np.ndarray:
-    """Draw text on a dark box. ``anchor`` is 'top' (top-right) or 'top_left'."""
+    """Draw text on a dark box. ``anchor``: 'top' (top-right), 'top_left' or 'bottom_left'."""
     if not lines:
         return frame
     import cv2
@@ -171,19 +188,19 @@ def _overlay_text(
     line_gap = margin
     block_h = sum(th for _, th in sizes) + line_gap * (len(lines) - 1) + 2 * pad
 
-    if anchor == "top_left":
+    if anchor in ("top_left", "bottom_left"):
         x0 = margin - pad
     else:
         x0 = max(0, img_w - max_tw - margin - pad)
-    y0 = max(0, margin - pad)
+    y0 = max(0, margin - pad) if anchor != "bottom_left" else max(0, img_h - block_h - margin)
     x1 = min(img_w, x0 + max_tw + 2 * pad)
     y1 = min(img_h, y0 + block_h)
     # Dark underlay so cyan text stays readable on bright house walls.
     cv2.rectangle(out, (x0, y0), (x1, y1), (0, 0, 0), thickness=-1)
 
-    y = margin
+    y = y0 + pad
     for line, (tw, th) in zip(lines, sizes):
-        x = margin if anchor == "top_left" else max(margin, img_w - tw - margin)
+        x = margin if anchor in ("top_left", "bottom_left") else max(margin, img_w - tw - margin)
         cv2.putText(out, line, (x, y + th), font, scale, color, thickness, cv2.LINE_AA)
         y += th + line_gap
     return out
@@ -233,6 +250,7 @@ def stitch_episode_frames(
             frame = _overlay_text(
                 frame, _gate_lines(episode, t, gate_vals), anchor="top_left", color=_YELLOW_BGR
             )
+            frame = _overlay_text(frame, _policy_input_lines(episode, t), anchor="bottom_left")
         frames.append(frame)
     return frames
 

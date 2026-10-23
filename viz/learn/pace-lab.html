@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pace Lab — edit the live pack</title>
+<style>
+  :root {
+    --bg: #0c1218;
+    --panel: #141c26;
+    --ink: #e7eef6;
+    --muted: #93a4b8;
+    --line: #2a3a4c;
+    --cyan: #5ec8e6;
+    --gold: #e2b15a;
+    --green: #7dcea0;
+    --rose: #e07a86;
+    --violet: #b9a6e8;
+    --amber: #f0b45a;
+    --hand: #f0a46a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
+    background: radial-gradient(1000px 480px at 12% -12%, #1a2c3d, var(--bg));
+    color: var(--ink);
+    min-height: 100vh;
+  }
+  header, .wrap, footer { width: min(1180px, calc(100% - 28px)); margin: 0 auto; }
+  header { padding: 20px 0 6px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .lede { color: var(--muted); margin: 0 0 10px; max-width: 70ch; }
+  .credit {
+    font-size: 12px; color: var(--muted); margin: 0 0 12px;
+    border-left: 3px solid var(--line); padding-left: 10px;
+  }
+  .credit a { color: var(--cyan); }
+  .toolbar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    margin: 10px 0 14px;
+  }
+  button, select {
+    background: #1c2836; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 999px; padding: 8px 14px; font: 600 13px/1 "Segoe UI", sans-serif;
+    cursor: pointer;
+  }
+  button.primary { background: #164e63; border-color: #2a7d99; }
+  button.danger { background: #3a1f28; border-color: #7a3a4a; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button:focus-visible, select:focus-visible, input:focus-visible {
+    outline: 2px solid var(--cyan); outline-offset: 2px;
+  }
+  .status { color: var(--muted); font-size: 13px; margin-left: auto; }
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(300px, 1.05fr) minmax(320px, 1fr);
+    gap: 14px; align-items: start;
+  }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 16px; padding: 14px 16px 16px;
+  }
+  .panel h2 { margin: 0 0 8px; font-size: 1.05rem; }
+  .panel h3 {
+    margin: 14px 0 8px; font-size: 0.78rem; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--muted); font-weight: 650;
+  }
+  .story { line-height: 1.5; margin: 0 0 10px; }
+  .story .edit {
+    display: inline-block; min-width: 3.2em; padding: 1px 6px;
+    border-radius: 6px; background: rgba(240,180,90,.16);
+    color: var(--amber); border: 1px dashed rgba(240,180,90,.45);
+    font-variant-numeric: tabular-nums; font-weight: 650;
+    cursor: ew-resize; user-select: none; touch-action: none;
+  }
+  .story .edit:focus { outline: 2px solid var(--gold); background: rgba(240,180,90,.28); }
+  .story .live {
+    color: var(--green); font-weight: 650; font-variant-numeric: tabular-nums;
+  }
+  .story .miss { color: var(--rose); font-weight: 650; }
+  .note { color: var(--muted); font-size: 0.92rem; margin: 0; }
+  .slots { display: flex; flex-direction: column; gap: 8px; }
+  .slot {
+    display: grid;
+    grid-template-columns: 28px 1fr auto auto;
+    gap: 8px; align-items: center;
+    background: #0e1620; border: 1px solid var(--line);
+    border-radius: 12px; padding: 8px 10px;
+  }
+  .slot.zeroed { border-color: #5a2a34; background: #1a1014; }
+  .slot .idx {
+    width: 28px; height: 28px; border-radius: 8px;
+    display: grid; place-items: center; font-size: 12px; font-weight: 700;
+    background: #1c2836; color: var(--gold);
+  }
+  .slot .meta { min-width: 0; }
+  .slot .name { font-weight: 650; font-size: 13px; }
+  .slot .plain { color: var(--muted); font-size: 12px; }
+  .slot input[type="range"] { width: 120px; accent-color: var(--cyan); }
+  .slot .val {
+    width: 72px; text-align: right; font-variant-numeric: tabular-nums;
+    background: #0a1016; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 8px; font: 600 13px/1 ui-monospace, monospace;
+  }
+  .slot-actions { display: flex; gap: 4px; grid-column: 1 / -1; justify-content: flex-end; }
+  .slot-actions button {
+    padding: 5px 10px; font-size: 12px; border-radius: 8px;
+  }
+  .insert-row {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px;
+  }
+  .insert-row select { flex: 1; min-width: 180px; border-radius: 10px; }
+  .diagram { width: 100%; height: auto; display: block; }
+  .node {
+    fill: #0e1620; stroke: var(--line); stroke-width: 1.5;
+  }
+  .node.on { stroke: var(--cyan); }
+  .node.warn { stroke: var(--rose); }
+  .node text { fill: var(--ink); font: 650 12px "Segoe UI", sans-serif; }
+  .edge { stroke: #3a4c60; stroke-width: 2; fill: none; }
+  .edge.on { stroke: var(--cyan); }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+  .chip {
+    border-radius: 7px; padding: 5px 8px; font-size: 11px; font-weight: 650;
+    border: 1px solid var(--line); background: rgba(94,200,230,.12); color: #b7e7f7;
+  }
+  .chip.off { opacity: 0.35; text-decoration: line-through; }
+  .chip.delta { background: rgba(185,166,232,.16); color: #d5c8f5; }
+  .toy {
+    margin-top: 10px; background: #0e1620; border: 1px solid var(--line);
+    border-radius: 12px; padding: 10px;
+  }
+  .toy svg { width: 100%; height: 180px; display: block; }
+  .meter {
+    height: 10px; border-radius: 999px; background: #0a1016; overflow: hidden; margin-top: 6px;
+  }
+  .meter > i {
+    display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--rose), var(--gold), var(--green));
+    transition: width .25s ease;
+  }
+  .history {
+    max-height: 120px; overflow: auto; font-size: 12px; color: var(--muted);
+    font-family: ui-monospace, monospace; line-height: 1.45;
+  }
+  footer { color: var(--muted); font-size: 13px; padding: 16px 0 28px; }
+  @media (max-width: 860px) {
+    .layout { grid-template-columns: 1fr; }
+    .status { margin-left: 0; width: 100%; }
+    .slot { grid-template-columns: 28px 1fr; }
+    .slot input[type="range"], .slot .val { width: 100%; grid-column: 1 / -1; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pace Lab — poke the live pack</h1>
+  <p class="lede">
+    Archify diagrams are great to <em>look</em> at. This page is for learning at your pace:
+    insert a number, delete one, zero them, or reset. The story and the little chase picture update live.
+  </p>
+  <p class="credit">
+    Idea stolen + stretched from
+    <a href="https://github.com/MisterBrookT/vividoc" target="_blank" rel="noopener">ViviDoc SRTC</a>
+    (State · Render · Transition · Constraint) and
+    <a href="https://github.com/curvenote/components" target="_blank" rel="noopener">Curvenote / Tangle</a>
+    (numbers you edit inside the sentence). Later this can ship as its own GitHub toy.
+  </p>
+  <div class="toolbar">
+    <button type="button" id="btn-reset" class="primary">Reset</button>
+    <button type="button" id="btn-undo">Undo</button>
+    <button type="button" id="btn-zero" class="danger">Zero all (B-zero)</button>
+    <button type="button" id="btn-share">Copy share link</button>
+    <label>
+      <span class="visually-hidden">Preset</span>
+      <select id="preset" aria-label="Preset">
+        <option value="live5">Live pack (5)</option>
+        <option value="four">Four numbers (no Δ)</option>
+        <option value="delta-only">Δ only</option>
+        <option value="empty">Empty pack</option>
+        <option value="noisy">Noisy ball</option>
+      </select>
+    </label>
+    <span class="status" id="status"></span>
+  </div>
+</header>
+
+<div class="wrap layout">
+  <section class="panel" aria-labelledby="story-h">
+    <h2 id="story-h">Live story</h2>
+    <p class="story" id="story"></p>
+    <p class="note">Amber numbers are yours — drag left/right to scrub, click to type, ↑/↓ to nudge. Green is computed. Red means a slot is missing.</p>
+
+    <h3>Pipeline</h3>
+    <svg class="diagram" viewBox="0 0 520 150" role="img" aria-label="Filter to pack to policy">
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="#3a4c60"></path>
+        </marker>
+        <marker id="arrow-on" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="#5ec8e6"></path>
+        </marker>
+      </defs>
+      <g id="edge-filter" class="edge">
+        <path d="M120 75 H190" marker-end="url(#arrow)"></path>
+      </g>
+      <g id="edge-pack" class="edge">
+        <path d="M310 75 H380" marker-end="url(#arrow)"></path>
+      </g>
+      <g id="n-filter" class="node">
+        <rect x="20" y="40" width="100" height="70" rx="12"></rect>
+        <text x="70" y="72" text-anchor="middle">Filter</text>
+        <text x="70" y="92" text-anchor="middle" style="font-size:10px;fill:#93a4b8">where / when</text>
+      </g>
+      <g id="n-pack" class="node">
+        <rect x="190" y="40" width="120" height="70" rx="12"></rect>
+        <text x="250" y="72" text-anchor="middle">Live pack</text>
+        <text id="pack-count" x="250" y="92" text-anchor="middle" style="font-size:10px;fill:#93a4b8">0 slots</text>
+      </g>
+      <g id="n-policy" class="node">
+        <rect x="380" y="40" width="120" height="70" rx="12"></rect>
+        <text x="440" y="72" text-anchor="middle">Policy</text>
+        <text x="440" y="92" text-anchor="middle" style="font-size:10px;fill:#93a4b8">what / how</text>
+      </g>
+    </svg>
+    <div class="chip-row" id="chips"></div>
+
+    <div class="toy">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline;">
+        <strong style="font-size:13px;color:var(--gold)">Toy chase</strong>
+        <span class="note" id="toy-label">hand aims at predicted ball</span>
+      </div>
+      <svg id="toy" viewBox="0 0 400 180" aria-hidden="true"></svg>
+      <div class="note">Usefulness of this pack (toy score, not a real gate)</div>
+      <div class="meter" aria-hidden="true"><i id="meter"></i></div>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="slots-h">
+    <h2 id="slots-h">Your slots</h2>
+    <p class="note">Insert what you want to study. Delete what you do not need. Reset brings the default live pack back.</p>
+    <div class="slots" id="slots"></div>
+    <div class="insert-row">
+      <select id="catalog" aria-label="Slot to insert"></select>
+      <button type="button" id="btn-insert" class="primary">Insert</button>
+    </div>
+    <h3>What just happened</h3>
+    <div class="history" id="history" aria-live="polite"></div>
+  </section>
+</div>
+
+<footer>
+  Pattern: <strong>State</strong> = the slot list ·
+  <strong>Render</strong> = story + diagram + toy ·
+  <strong>Transition</strong> = insert / delete / edit / zero / reset / preset ·
+  <strong>Constraint</strong> = unique keys, max 8 slots, Δ in seconds 0–1.
+  This sits under <code>viz/learn/</code> for experiments. Archify stays for checked diagrams; Pace Lab is the editable teacher layer.
+</footer>
+
+<script>
+(function () {
+  /**
+   * Pace Lab — SRTC mini-runtime (inspired by ViviDoc + Curvenote/Tangle).
+   * State -> Transition (with Constraint) -> Render. No build step.
+   */
+
+  var CATALOG = {
+    p_hat_x: { plain: "Ball will be X", unit: "m", min: -0.6, max: 0.8, step: 0.01, def: 0.51, kind: "place" },
+    p_hat_y: { plain: "Ball will be Y", unit: "m", min: -0.5, max: 0.5, step: 0.01, def: -0.08, kind: "place" },
+    v_hat_x: { plain: "Ball speed X", unit: "m/s", min: -0.4, max: 0.4, step: 0.01, def: 0.15, kind: "speed" },
+    v_hat_y: { plain: "Ball speed Y", unit: "m/s", min: -0.4, max: 0.4, step: 0.01, def: -0.02, kind: "speed" },
+    delta:   { plain: "Look-ahead Δ", unit: "s", min: 0, max: 1, step: 0.01, def: 0.25, kind: "delta" },
+    noise:   { plain: "Extra noise (toy)", unit: "m", min: 0, max: 0.2, step: 0.005, def: 0.03, kind: "toy" },
+    hand_x:  { plain: "Hand X (toy)", unit: "m", min: -0.2, max: 0.8, step: 0.01, def: 0.35, kind: "hand" },
+    hand_y:  { plain: "Hand Y (toy)", unit: "m", min: -0.4, max: 0.4, step: 0.01, def: 0.05, kind: "hand" }
+  };
+
+  var MAX_SLOTS = 8;
+  var NOW = { x: 0.47, y: -0.07 }; // current ball (toy GT)
+
+  var PRESETS = {
+    live5: ["p_hat_x", "p_hat_y", "v_hat_x", "v_hat_y", "delta"],
+    four: ["p_hat_x", "p_hat_y", "v_hat_x", "v_hat_y"],
+    "delta-only": ["delta"],
+    empty: [],
+    noisy: ["p_hat_x", "p_hat_y", "v_hat_x", "v_hat_y", "delta", "noise"]
+  };
+
+  var state = {
+    slots: [],
+    seed: 1
+  };
+  var undo = [];
+  var log = [];
+
+  function cloneSlots(slots) {
+    return slots.map(function (s) {
+      return { key: s.key, value: s.value };
+    });
+  }
+
+  function pushUndo() {
+    undo.push(cloneSlots(state.slots));
+    if (undo.length > 40) undo.shift();
+  }
+
+  function logEvent(msg) {
+    var t = new Date().toLocaleTimeString();
+    log.unshift(t + "  " + msg);
+    if (log.length > 24) log.pop();
+  }
+
+  function hasKey(key) {
+    return state.slots.some(function (s) { return s.key === key; });
+  }
+
+  function get(key, fallback) {
+    for (var i = 0; i < state.slots.length; i++) {
+      if (state.slots[i].key === key) return state.slots[i].value;
+    }
+    return fallback;
+  }
+
+  function constraintInsert(key) {
+    if (!CATALOG[key]) return "Unknown slot.";
+    if (hasKey(key)) return "That slot is already in the pack.";
+    if (state.slots.length >= MAX_SLOTS) return "Max " + MAX_SLOTS + " slots (Constraint).";
+    return null;
+  }
+
+  function clampValue(key, v) {
+    var c = CATALOG[key];
+    if (!c) return 0;
+    if (!isFinite(v)) v = c.def;
+    return Math.max(c.min, Math.min(c.max, v));
+  }
+
+  function makeSlots(keys, values) {
+    return keys.map(function (key) {
+      var v = values && values[key] != null ? values[key] : CATALOG[key].def;
+      return { key: key, value: clampValue(key, v) };
+    });
+  }
+
+  // --- Transitions ---
+  function transition(type, payload) {
+    var err = null;
+    if (type !== "undo" && type !== "load") pushUndo();
+
+    if (type === "reset") {
+      state.slots = makeSlots(PRESETS.live5);
+      document.getElementById("preset").value = "live5";
+      logEvent("reset → live pack (5)");
+    } else if (type === "preset") {
+      var keys = PRESETS[payload] || PRESETS.live5;
+      var vals = null;
+      if (payload === "noisy") {
+        vals = { p_hat_x: 0.55, p_hat_y: -0.12, v_hat_x: 0.22, v_hat_y: -0.05, delta: 0.25, noise: 0.06 };
+      }
+      state.slots = makeSlots(keys, vals);
+      logEvent("preset → " + payload);
+    } else if (type === "insert") {
+      err = constraintInsert(payload);
+      if (!err) {
+        state.slots.push({ key: payload, value: CATALOG[payload].def });
+        logEvent("insert " + payload);
+      }
+    } else if (type === "delete") {
+      var before = state.slots.length;
+      state.slots = state.slots.filter(function (s) { return s.key !== payload; });
+      if (state.slots.length === before) err = "Slot not found.";
+      else logEvent("delete " + payload);
+    } else if (type === "edit") {
+      state.slots.forEach(function (s) {
+        if (s.key === payload.key) s.value = clampValue(s.key, payload.value);
+      });
+      logEvent("edit " + payload.key + " = " + fmt(payload.value));
+    } else if (type === "zero-all") {
+      state.slots.forEach(function (s) { s.value = 0; });
+      logEvent("zero all (B-zero style)");
+    } else if (type === "zero-one") {
+      state.slots.forEach(function (s) {
+        if (s.key === payload) s.value = 0;
+      });
+      logEvent("zero " + payload);
+    } else if (type === "undo") {
+      if (!undo.length) { err = "Nothing to undo."; }
+      else {
+        state.slots = undo.pop();
+        logEvent("undo");
+      }
+    } else if (type === "load") {
+      state.slots = makeSlots(payload.keys, payload.values);
+      logEvent("loaded from share link");
+    }
+
+    if (err) {
+      if (type !== "undo" && type !== "load") undo.pop(); // revert unused undo snapshot
+      setStatus(err, true);
+      return;
+    }
+    writeHash();
+    render();
+  }
+
+  function fmt(n) {
+    if (!isFinite(n)) return "?";
+    var a = Math.abs(n);
+    if (a >= 10) return n.toFixed(1);
+    if (a >= 1) return n.toFixed(2);
+    return n.toFixed(2);
+  }
+
+  function predicted() {
+    var px = get("p_hat_x", null);
+    var py = get("p_hat_y", null);
+    var vx = get("v_hat_x", 0);
+    var vy = get("v_hat_y", 0);
+    var d = get("delta", null);
+    var noise = get("noise", 0);
+    // If p_hat missing but delta+now exist, invent p_hat from coasting NOW.
+    var ax = px;
+    var ay = py;
+    if (ax == null && d != null) ax = NOW.x + vx * d;
+    if (ay == null && d != null) ay = NOW.y + vy * d;
+    if (ax == null) ax = NOW.x;
+    if (ay == null) ay = NOW.y;
+    // toy noise jiggle from seed + noise amp
+    ax += noise * Math.sin(state.seed * 12.9898);
+    ay += noise * Math.cos(state.seed * 78.233);
+    return { x: ax, y: ay, d: d, missingP: px == null || py == null, missingD: d == null };
+  }
+
+  function usefulness(pred) {
+    var hx = get("hand_x", 0.35);
+    var hy = get("hand_y", 0.05);
+    var dist = Math.hypot(pred.x - hx, pred.y - hy);
+    var score = Math.max(0, 1 - dist / 0.55);
+    if (!state.slots.length) score = 0;
+    if (pred.missingP && pred.missingD) score *= 0.35;
+    // B-zero: all zero → pack "present" but useless
+    var allZero = state.slots.length && state.slots.every(function (s) { return Math.abs(s.value) < 1e-9; });
+    if (allZero) score *= 0.08;
+    return { score: score, dist: dist, allZero: allZero };
+  }
+
+  function setStatus(msg, bad) {
+    var el = document.getElementById("status");
+    el.textContent = msg || "";
+    el.style.color = bad ? "var(--rose)" : "var(--muted)";
+  }
+
+  // --- Render ---
+  function renderStory(pred, use) {
+    var px = get("p_hat_x", null);
+    var py = get("p_hat_y", null);
+    var vx = get("v_hat_x", null);
+    var vy = get("v_hat_y", null);
+    var d = get("delta", null);
+    var n = state.slots.length;
+
+    function editSpan(key, val) {
+      if (val == null) return "<span class='miss'>missing " + key + "</span>";
+      return "<span class='edit' contenteditable='true' data-key='" + key + "' role='textbox' aria-label='" + key + "'>" + fmt(val) + "</span>";
+    }
+
+    var bits = [];
+    bits.push("The pack has <span class='live'>" + n + "</span> slot" + (n === 1 ? "" : "s") + ".");
+    bits.push(
+      "The filter says the ball will be near " +
+      editSpan("p_hat_x", px) + " m X and " +
+      editSpan("p_hat_y", py) + " m Y" +
+      (d == null
+        ? ", with <span class='miss'>no Δ</span> (so look-ahead is guessy)."
+        : ", looking <span class='edit' contenteditable='true' data-key='delta'>" + fmt(d) + "</span> s ahead.")
+    );
+    bits.push(
+      "Speed in the pack is " +
+      editSpan("v_hat_x", vx) + " / " +
+      editSpan("v_hat_y", vy) + " m/s."
+    );
+    bits.push(
+      "Toy aim lands about <span class='live'>" + fmt(use.dist) + "</span> m from the hand" +
+      (use.allZero
+        ? " — but every slot is zero, so the pack is a lie (this is the B-zero collapse idea)."
+        : ".")
+    );
+    if (!n) {
+      bits = ["The pack is empty. Insert a slot, or pick a preset. With no numbers, the policy has nothing future-shaped to hold onto."];
+    }
+    document.getElementById("story").innerHTML = "<p>" + bits.join("</p><p>") + "</p>";
+
+    document.getElementById("story").querySelectorAll(".edit").forEach(function (el) {
+      var key = el.getAttribute("data-key");
+      var cat = CATALOG[key];
+      if (!cat) return;
+
+      el.addEventListener("blur", function () {
+        var v = parseFloat(String(el.textContent).replace(/[^0-9eE.+-]/g, ""));
+        transition("edit", { key: key, value: v });
+      });
+      el.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") { ev.preventDefault(); el.blur(); }
+        if (ev.key === "ArrowUp" || ev.key === "ArrowDown") {
+          ev.preventDefault();
+          var cur = parseFloat(el.textContent) || 0;
+          transition("edit", {
+            key: key,
+            value: cur + (ev.key === "ArrowUp" ? cat.step : -cat.step)
+          });
+        }
+      });
+
+      // Tangle-style horizontal scrub (worrydream/Tangle TKAdjustableNumber)
+      var drag = null;
+      el.addEventListener("pointerdown", function (ev) {
+        if (ev.button !== 0) return;
+        drag = {
+          x0: ev.clientX,
+          v0: get(key, cat.def),
+          moved: false
+        };
+        el.setPointerCapture(ev.pointerId);
+      });
+      el.addEventListener("pointermove", function (ev) {
+        if (!drag || !el.hasPointerCapture(ev.pointerId)) return;
+        var dx = ev.clientX - drag.x0;
+        if (Math.abs(dx) < 3 && !drag.moved) return;
+        if (!drag.moved) {
+          drag.moved = true;
+          pushUndo();
+          el.contentEditable = "false";
+        }
+        var raw = drag.v0 + (dx / 5) * cat.step;
+        var snapped = Math.round(raw / cat.step) * cat.step;
+        var s = state.slots.find(function (x) { return x.key === key; });
+        if (s) s.value = clampValue(key, snapped);
+        el.textContent = fmt(s.value);
+        writeHash();
+        renderSoft({ skipStory: true });
+      });
+      el.addEventListener("pointerup", function (ev) {
+        if (!drag) return;
+        var moved = drag.moved;
+        drag = null;
+        try { el.releasePointerCapture(ev.pointerId); } catch (e) { /* already released */ }
+        el.contentEditable = "true";
+        if (moved) {
+          logEvent("scrub " + key + " = " + fmt(get(key, 0)));
+          render(); // full refresh so slots + story stay in sync
+        }
+      });
+    });
+  }
+
+  function renderSlots() {
+    var root = document.getElementById("slots");
+    if (!state.slots.length) {
+      root.innerHTML = "<p class='note'>No slots yet. Insert one below.</p>";
+      return;
+    }
+    root.innerHTML = state.slots.map(function (s, i) {
+      var c = CATALOG[s.key];
+      var zeroed = Math.abs(s.value) < 1e-9 ? " zeroed" : "";
+      return (
+        "<div class='slot" + zeroed + "' data-key='" + s.key + "'>" +
+          "<div class='idx'>" + (i + 1) + "</div>" +
+          "<div class='meta'><div class='name'>" + s.key + "</div>" +
+          "<div class='plain'>" + c.plain + " · " + c.unit + "</div></div>" +
+          "<input type='range' min='" + c.min + "' max='" + c.max + "' step='" + c.step + "' value='" + s.value + "' aria-label='" + s.key + " slider' />" +
+          "<input class='val' type='number' step='" + c.step + "' value='" + s.value + "' aria-label='" + s.key + " value' />" +
+          "<div class='slot-actions'>" +
+            "<button type='button' data-act='zero' data-key='" + s.key + "'>Zero</button>" +
+            "<button type='button' data-act='del' data-key='" + s.key + "'>Delete</button>" +
+          "</div>" +
+        "</div>"
+      );
+    }).join("");
+
+    root.querySelectorAll("input[type='range']").forEach(function (el) {
+      el.addEventListener("input", function () {
+        var key = el.closest(".slot").getAttribute("data-key");
+        // live preview without flooding undo: soft-edit then commit on change
+        var s = state.slots.find(function (x) { return x.key === key; });
+        if (s) s.value = clampValue(key, parseFloat(el.value));
+        var num = el.closest(".slot").querySelector("input.val");
+        if (num) num.value = s.value;
+        writeHash();
+        renderSoft({ skipStory: false });
+      });
+      el.addEventListener("change", function () {
+        var key = el.closest(".slot").getAttribute("data-key");
+        transition("edit", { key: key, value: parseFloat(el.value) });
+      });
+    });
+    root.querySelectorAll("input.val").forEach(function (el) {
+      el.addEventListener("change", function () {
+        var key = el.closest(".slot").getAttribute("data-key");
+        transition("edit", { key: key, value: parseFloat(el.value) });
+      });
+    });
+    root.querySelectorAll("button[data-act]").forEach(function (el) {
+      el.addEventListener("click", function () {
+        var key = el.getAttribute("data-key");
+        if (el.getAttribute("data-act") === "del") transition("delete", key);
+        else transition("zero-one", key);
+      });
+    });
+  }
+
+  function renderCatalog() {
+    var sel = document.getElementById("catalog");
+    var keys = Object.keys(CATALOG).filter(function (k) { return !hasKey(k); });
+    sel.innerHTML = keys.length
+      ? keys.map(function (k) {
+          return "<option value='" + k + "'>" + k + " — " + CATALOG[k].plain + "</option>";
+        }).join("")
+      : "<option value=''>All catalog slots are in use</option>";
+    document.getElementById("btn-insert").disabled = !keys.length;
+  }
+
+  function renderDiagram() {
+    var n = state.slots.length;
+    var pack = document.getElementById("n-pack");
+    var pol = document.getElementById("n-policy");
+    var e1 = document.getElementById("edge-filter");
+    var e2 = document.getElementById("edge-pack");
+    pack.classList.toggle("on", n > 0);
+    pack.classList.toggle("warn", n > 0 && state.slots.every(function (s) { return Math.abs(s.value) < 1e-9; }));
+    pol.classList.toggle("on", n > 0);
+    e1.classList.toggle("on", n > 0);
+    e2.classList.toggle("on", n > 0);
+    e1.querySelector("path").setAttribute("marker-end", n > 0 ? "url(#arrow-on)" : "url(#arrow)");
+    e2.querySelector("path").setAttribute("marker-end", n > 0 ? "url(#arrow-on)" : "url(#arrow)");
+    document.getElementById("pack-count").textContent = n + " slot" + (n === 1 ? "" : "s");
+
+    document.getElementById("chips").innerHTML = Object.keys(CATALOG).map(function (k) {
+      var on = hasKey(k);
+      var cls = "chip" + (on ? "" : " off") + (k === "delta" ? " delta" : "");
+      return "<span class='" + cls + "'>" + k + (on ? " " + fmt(get(k, 0)) : "") + "</span>";
+    }).join("");
+  }
+
+  function worldToSvg(x, y) {
+    // map meters-ish into viewBox
+    var sx = 60 + (x + 0.2) * 280;
+    var sy = 90 - y * 220;
+    return { x: sx, y: sy };
+  }
+
+  function renderToy(pred, use) {
+    var hx = get("hand_x", 0.35);
+    var hy = get("hand_y", 0.05);
+    var ballNow = worldToSvg(NOW.x, NOW.y);
+    var ballPred = worldToSvg(pred.x, pred.y);
+    var hand = worldToSvg(hx, hy);
+    var svg = document.getElementById("toy");
+    svg.innerHTML =
+      "<rect x='0' y='0' width='400' height='180' fill='#0a1016'></rect>" +
+      "<text x='12' y='18' fill='#93a4b8' font-size='11'>table top (toy)</text>" +
+      "<line x1='" + ballNow.x + "' y1='" + ballNow.y + "' x2='" + ballPred.x + "' y2='" + ballPred.y +
+        "' stroke='#5ec8e6' stroke-dasharray='4 3' stroke-width='2'></line>" +
+      "<circle cx='" + ballNow.x + "' cy='" + ballNow.y + "' r='8' fill='#5ec8e6' opacity='0.45'></circle>" +
+      "<circle cx='" + ballPred.x + "' cy='" + ballPred.y + "' r='9' fill='#5ec8e6'></circle>" +
+      "<rect x='" + (hand.x - 10) + "' y='" + (hand.y - 10) + "' width='20' height='20' rx='4' fill='#f0a46a'></rect>" +
+      "<line x1='" + hand.x + "' y1='" + hand.y + "' x2='" + ballPred.x + "' y2='" + ballPred.y +
+        "' stroke='#e2b15a' stroke-width='1.5' opacity='0.7'></line>" +
+      "<text x='" + ballPred.x + "' y='" + (ballPred.y - 14) + "' fill='#b7e7f7' font-size='11' text-anchor='middle'>aim</text>" +
+      "<text x='" + hand.x + "' y='" + (hand.y + 24) + "' fill='#ffd2a8' font-size='11' text-anchor='middle'>hand</text>";
+
+    document.getElementById("meter").style.width = Math.round(use.score * 100) + "%";
+    document.getElementById("toy-label").textContent = use.allZero
+      ? "B-zero: pack is all zeros — aim collapses"
+      : "hand aims at predicted ball · score " + Math.round(use.score * 100) + "%";
+  }
+
+  function renderHistory() {
+    document.getElementById("history").textContent = log.length ? log.join("\n") : "No edits yet.";
+  }
+
+  function renderSoft(opts) {
+    // during slider/scrub drag: update toy/diagram without rebuilding slot/story DOM
+    opts = opts || {};
+    var pred = predicted();
+    var use = usefulness(pred);
+    if (!opts.skipStory) renderStory(pred, use);
+    renderDiagram();
+    renderToy(pred, use);
+    setStatus(state.slots.length + " slots · undo " + undo.length, false);
+  }
+
+  function render() {
+    var pred = predicted();
+    var use = usefulness(pred);
+    renderSlots();
+    renderCatalog();
+    renderStory(pred, use);
+    renderDiagram();
+    renderToy(pred, use);
+    renderHistory();
+    document.getElementById("btn-undo").disabled = !undo.length;
+    setStatus(state.slots.length + " slots · undo " + undo.length, false);
+  }
+
+  // --- Share link (hash) ---
+  function writeHash() {
+    var payload = state.slots.map(function (s) {
+      return s.key + "=" + Number(s.value.toFixed(4));
+    }).join("&");
+    var next = payload ? "#" + payload : "#";
+    if (location.hash !== next) history.replaceState(null, "", next);
+  }
+
+  function readHash() {
+    var h = location.hash.replace(/^#/, "");
+    if (!h) return false;
+    var keys = [];
+    var values = {};
+    h.split("&").forEach(function (part) {
+      var kv = part.split("=");
+      if (!kv[0] || !CATALOG[kv[0]]) return;
+      keys.push(kv[0]);
+      values[kv[0]] = parseFloat(kv[1]);
+    });
+    if (!keys.length) return false;
+    transition("load", { keys: keys, values: values });
+    return true;
+  }
+
+  // --- Wire UI ---
+  document.getElementById("btn-reset").addEventListener("click", function () {
+    transition("reset");
+  });
+  document.getElementById("btn-undo").addEventListener("click", function () {
+    transition("undo");
+  });
+  document.getElementById("btn-zero").addEventListener("click", function () {
+    transition("zero-all");
+  });
+  document.getElementById("btn-insert").addEventListener("click", function () {
+    var key = document.getElementById("catalog").value;
+    if (key) transition("insert", key);
+  });
+  document.getElementById("preset").addEventListener("change", function (ev) {
+    transition("preset", ev.target.value);
+  });
+  document.getElementById("btn-share").addEventListener("click", function () {
+    writeHash();
+    var url = location.href;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(function () {
+        setStatus("Share link copied.", false);
+      }).catch(function () {
+        setStatus(url, false);
+      });
+    } else {
+      setStatus(url, false);
+    }
+  });
+
+  if (!readHash()) transition("reset");
+})();
+</script>
+</body>
+</html>

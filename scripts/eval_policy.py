@@ -134,6 +134,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="conditioning look-ahead (s); default = state_machine_params.conditioning_delta_s",
     )
     p.add_argument("--trials-per-speed", type=int, default=G1_TRIALS)
+    p.add_argument("--episode-seeds", type=int, nargs="+", default=None,
+                   help="run exactly these episode seeds (overrides --trials-per-speed and the "
+                   "seed + speed*1000 + i scheme); the asset world still comes from --seed")
     p.add_argument("--speeds", type=float, nargs="+", default=list(G1_SPEEDS))
     p.add_argument("-c", "--sim_cfg_file", default=str(DEFAULT_CFG))
     p.add_argument("-o", "--output_dir", default=str(FORESIGHT_ROOT / "data" / "p1_throw" / "eval"))
@@ -171,6 +174,22 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Timestamped ActionBuffer: drop chunk slots whose time has passed.")
     p.add_argument("--inject-latency-s", type=float, default=0.0,
                    help="Simulated inference delay (s): plan from an observation this old.")
+    # Sanity checks: change one input the model reads, keep everything else.
+    p.add_argument("--blank-cam", choices=["none", "static", "wrist", "both"], default="none",
+                   help="Feed a gray image for this camera (the .mp4 still shows the real view).")
+    p.add_argument("--language", type=str, default=None,
+                   help="Override the task text (default: built from the scene's object/container).")
+    p.add_argument("--distractor-usd", default=None,
+                   help="E3: add a static second object (this USD) 12-16 cm from the target's start.")
+    p.add_argument("--cond-donor-dir", default=None,
+                   help="E1: feed the 4 numbers of a different logged episode at the same speed "
+                   "(eval h5 files eval_model_v<speed>_s<seed>_cond.h5 in this dir; donor = next seed).")
+    p.add_argument("--hand-shift-m", type=float, nargs=2, default=None, metavar=("DX", "DY"),
+                   help="E1: tell the model its hand is (DX, DY) m elsewhere; the real hand is unchanged.")
+    p.add_argument("--cond-vel-override", type=float, nargs=2, default=None, metavar=("VX", "VY"),
+                   help="Replace v̂ (m/s) fed to the model; p̂ unchanged.")
+    p.add_argument("--gripper-state-override", choices=["none", "open", "closed"], default="none",
+                   help="Replace the gripper slot of the state the model reads.")
     p.add_argument("--held-from-hand", choices=["on", "off"], default="on",
                    help="Filter arm: while the fingers hold something, the 4 numbers come "
                    "from the hand (held object rides with it). off = raw filter throughout.")
@@ -182,6 +201,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--close-gate-depth-m", type=float, default=0.090)
     p.add_argument("--close-gate-xy-m", type=float, default=0.012)
     p.add_argument("--close-gate-max-wait", type=int, default=8, help="frames (25 Hz)")
+    # Stage 1: grasp-capture probability P_s (control/capture.py, params from Stage 0).
+    p.add_argument("--ps-close", choices=["off", "observe", "time", "veto", "dist"], default="off",
+                   help="observe = log P_s only; time = also close at the P_s peak (first close "
+                   "only); veto = time + hold a policy close while P_s < --ps-min (times out); "
+                   "dist = control rule: close when hand-object distance <= --dist-close-m and "
+                   "not shrinking (P_s still logged).")
+    # Youden-optimal distance on the Stage 0 tangerine closes (TPR 0.90, FPR 0.085).
+    p.add_argument("--dist-close-m", type=float, default=0.0256)
+    p.add_argument("--ps-min", type=float, default=0.5)
+    p.add_argument("--ps-max-wait", type=int, default=8, help="veto: frames (25 Hz)")
+    p.add_argument("--ps-source", choices=["truth", "filter"], default="truth",
+                   help="object state for P_s: sim truth, or the filter estimate (filter arm)")
     p.add_argument("--torch-deterministic", action="store_true",
                    help="torch.use_deterministic_algorithms + cuDNN deterministic (slower).")
     return p
@@ -376,6 +407,7 @@ def build_obs_batch(
     filter_state=None,
     frames: dict | None = None,
     cond_shift: np.ndarray | None = None,
+    sanity: dict | None = None,
 ) -> tuple[dict, dict]:
     """One SmolVLA observation dict + the packs we logged.
 
@@ -395,7 +427,13 @@ def build_obs_batch(
     # Same channel as collect/convert: commanded open∈{0,1}, not raw finger width.
     # (Fingers are snapped to this command on attach; see Phase0Scene._snap_fingers.)
     grip_cmd = float(scene.get_gripper_open())
-    state = pack_proprio(ee_pos, ee_quat, grip_cmd)
+    sanity = sanity or {}
+    grip_seen = {"open": 1.0, "closed": 0.0}.get(sanity.get("gripper_state", "none"), grip_cmd)
+    ee_seen = np.asarray(ee_pos, dtype=np.float64)
+    if sanity.get("hand_shift") is not None:
+        # E1 counterfactual: the model is told its hand is elsewhere (real hand unchanged).
+        ee_seen = ee_seen + np.r_[np.asarray(sanity["hand_shift"], dtype=np.float64).reshape(2), 0.0]
+    state = pack_proprio(ee_seen, ee_quat, grip_seen)
     obj = scene.get_object_state() if oracle_state is None else oracle_state
     # choose_pack decides the 4 numbers: sim truth (oracle), camera filter,
     # or all zeros (--zero-conditioning). The images and hand state do not change
@@ -407,10 +445,19 @@ def build_obs_batch(
         delta=delta,
         zero=zero_conditioning,
     )
+    if sanity.get("cond_donor") is not None and not zero_conditioning:
+        # E1 counterfactual (in-distribution): the 4 numbers of a real, different episode
+        # at the same speed, replayed frame by frame. The scene, images and hand are unchanged.
+        donor = np.asarray(sanity["cond_donor"], dtype=np.float64)
+        k = min(int(sanity.get("_step", 0)), len(donor) - 1)
+        aux["cond"] = donor[k].copy()
     if cond_shift is not None and not zero_conditioning:
         # Claim test: feed a deliberately wrong p̂ (logged as the cond we fed).
         aux["cond"] = np.asarray(aux["cond"], dtype=np.float64).copy()
         aux["cond"][0:2] += np.asarray(cond_shift, dtype=np.float64).reshape(2)
+    if sanity.get("cond_vel") is not None and not zero_conditioning:
+        aux["cond"] = np.asarray(aux["cond"], dtype=np.float64).copy()
+        aux["cond"][2:4] = np.asarray(sanity["cond_vel"], dtype=np.float64).reshape(2)
     from policy.transforms import cond_to_model
 
     cond_frame = (frames or {}).get("cond_frame", "abs")
@@ -426,6 +473,11 @@ def build_obs_batch(
         "observation.images.wrist_cam": _as_chw_float(imgs["wrist_cam"]).unsqueeze(0).to(device),
         "task": [language if language.endswith("\n") else language + "\n"],
     }
+    blank = sanity.get("blank_cam", "none")
+    for cam in ("static", "wrist"):
+        if blank in (cam, "both"):
+            key = f"observation.images.{cam}_cam"
+            batch[key] = torch.full_like(batch[key], 0.5)  # mid-gray, same shape
     return batch, aux
 
 
@@ -445,6 +497,43 @@ def action_to_ee(action: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
         quat = quat / n
     grip_open = float(a[7] > 0.5) if a.shape[0] > 7 else 1.0
     return pos, quat, grip_open
+
+
+
+def _donor_files(donor_dir: str | None, speed: float) -> list[tuple[int, Path]]:
+    """Logged eval episodes at this speed: [(seed, h5)], sorted by seed."""
+    if not donor_dir:
+        return []
+    import re as _re
+
+    out = []
+    for h5 in Path(donor_dir).glob(f"eval_model_v{speed:.2f}_s*_cond.h5"):
+        m = _re.search(r"_s(\d+)_cond\.h5$", h5.name)
+        if m:
+            out.append((int(m.group(1)), h5))
+    return sorted(out)
+
+
+def _donor_seed(donor_dir: str | None, speed: float, seed: int) -> int | None:
+    """E1 donor = the next logged seed after this one (wraps); never the episode itself."""
+    files = [s for s, _ in _donor_files(donor_dir, speed) if s != seed]
+    if not files:
+        return None
+    later = [s for s in files if s > seed]
+    return later[0] if later else files[0]
+
+
+def _donor_cond(donor_dir: str | None, speed: float, seed: int):
+    ds = _donor_seed(donor_dir, speed, seed)
+    if ds is None:
+        if donor_dir:
+            raise FileNotFoundError(f"no donor episode at speed {speed:.2f} in {donor_dir}")
+        return None
+    import h5py
+
+    h5 = dict(_donor_files(donor_dir, speed))[ds]
+    with h5py.File(h5, "r") as f:
+        return np.asarray(f["conditioning"][:], dtype=np.float64)
 
 
 def run_episode_policy(
@@ -470,6 +559,8 @@ def run_episode_policy(
     cond_shift: np.ndarray | None = None,
     held_from_hand: bool = True,
     close_gate: dict | None = None,
+    sanity: dict | None = None,
+    ps_close: dict | None = None,
 ) -> tuple[dict, dict]:
     """Closed-loop policy rollout. Logs the same arrays as expert collect.
 
@@ -490,8 +581,13 @@ def run_episode_policy(
     # Same seed = same policy noise too (SmolVLA samples noise every replan).
     seed_episode(seed)
     meta["policy_seed"] = int(seed)
+    sanity = dict(sanity or {})
     language = default_language(meta.get("category"), meta.get("container_category"))
+    meta["language_scene"] = language
+    if sanity.get("language"):
+        language = str(sanity["language"])  # sanity check: model reads this text instead
     meta["language"] = language
+    meta["sanity"] = {k: v for k, v in sanity.items() if k != "cond_donor"}  # donor array stays out of the json
     meta["no_attach"] = bool(no_attach)
     meta["force_place"] = bool(force_place)
     meta["cond_source"] = cond_source
@@ -550,6 +646,25 @@ def run_episode_policy(
     ee_prev = None  # (hand xyz, time) last frame: hand velocity while holding
     # Close gate state: first close only (a later re-close is the policy's own).
     gate_done, gate_wait, gate_hold, gate_log = False, 0, None, []
+    # P_s close rule state (Stage 1). First close only; after a rule close the
+    # fingers stay shut until the policy asks to close itself.
+    ps_rule = None
+    if ps_close is not None:
+        from control.capture import CaptureRule, collider_dims
+
+        approx = False
+        try:
+            r_obj, hc_obj = collider_dims(str(meta.get("usd")))
+        except Exception as ex:  # e.g. held-out meshes without a capsule collider
+            # Fallback: a sphere from the visual box (P_s is then approximate; logged as such).
+            size = np.asarray(getattr(scene, "_object_size", [0.07, 0.07, 0.07]), dtype=np.float64)
+            r_obj, hc_obj, approx = 0.5 * float(max(size[0], size[1])), 0.0, True
+            logging.warning("P_s geometry fallback (%s): sphere r=%.3f m", ex, r_obj)
+        open_half = float(scene.cfg.get("robot", {}).get("gripper_open_mm", 40.0)) / 1000.0
+        ps_rule = CaptureRule(r_obj, hc_obj, p_min=float(ps_close["p_min"]), open_half=open_half)
+        meta["ps_geometry"] = {"radius_m": r_obj, "half_straight_m": hc_obj, "open_half_m": open_half,
+                               "approx_sphere": approx}
+    ps_done, ps_wait, ps_hold, ps_owns_grip, ps_prev, ps_log = False, 0, None, False, None, []
     n_hand_frames = 0  # filter arm: frames whose numbers came from the held hand
 
     # Only the filter arm (G2b) needs a camera tracker + Kalman filter.
@@ -582,6 +697,8 @@ def run_episode_policy(
         "timestamp": [],
         "container_pos": [],
         "policy_replan": [],
+        "finger_gap": [],
+        "p_s": [],
     }
     if save_images:
         log["static_cam_rgb"] = []
@@ -631,6 +748,7 @@ def run_episode_policy(
     #   5. step the sim   
     #   6. log everything
     for t in range(n_steps):
+        sanity["_step"] = t
         # Empty plan means the net runs this step.
         will_replan = (len(action_buf) == 0) if action_buf is not None else (len(plan) == 0)
         imgs = scene.get_images()
@@ -673,6 +791,7 @@ def run_episode_policy(
             filter_state=filt_state,
             frames=frames,
             cond_shift=cond_shift,
+            sanity=sanity,
         )
         # Latency: the policy plans from the observation lat_steps ago
         # (clamped to the first frame at episode start). L=0: this frame.
@@ -743,6 +862,54 @@ def run_episode_policy(
                 pos = hold_pos.copy()
                 pos[0:2] += (p_now - p0)[0:2]
                 grip, want_close = 1.0, False
+
+        # ----- P_s CLOSE RULE (Stage 1 overlay, eval only) -----
+        # time: close at the P_s peak (P_s >= p_min and not rising) even if the policy
+        #       has not asked. veto: also hold a policy close while P_s < p_min (hold the
+        #       target, carry it with the object; times out). First close only.
+        ps_now = float("nan")
+        if ps_rule is not None:
+            ee_arr = np.asarray(ee, dtype=np.float64)
+            v_hand = np.zeros(3) if ps_prev is None else (ee_arr - ps_prev) / dt
+            ps_prev = ee_arr.copy()
+            if ps_owns_grip:
+                if want_close:
+                    ps_owns_grip = False  # the policy asked to close: it owns the gripper again
+                else:
+                    grip, want_close = 0.0, True
+            elif not ps_done and float(scene.get_gripper_open()) > 0.5 and not attached and not placed:
+                src = filt_state if (ps_close["source"] == "filter" and filt_state is not None) else obj
+                p_obj = np.asarray(src.position, dtype=np.float64) + np.asarray(src.velocity) * max(
+                    now_t - float(src.timestamp), 0.0)
+                ps_now, ps_next = ps_rule.evaluate(ee_arr, ee_q, p_obj, src.velocity, v_hand, dt)
+                if (want_close and ps_close["mode"] == "veto" and ps_now < ps_rule.p_min
+                        and ps_wait < int(ps_close["max_wait"])):
+                    if ps_hold is None:
+                        ps_hold = (np.asarray(pos, dtype=np.float64).reshape(3).copy(), p_obj.copy())
+                    ps_wait += 1
+                    hold_pos, p0 = ps_hold
+                    pos = hold_pos.copy()
+                    pos[0:2] += (p_obj - p0)[0:2]
+                    grip, want_close = 1.0, False
+                elif want_close:
+                    ps_done = True
+                    ps_log.append({"t": now_t, "kind": "policy", "ps": ps_now, "ps_next": ps_next,
+                                   "wait": ps_wait})
+                else:
+                    if ps_close["mode"] == "dist":
+                        v_o = np.asarray(src.velocity, dtype=np.float64).copy()
+                        v_o[2] = 0.0
+                        d_now = float(np.linalg.norm(p_obj - ee_arr))
+                        d_next = float(np.linalg.norm((p_obj + v_o * dt) - (ee_arr + v_hand * dt)))
+                        fire = d_now <= float(ps_close["dist_m"]) and d_next >= d_now - 1e-9
+                    else:
+                        fire = ps_close["mode"] != "observe" and ps_rule.fire(ps_now, ps_next)
+                    if fire:
+                        ps_done = True
+                        ps_owns_grip = True
+                        grip, want_close = 0.0, True
+                        ps_log.append({"t": now_t, "kind": "rule", "ps": ps_now, "ps_next": ps_next,
+                                       "wait": ps_wait})
 
         # Reflex (control rate): steer XY at the meeting point, close on time-to-arrival.
         # Uses the filter state when there is one, else sim truth. A close stays latched.
@@ -988,6 +1155,8 @@ def run_episode_policy(
             ctr[0].copy() if ctr is not None else np.full(3, np.nan)
         )
         log["policy_replan"].append(1 if will_replan else 0)
+        log["finger_gap"].append(scene.get_finger_gap_m())
+        log["p_s"].append(ps_now)
         # Log the exact 4 numbers the net saw (so a zero run shows all zeros).
         if cond is not None:
             log["conditioning"].append(np.asarray(cond, dtype=np.float64).copy())
@@ -1041,6 +1210,8 @@ def run_episode_policy(
     meta["n_hand_frames"] = int(n_hand_frames)
     meta["close_gate"] = close_gate
     meta["close_gate_log"] = gate_log
+    meta["ps_close"] = ps_close
+    meta["ps_log"] = ps_log
     meta["off_table"] = bool(getattr(scene, "off_table", False))
     meta["table_z"] = float(getattr(scene, "_table_z", 0.0))
     meta["dt"] = dt
@@ -1241,7 +1412,12 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
     # ===== TRIAL LOOP =====
     # One turn = one trial at this speed. The same --zero-conditioning /
     # --cond-source setting applies to every trial in the run.
+    seed_list = getattr(args, "episode_seeds", None)
+    if seed_list:
+        n = len(seed_list)
     for i in range(n):
+        if seed_list:
+            seed = int(seed_list[i])
         logging.info("eval speed=%.2f trial %d/%d seed=%d", speed, i + 1, n, seed)
         # A crashed trial counts as a failure (ok=False) and is logged with
         # the full error. It still counts in n, so the rate is not inflated.
@@ -1270,6 +1446,15 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
                 close_time=getattr(args, "_close_time", None),
                 cond_shift=getattr(args, "cond_shift_m", None),
                 held_from_hand=getattr(args, "held_from_hand", "on") == "on",
+                sanity={
+                    "blank_cam": getattr(args, "blank_cam", "none"),
+                    "language": getattr(args, "language", None),
+                    "cond_vel": getattr(args, "cond_vel_override", None),
+                    "gripper_state": getattr(args, "gripper_state_override", "none"),
+                    "hand_shift": getattr(args, "hand_shift_m", None),
+                    "cond_donor": _donor_cond(getattr(args, "cond_donor_dir", None), speed, seed),
+                    "cond_donor_seed": _donor_seed(getattr(args, "cond_donor_dir", None), speed, seed),
+                },
                 close_gate=(
                     {
                         "depth_m": float(args.close_gate_depth_m),
@@ -1277,6 +1462,17 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
                         "max_wait": int(args.close_gate_max_wait),
                     }
                     if getattr(args, "close_gate", "off") == "on"
+                    else None
+                ),
+                ps_close=(
+                    {
+                        "mode": str(args.ps_close),
+                        "p_min": float(args.ps_min),
+                        "max_wait": int(args.ps_max_wait),
+                        "source": str(args.ps_source),
+                        "dist_m": float(args.dist_close_m),
+                    }
+                    if getattr(args, "ps_close", "off") != "off"
                     else None
                 ),
             )
@@ -1349,9 +1545,19 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
             "frames": meta.get("frames"),
             "cond_shift_m": meta.get("cond_shift_m"),
             "held_from_hand": meta.get("held_from_hand"),
+            "language": meta.get("language"),
+            "language_scene": meta.get("language_scene"),
+            "sanity": meta.get("sanity"),
+            "language": meta.get("language"),
+            "distractor_category": meta.get("distractor_category"),
+            "distractor_pos": meta.get("distractor_pos"),
+            "init_pos": meta.get("init_pos"),
+            "init_vel": meta.get("init_vel"),
             "n_hand_frames": meta.get("n_hand_frames"),
             "close_gate": meta.get("close_gate"),
             "close_gate_log": meta.get("close_gate_log"),
+            "ps_close": meta.get("ps_close"),
+            "ps_log": meta.get("ps_log"),
             "asset_seed": meta.get("asset_seed"),
             "category": meta.get("category"),
             "container_category": meta.get("container_category"),
@@ -1374,7 +1580,20 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
             fps = int(scene.cfg.get("static_camera", {}).get("fps", 25))
             tag = "ok" if ok else tax
             mp4 = out_dir / f"eval_model_v{speed:.2f}_s{seed}_{tag}.mp4"
-            write_debug_mp4(episode, mp4, fps=fps)
+            sv = meta.get("sanity") or {}
+            info = [
+                f"Task text fed: {meta.get('language')}",
+                f"Scene: {meta.get('category')} -> {meta.get('container_category')}",
+            ]
+            if sv.get("blank_cam", "none") != "none":
+                info.append(f"Model camera BLANKED: {sv['blank_cam']} (video shows real view)")
+            if sv.get("cond_vel") is not None:
+                info.append(f"v-hat overridden: {sv['cond_vel']} m/s")
+            if sv.get("gripper_state", "none") != "none":
+                info.append(f"Gripper state fed: {sv['gripper_state']}")
+            if meta.get("cond_shift_m"):
+                info.append(f"p-hat shifted: {meta['cond_shift_m']} m")
+            write_debug_mp4(dict(episode, overlay_info=info), mp4, fps=fps)
 
         seed += 1
 
@@ -1504,7 +1723,8 @@ def main() -> None:
         cfg.setdefault("sim", {})["device"] = args.device
 
     # Create a new scene for each speed.
-    scene = Phase0Scene(cfg, enable_cameras=True, object_usd=args.object_usd,container_usd=args.container_usd,asset_seed=int(args.seed))
+    scene = Phase0Scene(cfg, enable_cameras=True, object_usd=args.object_usd,container_usd=args.container_usd,asset_seed=int(args.seed),
+                         distractor_usd=getattr(args, "distractor_usd", None))
     
     # Load the policy for the given checkpoint.
     policy = load_policy(args.checkpoint,device,n_action_steps=args.n_action_steps)
