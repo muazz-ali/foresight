@@ -12,7 +12,7 @@ from policy.transforms import (
 )
 
 EE = np.array([0.48, 0.05, 0.10])
-COND = np.array([0.52, 0.02, 0.10, -0.05])  # p̂x, p̂y, v̂x, v̂y (world)
+COND = np.array([0.52, 0.02, 0.08, 0.10, -0.05])  # p̂x, p̂y, p̂z, v̂x, v̂y (world)
 
 
 class _Base:
@@ -47,7 +47,8 @@ def test_rel_cond_is_object_minus_hand_xy():
     want = cond_to_model(COND, EE, "rel")
     np.testing.assert_allclose(it["observation.state"][8:].numpy(), want, atol=1e-6)
     np.testing.assert_allclose(want[:2], COND[:2] - EE[:2])
-    np.testing.assert_allclose(want[2:], COND[2:])  # velocity stays world
+    np.testing.assert_allclose(want[2], COND[2])  # p̂z stays world
+    np.testing.assert_allclose(want[3:], COND[3:])  # velocity stays world
 
 
 def test_delta_action_round_trips_through_eval_helper():

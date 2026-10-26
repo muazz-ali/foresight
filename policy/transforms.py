@@ -75,7 +75,11 @@ class AugConfig:
     ee_noise_std: float = 0.0
 
 
-POLICY_FRAMES = {"cond_frame": ("abs", "rel"), "action_frame": ("abs", "delta")}
+POLICY_FRAMES = {
+    "cond_frame": ("abs", "rel"),
+    # forecast = d_k = target_k − p̂_k (claim Step 4).
+    "action_frame": ("abs", "delta", "forecast"),
+}
 # Saved next to each checkpoint so eval rebuilds the same inputs / outputs.
 FRAMES_FILE = "foresight_policy.json"
 
@@ -90,13 +94,32 @@ def cond_to_model(cond_abs: np.ndarray, ee_xyz: np.ndarray, cond_frame: str) -> 
     return out
 
 
-def action_from_model(chunk: np.ndarray, ee_xyz: np.ndarray, action_frame: str) -> np.ndarray:
-    """Model action chunk (T, 8) → world hand targets. Inverse of the train-side shift."""
+def action_from_model(
+    chunk: np.ndarray,
+    ee_xyz: np.ndarray,
+    action_frame: str,
+    *,
+    forecasts: np.ndarray | None = None,
+) -> np.ndarray:
+    """Model action chunk (T, 8) → world hand targets. Inverse of the train-side shift.
+
+    Frames:
+      * ``abs`` — world XYZ as predicted
+      * ``delta`` — XYZ is offset from the planning-frame hand (``ee_xyz``)
+      * ``forecast`` — XYZ is offset from per-slot object forecast ``p̂_k``
+        (Step 4/5). Pass ``forecasts`` shape (T, 3).
+    """
     out = np.asarray(chunk, dtype=np.float64).copy()
     if action_frame == "delta":
         out[..., 0:3] += np.asarray(ee_xyz, dtype=np.float64).reshape(-1)[0:3]
+    elif action_frame == "forecast":
+        if forecasts is None:
+            raise ValueError("action_frame='forecast' needs forecasts (T, 3)")
+        from policy.relabel import actions_from_forecast_rel
+
+        out = actions_from_forecast_rel(out, forecasts)
     elif action_frame != "abs":
-        raise ValueError(f"action_frame must be abs|delta, got {action_frame!r}")
+        raise ValueError(f"action_frame must be abs|delta|forecast, got {action_frame!r}")
     return out
 
 
@@ -138,10 +161,10 @@ def augment_conditioning(
     delta = float(rng.uniform(cfg.delta_min, cfg.delta_max))
     # Same helper the filter path uses, so train and deploy build the 4 numbers alike.
     cond = conditioning_vector(state, delta=delta).astype(np.float64)
-    # Layout: [p_hat_x, p_hat_y, v_hat_x, v_hat_y]
-    # Shake the clean numbers a bit, like a real tracker would.
-    cond[0:2] += rng.normal(0.0, cfg.pos_noise_std, size=2)
-    cond[2:4] += rng.normal(0.0, cfg.vel_noise_std, size=2)
+    # Layout: [p_hat_x, p_hat_y, p_hat_z, v_hat_x, v_hat_y]
+    # Shake place (incl. z) and XY speed a bit, like a real tracker would.
+    cond[0:3] += rng.normal(0.0, cfg.pos_noise_std, size=3)
+    cond[3:5] += rng.normal(0.0, cfg.vel_noise_std, size=2)
     return cond
 
 
@@ -210,13 +233,46 @@ class PolicyDataset(Dataset):
             raise KeyError(
                 "PolicyDataset needs observation.oracle_state or observation.conditioning"
             )
-        # Frames: rel cond and delta action both use the clean hand pose.
+        # Frames: rel cond uses clean hand; action_frame chooses the subtract base.
         ee_clean = state_last[0:3].numpy().astype(np.float64)
         if not self.aug.zero_conditioning:
             cond = cond_to_model(cond, ee_clean, self.aug.cond_frame)
         if self.aug.action_frame != "abs" and "action" in item:
             act = torch.as_tensor(item["action"], dtype=torch.float32).clone()
-            act[..., 0:3] -= torch.as_tensor(ee_clean, dtype=torch.float32)
+            if self.aug.action_frame == "delta":
+                # d = target − hand_now (old V2 path).
+                act[..., 0:3] -= torch.as_tensor(ee_clean, dtype=torch.float32)
+            elif self.aug.action_frame == "forecast":
+                # d_k = target_k − p̂_k (claim Step 4). Needs oracle + Δ.
+                if "observation.oracle_state" not in item:
+                    raise KeyError(
+                        "action_frame='forecast' needs observation.oracle_state"
+                    )
+                from interfaces.forecast import forecast_horizon
+                from policy.relabel import actions_to_forecast_rel
+
+                oracle = item["observation.oracle_state"]
+                if isinstance(oracle, torch.Tensor):
+                    oracle = oracle.detach().cpu().numpy()
+                oracle = np.asarray(oracle)
+                if oracle.ndim == 2:
+                    oracle = oracle[-1]
+                st = oracle_flat_to_state(oracle)
+                delta = float(rng.uniform(self.aug.delta_min, self.aug.delta_max))
+                act_np = act.detach().cpu().numpy()
+                # Support (8,) single step or (T, 8) chunk.
+                single = act_np.ndim == 1
+                if single:
+                    act_np = act_np.reshape(1, -1)
+                forecasts = forecast_horizon(st, delta, n=act_np.shape[0])
+                act_np = actions_to_forecast_rel(act_np, forecasts)
+                if single:
+                    act_np = act_np.reshape(-1)
+                act = torch.as_tensor(act_np, dtype=torch.float32)
+            else:
+                raise ValueError(
+                    f"action_frame must be abs|delta|forecast, got {self.aug.action_frame!r}"
+                )
             item["action"] = act
         if self.apply_aug and self.aug.ee_noise_std > 0:
             # Noisy copy of the hand XYZ only in what the model reads.

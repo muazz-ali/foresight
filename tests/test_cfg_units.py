@@ -33,10 +33,9 @@ def test_normalize_converts_mm_ms_cm_s():
             "clipping_range_mm": [10.0, 2000.0],
         },
         "state_machine_params": {
-            "grasp_xyz_ok_mm": [10.0, 10.0, 15.0],
+            "grasp_xyz_ok_mm": [10.0, 10.0, 20.0],
             "arrived_z_ok_mm": 30.0,
-            "hand_speed_max_cm_s": 90.0,
-            "object_still_cm_s": 5.0,
+            "hand_speed_max_cm_s": 250.0,
             "hold_closed_physics_ms": 300,
             "aim_refine_iters": 3,
         },
@@ -57,10 +56,9 @@ def test_normalize_converts_mm_ms_cm_s():
     assert cfg["static_camera"]["clip"]["far"] == 100.0
     assert cfg["wrist_camera"]["pos"] == [0.065, 0.0, 0.0]
     assert cfg["wrist_camera"]["clipping_range"] == [0.01, 2.0]
-    assert cfg["state_machine_params"]["grasp_xyz_ok"] == [0.01, 0.01, 0.015]
+    assert cfg["state_machine_params"]["grasp_xyz_ok"] == [0.01, 0.01, 0.02]
     assert cfg["state_machine_params"]["place_z_tol"] == 0.03
-    assert cfg["state_machine_params"]["ee_speed_max"] == 0.9
-    assert cfg["state_machine_params"]["ee_settle_tol"] == 0.05
+    assert cfg["state_machine_params"]["ee_speed_max"] == 2.5
     assert cfg["state_machine_params"]["physics_close_s"] == 0.3
     assert cfg["state_machine_params"]["intercept_iters"] == 3
     assert cfg["sim"]["dt"] == 0.04
@@ -75,16 +73,10 @@ def test_legacy_si_keys_are_rejected():
     with pytest.raises(ValueError, match="legacy key"):
         normalize_cfg_units({"sim": {"dt": 0.04}})
     with pytest.raises(ValueError, match="legacy key"):
-        normalize_cfg_units({"state_machine_params": {"ee_speed_max": 0.9}})
+        normalize_cfg_units({"state_machine_params": {"ee_speed_max": 2.5}})
 
 
 def test_legacy_human_knob_names_are_rejected():
-    with pytest.raises(ValueError, match="min_wait_after_bounce_ms"):
-        normalize_cfg_units({"state_machine_params": {"bounce_guard_ms": 100}})
-    with pytest.raises(ValueError, match="min_wait_after_bounce_ms"):
-        normalize_cfg_units({"state_machine_params": {"wait_after_bounce_ms": 100}})
-    with pytest.raises(ValueError, match="min_wait_after_bounce_ms"):
-        normalize_cfg_units({"state_machine_params": {"min_clear_before_wall_ms": 100}})
     with pytest.raises(ValueError, match="tip_lag_pad_ms"):
         normalize_cfg_units({"state_machine_params": {"robot_approach_pad_ms": 160}})
     with pytest.raises(ValueError, match="grasp_xyz_ok_mm"):
@@ -101,17 +93,30 @@ def test_phase0_yaml_loads_to_expected_si():
     assert abs(cfg["robot"]["gripper_close_time_s"] - 0.08) < 1e-12
     assert abs(cfg["scene"]["max_object_width_m"] - 0.075) < 1e-12
     assert cfg["state_machine_params"]["grasp_xyz_ok"] == pytest.approx(
-        [0.01, 0.01, 0.015]
+        [0.01, 0.01, 0.02]
     )
-    assert abs(cfg["state_machine_params"]["ee_speed_max"] - 0.9) < 1e-12
-    assert abs(cfg["state_machine_params"]["ee_settle_tol"] - 0.05) < 1e-12
-    assert abs(cfg["state_machine_params"]["bounce_guard_s"] - 0.10) < 1e-12
+    assert abs(cfg["state_machine_params"]["ee_speed_max"] - 2.5) < 1e-12
+    assert abs(cfg["state_machine_params"]["lookahead_s"] - 0.40) < 1e-12
+    assert abs(cfg["state_machine_params"]["robot_approach_pad_s"] - 0.16) < 1e-12
     assert abs(cfg["state_machine_params"]["conditioning_delta_s"] - 0.25) < 1e-12
     assert cfg["state_machine_params"]["intercept_iters"] == 3
-    assert abs(cfg["sim"]["dt"] - 0.04) < 1e-12
+    # Claim default: 30 Hz control (was 0.04 s / 25 Hz for G0–G2).
+    assert abs(cfg["sim"]["dt"] - (1.0 / 30.0)) < 1e-9
+    assert cfg["claim_timing"]["delta_jitter_s"] == pytest.approx(0.010)
+    assert cfg["claim_timing"]["train_delta_max_s"] == pytest.approx(0.200)
+    # Grasp height latch (claim Z): mm yaml → metres.
+    ch = cfg["claim_height"]
+    assert ch["finger_insert_m"] == pytest.approx(0.03)
+    assert ch.get("close_at_object_center", True) is True
+    assert ch.get("pack_z_from_depth", True) is True
+    assert ch["table_clear_m"] == pytest.approx(0.005)
+    assert ch["z_slack_m"] == pytest.approx(0.005)
+    assert ch["latch_lo_m"] == pytest.approx(0.07)
+    assert ch["latch_hi_m"] == pytest.approx(0.20)
+    assert ch["depth_rmse_max_m"] == pytest.approx(0.01)
     assert "camera" not in cfg
     assert "cameras" not in cfg["scene"]
-    assert cfg["static_camera"]["position"] == [1.0, 0.0, 0.6]
+    assert cfg["static_camera"]["position"] == [1.2, 0.0, 0.8]
     assert cfg["static_camera"]["clip"]["near"] == 0.01
     assert cfg["wrist_camera"]["pos"] == [0.065, 0.0, 0.0]
     assert cfg["wrist_camera"]["clipping_range"] == [0.01, 2.0]

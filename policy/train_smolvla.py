@@ -45,15 +45,21 @@ sys.path.insert(0, str(FORESIGHT_ROOT))
 logger = logging.getLogger(__name__)
 
 
-def _collate(batch: list[dict]) -> dict:
-    """Stack tensor fields; keep task as list[str]."""
+def _collate(batch: list[dict], *, vary_language: bool = False) -> dict:
+    """Stack tensor fields; keep task as list[str].
+
+    ``vary_language`` swaps in another wording of the same object each batch
+    (train only). Val keeps the sentence stored with the demo.
+    """
+    from policy.features import paraphrase_task
+
     # Text is not a tensor, so it stays a plain list of strings.
     keys = batch[0].keys()
     out: dict = {}
     for k in keys:
         vals = [b[k] for b in batch]
         if k == "task":
-            out[k] = vals
+            out[k] = [paraphrase_task(t) for t in vals] if vary_language else vals
         elif isinstance(vals[0], torch.Tensor):
             out[k] = torch.stack(vals, dim=0)
         else:
@@ -67,6 +73,7 @@ def build_policy(
     pretrained: str | None,
     *,
     chunk_size: int | None = None,
+    n_action_steps: int | None = None,
     frames: dict | None = None,
     dataset_root: str | Path | None = None,
 ):
@@ -88,7 +95,7 @@ def build_policy(
             dataset_root,
             cond_frame=frames["cond_frame"],
             action_frame=frames["action_frame"],
-            chunk_size=int(chunk_size or 50),
+            chunk_size=int(chunk_size or 25),
         )
 
     policy_features = dataset_to_policy_features(features)
@@ -96,7 +103,9 @@ def build_policy(
     # Chunk = how many future actions the model predicts at once.
     if chunk_size:
         cfg.chunk_size = int(chunk_size)
-        cfg.n_action_steps = int(chunk_size)
+        # Claim default: predict 25, execute 10 (yaml). CLI can still set both equal.
+        n_act = int(chunk_size) if n_action_steps is None else int(n_action_steps)
+        cfg.n_action_steps = n_act
     cfg.pretrained_path = pretrained
     # LeRobot validates device as cuda|mps|cpu only (rejects cuda:N). Placement
     # still uses the indexed device via policy.to(device) below.
@@ -164,12 +173,14 @@ def _eval_loss(policy, loader: DataLoader | None, device: str, max_batches: int 
 
 
 def _make_loader(ds, args: argparse.Namespace, *, shuffle: bool) -> DataLoader:
+    # Train redraws the task sentence; val keeps the stored one (stable loss).
+    collate = (lambda batch: _collate(batch, vary_language=True)) if shuffle else _collate
     return DataLoader(
         ds,
         batch_size=args.batch_size,
         shuffle=shuffle,
         num_workers=args.num_workers,
-        collate_fn=_collate,
+        collate_fn=collate,
         drop_last=shuffle,  # drop_last only for train (stable batch size)
     )
 
@@ -189,7 +200,9 @@ def train(args: argparse.Namespace) -> Path:
     probe_cfg = SmolVLAConfig()
     if args.chunk_size:
         probe_cfg.chunk_size = int(args.chunk_size)
-        probe_cfg.n_action_steps = int(args.chunk_size)
+        probe_cfg.n_action_steps = int(
+            args.n_action_steps if args.n_action_steps is not None else args.chunk_size
+        )
     # Peek at episode 0 just to read dataset meta (fps, features).
     meta_ds = LeRobotDataset(repo_id=args.repo_id, root=root, episodes=[0])
     delta_timestamps = resolve_delta_timestamps(probe_cfg, meta_ds.meta)
@@ -270,6 +283,7 @@ def train(args: argparse.Namespace) -> Path:
         device=device,
         pretrained=args.pretrained,
         chunk_size=args.chunk_size,
+        n_action_steps=args.n_action_steps,
         frames={"cond_frame": args.cond_frame, "action_frame": args.action_frame},
         dataset_root=root,
     )
@@ -527,8 +541,14 @@ def main() -> None:
     p.add_argument(
         "--chunk-size",
         type=int,
-        default=50,
-        help="SmolVLA action chunk length (must match delta_timestamps)",
+        default=None,
+        help="SmolVLA action chunk length (default: policy yaml, claim=25)",
+    )
+    p.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=None,
+        help="How many chunk steps to execute before replan (default: yaml, claim=10)",
     )
     p.add_argument(
         "--precision",
@@ -558,9 +578,15 @@ def main() -> None:
         "log_every",
         "eval_every",
         "val_fraction",
+        "chunk_size",
+        "n_action_steps",
     ):
-        if getattr(args, key) is None:
+        if getattr(args, key) is None and key in train_defs:
             setattr(args, key, train_defs[key])
+    if args.chunk_size is None:
+        args.chunk_size = 25
+    if args.n_action_steps is None:
+        args.n_action_steps = min(10, int(args.chunk_size))
 
     # Any Δ / noise flag left empty is filled from the yaml (+ sim Δ).
     aug = policy_aug_defaults(args.policy_cfg)

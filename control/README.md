@@ -1,6 +1,14 @@
 # control/
 
-Two small tools. No learning, no Isaac.
+Timing tools for the claim path. No learning, no Isaac.
+
+| File | Role |
+|---|---|
+| `buffer.py` | Timestamped action queue (drop stale slots) |
+| `delay.py` | Applied vs reported Δ (+ ~10 ms jitter) — Step 1 |
+| `exec_chunk.py` | Relative chunk → world targets into the buffer — Step 5 |
+| `close_guard.py` | Hand–object speed match while closing — Step 5 |
+| `reflex.py` / `capture.py` | Last-cm close helpers (G3 overlays) |
 
 ## `ActionBuffer` — never act on old info
 - `push_chunk(actions, t0, dt, now=None, blend=0)`: action `i` runs at `t0 + i*dt`.

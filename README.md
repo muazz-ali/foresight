@@ -16,10 +16,10 @@ Full write-up: [`foresight_plan.md`](foresight_plan.md) · How we work: [`AGENTS
 | **G1** | Model keeps grasp rate flat 0 → 20 cm/s; zero the 4 numbers at eval and success collapses | **PASS** (Sep 13 2026). 84 / 70 / 71% at 0 / 15 / 20 cm/s; zero-out 2% still; drop still→20 is 13 points (<15 cap). n = 100 per bin. Details: plan §5 |
 | G2a | Camera + filter numbers close to sim truth: at 20 cm/s, median ≤ 1 cm and RMSE ≤ 2 cm vs the sim-truth p̂ | **PASS** (Sep 18 2026, offline). 0.34 / 1.14 cm on demos, 0.31 / 1.26 cm on model eval runs. Report: `data/eval/p2_perception_report/REPORT.md` |
 | G2b | Swap sim truth → camera numbers in the model, same seeds: success drops < 10 points at 15 and 20 cm/s | **PASS** (Sep 29 2026). Filter 92 / 65 / 65 of 100 at 0 / 15 / 20 cm/s. Drop vs oracle is 5 points at 15 cm/s and 6 at 20. Logs: `data/eval/g2b_n100/` |
-| G3 | Throw catch (no bounce box) + timing (buffer / reflex / wrist); recover ≥ half late / early-close; one last sim collect + one retrain | not started |
+| G3 | Throw catch + timing (buffer / reflex / wrist); recover ≥ half late / early-close; one last sim collect + one retrain | not started |
 | G4 | Real arm works well at 10–20 cm/s | not started |
 
-“Success” on the bounce-box model (G1 / G2) = the policy's grasp holds under the eval latch, then a script places (`--force-place`). Phase 3 / G3 uses a real physics grasp on the throw task.
+“Success” on G1 / G2 = the policy's grasp holds under the eval latch, then a script places (`--force-place`). Phase 3 / G3 uses a real physics grasp on the throw task.
 
 Lesson from G0: do **not** wrap DynamicVLA’s pick state machine. Our expert and scene live in this repo under `sim/`.
 
@@ -141,13 +141,13 @@ Replace sim truth with what the static camera sees: blob tracker → pixel-to-ta
 
 Throw and timing are **one** phase. Collecting demos and training are expensive — this is the **last sim dataset** and the **last sim retrain**.
 
-Build first (no collect yet): no wall bounce, throw catch expert, `control/` buffer + reflex, wrist last-cm, real physics grasp. Smoke the full stack. Then **one** collect → **one** train → Gate G3. Plan §5 / §8.
+Build first (no collect yet): throw catch expert, `control/` buffer + reflex, wrist last-cm, real physics grasp. Smoke the full stack. Then **one** collect → **one** train → Gate G3. Plan §5 / §8.
 
 ---
 
 ## What we are **not** building yet
 
-No big learned world model, no optical-flow network, no policy from scratch, no full 6D pose first (center + speed is enough), no second sim collect after Phase 3 freezes, no bounce-box demos in Phase 3, no DynamicVLA state machine as our expert.
+No big learned world model, no optical-flow network, no policy from scratch, no full 6D pose first (center + speed is enough), no second sim collect after Phase 3 freezes, no DynamicVLA state machine as our expert.
 
 ---
 

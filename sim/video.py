@@ -73,9 +73,7 @@ def _gates_from_cfg() -> dict[str, float]:
     cfg = load_yaml(_CFG_PATH)
     sm = cfg["state_machine_params"]
     scene = cfg.get("scene", {})
-    physics = bool(scene.get("use_house", False)) and not bool(
-        scene.get("use_weld_grasp", not bool(scene.get("use_house", False)))
-    )
+    physics = not bool(scene.get("use_weld_grasp", False))
     close_s = float(sm["physics_close_s"] if physics else sm["close_gripper_s"])
     ok = sm["grasp_xyz_ok"]
     return {

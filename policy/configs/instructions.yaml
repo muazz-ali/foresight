@@ -1,0 +1,90 @@
+# Task text for SmolVLA. Many wordings per object so the model cannot
+# memorize one sentence. Every line still names the object (apple ≠ tangerine)
+# and the container, so the words and the picture have to agree.
+#
+# Used by policy.features.default_language and paraphrase_task.
+# Keys = object category stems. Unknown objects use `default`.
+
+templates:
+  apple:
+    - "Pick the apple and place it in the {container}."
+    - "Pick the red apple and put it in the {container}."
+    - "Grasp the apple and place it into the {container}."
+    - "Grab the apple and set it in the {container}."
+    - "Take the red apple and drop it in the {container}."
+    - "Lift the apple and put it into the {container}."
+  tangerine:
+    - "Pick the tangerine and place it in the {container}."
+    - "Pick the orange tangerine and put it in the {container}."
+    - "Grasp the tangerine and place it into the {container}."
+    - "Grab the tangerine and set it in the {container}."
+    - "Take the tangerine and drop it in the {container}."
+    - "Lift the small tangerine and put it into the {container}."
+  orange:
+    - "Pick the orange and place it in the {container}."
+    - "Pick the round orange and put it in the {container}."
+    - "Grasp the orange and place it into the {container}."
+    - "Grab the orange and set it in the {container}."
+    - "Take the orange and drop it in the {container}."
+    - "Lift the orange and put it into the {container}."
+  avocado:
+    - "Pick the avocado and place it in the {container}."
+    - "Grasp the avocado and put it in the {container}."
+    - "Grab the green avocado and place it into the {container}."
+    - "Take the avocado and set it in the {container}."
+    - "Lift the avocado and drop it in the {container}."
+  can:
+    - "Pick the can and place it in the {container}."
+    - "Grasp the can and put it in the {container}."
+    - "Grab the can and place it into the {container}."
+    - "Take the can and set it in the {container}."
+    - "Lift the can and drop it in the {container}."
+  egg:
+    - "Pick the egg and place it in the {container}."
+    - "Grasp the egg and put it in the {container}."
+    - "Grab the egg and place it into the {container}."
+    - "Take the egg and set it in the {container}."
+    - "Lift the egg and drop it in the {container}."
+  kiwi:
+    - "Pick the kiwi and place it in the {container}."
+    - "Grasp the kiwi and put it in the {container}."
+    - "Grab the brown kiwi and place it into the {container}."
+    - "Take the kiwi and set it in the {container}."
+    - "Lift the kiwi and drop it in the {container}."
+  lemon:
+    - "Pick the lemon and place it in the {container}."
+    - "Grasp the yellow lemon and put it in the {container}."
+    - "Grab the lemon and place it into the {container}."
+    - "Take the lemon and set it in the {container}."
+    - "Lift the lemon and drop it in the {container}."
+  lime:
+    - "Pick the lime and place it in the {container}."
+    - "Grasp the green lime and put it in the {container}."
+    - "Grab the lime and place it into the {container}."
+    - "Take the lime and set it in the {container}."
+    - "Lift the lime and drop it in the {container}."
+  onion:
+    - "Pick the onion and place it in the {container}."
+    - "Grasp the onion and put it in the {container}."
+    - "Grab the onion and place it into the {container}."
+    - "Take the onion and set it in the {container}."
+    - "Lift the onion and drop it in the {container}."
+  peach:
+    - "Pick the peach and place it in the {container}."
+    - "Grasp the peach and put it in the {container}."
+    - "Grab the peach and place it into the {container}."
+    - "Take the peach and set it in the {container}."
+    - "Lift the peach and drop it in the {container}."
+  default:
+    - "Pick the {object} and place it in the {container}."
+    - "Grasp the {object} and put it in the {container}."
+    - "Grab the {object} and place it into the {container}."
+    - "Take the {object} and set it in the {container}."
+    - "Lift the {object} and drop it in the {container}."
+
+# Prefer these container words in templates.
+containers:
+  bowl: bowl
+  basket: basket
+  box: box
+  default: bowl

@@ -32,7 +32,7 @@ import numpy as np
 
 FORESIGHT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CFG = FORESIGHT_ROOT / "sim" / "phase0_cfg.yaml"
-DEFAULT_OUT = FORESIGHT_ROOT / "data" / "g0"
+DEFAULT_OUT = FORESIGHT_ROOT / "data" / "smoke"
 
 G0_SPEEDS_M_S = (0.0, 0.10, 0.15, 0.20)  # plan G0 bins: 0-20 cm/s. Same bins G1 uses.
 # 20 tries per speed is a scout size. Fine for G0 smoke, too small to settle a close call.
@@ -56,12 +56,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     # --g0 = the real gate run (all 4 speeds, 20 tries each). Without it: smoke check.
     parser.add_argument("--g0", action="store_true")
-    parser.add_argument("-n", "--n_simulations", type=int, default=5)
+    parser.add_argument("-n", "--n_simulations", type=int, default=1)
     parser.add_argument("--trials-per-speed", type=int, default=G0_TRIALS_PER_SPEED)
     parser.add_argument("--robot", default="franka", choices=["franka"])
     parser.add_argument("-c", "--sim_cfg_file", default=str(DEFAULT_CFG))
     parser.add_argument("-o", "--output_dir", default=str(DEFAULT_OUT))
-    parser.add_argument("--seed", type=int, default=40)
+    parser.add_argument("--seed", type=int, default=41)
     parser.add_argument(
         "--object-usd",
         default=None,
@@ -80,7 +80,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--save", action="store_true", default=True)
     parser.add_argument("--no-save", action="store_false", dest="save")
-    parser.add_argument("--debug", action="store_true", default=False)
+    parser.add_argument("--debug", action="store_true", default=True)
     parser.add_argument("--save-images", action="store_true", default=False)
     parser.add_argument(
         "--delta",
@@ -512,8 +512,7 @@ def main() -> None:
         log_event(
             log,
             f"Robot approach pad {expert.robot_approach_pad_s:.3f} s (tau {expert.tau:.3f} s), "
-            f"hand speed cap {expert.ee_speed_max:.2f} m/s, "
-            f"bounce guard {expert.bounce_guard_s:.2f} s.",
+            f"hand speed cap {expert.ee_speed_max:.2f} m/s.",
         )
         log_how_to_read(
             log,

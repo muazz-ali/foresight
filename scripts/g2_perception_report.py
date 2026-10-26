@@ -71,7 +71,6 @@ REPORT_SETS = [
 # Knob sweep uses speeds that are NOT in the report.
 TUNE_SETS = [("demo", s, DEMO / f"speed_{s:.2f}", 40) for s in (0.12, 0.14, 0.16, 0.18)]
 HORIZONS = (0.10, 0.20, 0.25, 0.30)  # "look this far ahead" times (s) for the future-error check
-BOUNCE_LOOKBACK_S = 0.20  # a wall hit this recently still counts (filter re-learning speed)
 SMOOTH_S = 0.24  # house truth speed zigzags on a 3-frame cycle; average over 6 frames
 WARMUP_FRAMES = 2  # first fixes: the filter starts at speed 0 (step 3 warms up before first plan)
 OFF_TABLE_DROP_M = 0.03  # object this far below / above its spawn height = fell off / lifted
@@ -99,20 +98,6 @@ def _oracle(o: np.ndarray) -> ObjectState:
     # One logged oracle_state row → the shared state message
     # (position, velocity, covariance, timestamp, valid).
     return ObjectState(o[:3], o[3:6], o[6:12], o[12], bool(o[13]))
-
-
-def _wall_hits(vel_xy: np.ndarray) -> np.ndarray:
-    """Frame indices where a velocity component flips sign (moving objects only).
-
-    On the hit frame the logged speed along that axis is nearly 0 (the position
-    is clamped at the wall), so compare against the last frame with a clear speed.
-    """
-    hits = set()
-    for axis in (0, 1):
-        idx = np.where(np.abs(vel_xy[:, axis]) > 0.02)[0]
-        s = np.sign(vel_xy[idx, axis])
-        hits.update((idx[:-1][s[1:] != s[:-1]] + 1).tolist())
-    return np.array(sorted(hits), dtype=int)
 
 
 def _read_episode(path: str) -> dict:
@@ -164,18 +149,15 @@ def run_episode(job: tuple[str, float, str, dict | None]) -> dict:
     #   found the object, valid=filter says state is good, dp/dv=pack error vs truth).
     # hor: per look-ahead time, error of the filter's guess (fe) and of the
     #   sim-truth straight-line guess (oe) vs where the object really went.
-    frames = {k: [] for k in ("has", "meas", "valid", "dp", "dv", "near_bounce", "warmup", "z",
+    frames = {k: [] for k in ("has", "meas", "valid", "dp", "dv", "warmup", "z",
                               "uv", "phat", "phat_true", "dps")}
-    hor = {h: {"fe": [], "oe": [], "bounce": []} for h in HORIZONS}
+    hor = {h: {"fe": [], "oe": []} for h in HORIZONS}
     if n == 0:
         return {"row": {**row, "start_ok": False}, "frames": frames, "hor": hor}
     # Sim stand-in for a detector: truth spawn pose is used once to find the
     # object in frame 0. After that the tracker sees pixels only.
     row["start_ok"] = est.start(rgb[0], orc[0, :3])
     row["mode"] = est.tracker.mode
-    # Times when the object hit a wall (velocity flipped). Used to split errors.
-    hit_t = ts[_wall_hits(orc[:, 3:5])]
-    row["wall_hits"] = int(len(hit_t))
     # Calm sim-truth p̂: truth position + truth speed averaged over the last
     # SMOOTH_S (a perfect causal filter of the truth could give this). In house
     # runs the logged speed zigzags (e.g. 5 / 17 cm/s on alternate frames), so
@@ -192,11 +174,6 @@ def run_episode(job: tuple[str, float, str, dict | None]) -> dict:
         frames["meas"].append(est.last_uv is not None)
         frames["has"].append(st is not None)
         frames["valid"].append(st is not None and st.valid)
-        # Mark recent wall hits because the filter may need time to relearn speed.
-        # This split looks backward from the current frame.
-        frames["near_bounce"].append(
-            bool(np.any((hit_t > ts[t] - BOUNCE_LOOKBACK_S) & (hit_t <= ts[t])))
-        )
         frames["warmup"].append(n_fixes <= WARMUP_FRAMES and est.n_redetects == 0)
         # Pack error: filter pack minus truth pack, same Δ, same helper.
         # dp = position part (m), dv = velocity part (m/s). NaN = no estimate yet.
@@ -224,16 +201,12 @@ def run_episode(job: tuple[str, float, str, dict | None]) -> dict:
             true = np.array([np.interp(ts[t] + h, ts, orc[:, i]) for i in (0, 1)])
             hor[h]["fe"].append(np.linalg.norm(st.predict(h).position[:2] - true))
             hor[h]["oe"].append(np.linalg.norm(o.predict(h).position[:2] - true))
-            hor[h]["bounce"].append(
-                bool(np.any((hit_t > ts[t] - BOUNCE_LOOKBACK_S) & (hit_t <= ts[t] + h)))
-            )
     # Episode summary row (goes to per_episode.csv).
     #   track_rate = share of frames where the camera found the object.
     #   valid_rate = share of frames where the filter called its state valid.
     dp = np.linalg.norm(np.asarray(frames["dp"]), axis=1)
     row["track_rate"] = float(np.mean(frames["meas"]))
     row["pack_p_median_cm"] = float(np.nanmedian(dp) * 100) if np.isfinite(dp).any() else None
-    row["filter_bounces"] = est.kf.n_bounces
     row["redetects"] = est.n_redetects
     row["valid_rate"] = float(np.mean(frames["valid"]))
     # Kept for --tune, which replays the filter on saved camera fixes (z) and truth packs.
@@ -315,13 +288,10 @@ def _group(results: list[dict]) -> dict:
       coverage / track_rate / valid_rate: how often we had a state / a camera fix / a valid state.
       pack_p, pack_v: position and velocity pack error vs truth (the G2a number is pack_p).
       *_after_warmup, *_warmup: split off the first fixes, where the filter still thinks speed = 0.
-      *_no_recent_hit, *_recent_hit: split by whether a wall bounce just happened.
-      horizons: error of the guess N ms ahead vs the real future, filter vs truth
-        straight-line, each split by "bounce in the window" or not.
+      horizons: error of the guess N ms ahead vs the real future, filter vs truth straight-line.
     """
     dp = np.concatenate([np.asarray(r["frames"]["dp"]).reshape(-1, 2) for r in results])
     dv = np.concatenate([np.asarray(r["frames"]["dv"]).reshape(-1, 2) for r in results])
-    near = np.concatenate([np.asarray(r["frames"]["near_bounce"], bool) for r in results])
     warm = np.concatenate([np.asarray(r["frames"]["warmup"], bool) for r in results])
     has = np.concatenate([np.asarray(r["frames"]["has"], bool) for r in results])
     meas = np.concatenate([np.asarray(r["frames"]["meas"], bool) for r in results])
@@ -332,7 +302,7 @@ def _group(results: list[dict]) -> dict:
     out = {
         "episodes": len(results),
         "start_failed": sum(not r["row"]["start_ok"] for r in results),
-        # Why scoring stopped: hold / off_table / off_area / end (house only differs).
+        # Why scoring stopped: hold / off_table / off_area / end.
         "stops": {k: sum(r["row"].get("stop") == k for r in results)
                   for k in ("hold", "lifted", "off_table", "off_area", "end")},
         "frames": int(len(ep)),
@@ -340,14 +310,11 @@ def _group(results: list[dict]) -> dict:
         "track_rate": round(float(meas.mean()), 4) if len(meas) else None,
         "valid_rate": round(float(valid.mean()), 4) if len(valid) else None,
         "redetects": sum(r["row"].get("redetects", 0) for r in results),
-        "recent_wall_hit_frames_frac": round(float(near.mean()), 4) if len(near) else None,
         "pack_p": _stats(ep),
         "pack_p_after_warmup": _stats(ep[~warm]),
         "pack_p_vs_calm_truth": _stats(eps),
         "pack_p_vs_calm_truth_after_warmup": _stats(eps[~warm]),
         "pack_p_warmup": _stats(ep[warm]),
-        "pack_p_no_recent_hit": _stats(ep[~near & ~warm]),
-        "pack_p_recent_hit": _stats(ep[near & ~warm]),
         "pack_v": _stats(np.linalg.norm(dv, axis=1)),
         "pack_v_after_warmup": _stats(np.linalg.norm(dv, axis=1)[~warm]),
         "horizons": {},
@@ -355,14 +322,9 @@ def _group(results: list[dict]) -> dict:
     for h in HORIZONS:
         fe = np.concatenate([np.asarray(r["hor"][h]["fe"]) for r in results])
         oe = np.concatenate([np.asarray(r["hor"][h]["oe"]) for r in results])
-        b = np.concatenate([np.asarray(r["hor"][h]["bounce"], bool) for r in results])
         out["horizons"][f"{int(h * 1000)}ms"] = {
             "filter_vs_true": _stats(fe),
             "oracle_vs_true": _stats(oe),
-            "filter_vs_true_no_bounce": _stats(fe[~b]),
-            "oracle_vs_true_no_bounce": _stats(oe[~b]),
-            "filter_vs_true_bounce": _stats(fe[b]),
-            "oracle_vs_true_bounce": _stats(oe[b]),
         }
     return out
 
@@ -430,25 +392,20 @@ def _plots(summary: dict, results: list[dict], out: Path) -> None:
     fig.savefig(out / "g2a_pack_error.png", dpi=150)
     plt.close(fig)
 
-    # 2 — error vs horizon at 20 cm/s: bounce-free windows | windows with a bounce.
+    # 2 — error vs horizon at 20 cm/s.
     moving20 = [r for r in results if abs(r["row"]["speed"] - 0.20) < 1e-6]
     g20 = _group(moving20)
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6), sharey=True)
+    fig, ax = plt.subplots(1, 1, figsize=(5.5, 3.6))
     hs = [int(h * 1000) for h in HORIZONS]
-    for ax, suffix, title in (
-        (axes[0], "_no_bounce", "no wall hit in the window"),
-        (axes[1], "_bounce", "wall hit in the window"),
-    ):
-        f = [g20["horizons"][f"{h}ms"][f"filter_vs_true{suffix}"].get("rmse_cm", np.nan) for h in hs]
-        o = [g20["horizons"][f"{h}ms"][f"oracle_vs_true{suffix}"].get("rmse_cm", np.nan) for h in hs]
-        ax.plot(hs, f, "-o", ms=8, color=BLUE, label="camera + filter")
-        ax.plot(hs, o, "-D", ms=7, color=ORANGE, label="sim truth, straight line")
-        ax.set_title(title, loc="left")
-        ax.set_xlabel("look-ahead (ms)")
-        ax.set_xticks(hs)
-    axes[0].set_ylabel("RMSE vs true future (cm)")
-    axes[0].legend(loc="upper left")
-    fig.suptitle("20 cm/s, demos + evals: prediction error vs the real future", x=0.01, ha="left")
+    f = [g20["horizons"][f"{h}ms"]["filter_vs_true"].get("rmse_cm", np.nan) for h in hs]
+    o = [g20["horizons"][f"{h}ms"]["oracle_vs_true"].get("rmse_cm", np.nan) for h in hs]
+    ax.plot(hs, f, "-o", ms=8, color=BLUE, label="camera + filter")
+    ax.plot(hs, o, "-D", ms=7, color=ORANGE, label="sim truth, straight line")
+    ax.set_xlabel("look-ahead (ms)")
+    ax.set_xticks(hs)
+    ax.set_ylabel("RMSE vs true future (cm)")
+    ax.legend(loc="upper left")
+    ax.set_title("20 cm/s: prediction error vs the real future", loc="left")
     fig.tight_layout()
     fig.savefig(out / "horizon_20cms.png", dpi=150)
     plt.close(fig)
@@ -553,9 +510,8 @@ def report(workers: int, out: Path, sets: str = "box", house_dirs=HOUSE_DIRS, n_
     summary = {
         "what": "G2a offline: static-cam tracker + CV Kalman vs sim-truth pack, free-object frames",
         "delta_s": conditioning_delta_s(load_yaml(SIM_CFG)),
-        "kalman": {k: getattr(kf, k) for k in ("meas_std", "accel_std", "bounce_accel_std",
-                                                "init_vel_std", "bounce_nis", "max_coast_s",
-                                                "outlier_m", "max_speed")},
+        "kalman": {k: getattr(kf, k) for k in ("meas_std", "accel_std", "init_vel_std",
+                                                "max_coast_s", "outlier_m", "max_speed")},
         "g2a_bars": {"median_cm": G2A_MEDIAN_M * 100, "rmse_cm": G2A_RMSE_M * 100, "speed": "20 cm/s"},
         "g2a": g2a,
         "groups": groups,
@@ -565,7 +521,7 @@ def report(workers: int, out: Path, sets: str = "box", house_dirs=HOUSE_DIRS, n_
     }
     (OUT / "summary.json").write_text(json.dumps(summary, indent=1))
     keys = ["set", "speed", "category", "mode", "start_ok", "n_free", "n_frames_total", "stop", "track_rate", "valid_rate",
-            "pack_p_median_cm", "wall_hits", "filter_bounces", "redetects", "path"]
+            "pack_p_median_cm", "redetects", "path"]
     with open(OUT / "per_episode.csv", "w", newline="") as fp:
         w = csv.DictWriter(fp, fieldnames=keys, extrasaction="ignore")
         w.writeheader()
@@ -607,7 +563,6 @@ def tune(workers: int) -> None:
     grid = {
         "meas_std": (0.001, 0.002, 0.004, 0.006, 0.008),
         "accel_std": (0.3, 0.5, 1.0, 2.0, 4.0),
-        "bounce_accel_std": (3.0, 10.0),
     }
     delta = conditioning_delta_s(load_yaml(SIM_CFG))
     rows = []

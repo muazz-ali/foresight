@@ -1,0 +1,40 @@
+---
+description: Every new or complex function/method must have a clear purpose-and-usage comment
+alwaysApply: true
+---
+
+# Comment new and complex code
+
+When you **add** a function, method, class, or non-obvious block, write a short comment that says **what it is for** and **how to use it**. Same for non-trivial edits that change behavior.
+
+## Required
+- **New public function / method / class:** docstring (or plain block comment) with purpose + how callers use it.
+- **Complex logic** (timing, filters, forecasts, buffers, IK, gates): say *why* the trick exists in one plain sentence, then the steps if needed.
+- Prefer everyday words (see `05-plain-english.mdc`). One short “why” beats a long design essay.
+
+## Skip
+- One-liner getters, obvious renames, pure test fixtures with a clear name.
+- Do not restate the code (`i += 1  # increment i`).
+
+## Shape (Python)
+
+```python
+def sample(self, t0: float, *, mode: Mode = "train") -> DelaySample:
+    """Draw one cycle's applied/reported delay and append to the log.
+
+    Call once per control step after you know the frame capture time ``t0``.
+    Train mode draws Δ; eval mode uses ``eval_delta_s``. Motions from this
+    frame must not run before ``sample.apply_at`` (t0 + applied Δ).
+    """
+```
+
+## Bad
+```python
+def sample(self, t0, mode="train"):  # samples
+    ...
+```
+
+## Checklist before finishing an edit
+1. Every new callable you added has a purpose + usage note.
+2. Every tricky block has a one-line “why”.
+3. Comments match the code (no stale or invented APIs).

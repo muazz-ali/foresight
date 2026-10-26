@@ -1,23 +1,22 @@
 """In-repo Franka Phase-0 scene (Isaac Lab). Import only AFTER AppLauncher.
 
-Owns: Franka Panda + work surface + one rigid object + static container
+Owns: Franka Panda + house USD table + one rigid object + static container
 + static/wrist cameras + DiffIK.
 
-``scene.use_house: true`` loads a random house USD (paths.scene_dir), moves it
-so a free long table edge sits at the world origin (robot stays at 0,0,0),
-randomizes lights, and aims throws across a catch band. 
-Floor mode keeps the old kinematic slab.
+Loads a random house USD (paths.scene_dir), moves it so a free long table
+edge sits at the world origin (robot stays at 0,0,0), randomizes lights, and
+aims throws across a catch band. Misses coast off the table.
 
-Grasp (``scene.use_weld_grasp``): house default = real PhysX (fingers close,
-no weld; the object is scripted until the expert closes, then free). Floor
-default = legacy weld. House throws never bounce; a miss coasts off the table.
+Grasp (``scene.use_weld_grasp``): default = real PhysX (fingers close, no weld;
+object is scripted until the expert closes, then free). Optional weld override.
 
-Meshes (object + container USDs, and the house when enabled) are fixed for the
-process lifetime (plan 2A). Diversify across workers / restarts via asset_seed.
+Meshes (object + container USDs + house) are fixed for the process lifetime
+(plan 2A). Diversify across workers / restarts via asset_seed.
 
 Runs once at start (build the world), then every control step (move things, step physics).
-Timing: control step ``sim.dt`` (25 Hz: expert, policy, cameras, logs). House mode runs
-``sim.physics_substeps`` PhysX steps inside each control step (floor mode: always 1).
+Timing: control step ``sim.dt`` (claim default 30 Hz: expert, policy, cameras, logs).
+``sim.physics_substeps`` PhysX steps run inside each control step.
+Each camera update stamps ``last_capture_t0`` (sim time).
 Why here: Foresight owns the scene and the object's motion.
 Must not: pick or judge grasps. The expert and success rules live elsewhere.
 """
@@ -309,18 +308,17 @@ class Phase0Scene:
         self._asset_seed = int(asset_seed)
 
         sc = _require(cfg, "scene")
-        self._use_house = bool(sc.get("use_house", False))
 
         # Control rate stays dt (expert, policy, cameras, logs). Physics runs
-        # ``n_substeps`` smaller steps inside each control step (house only;
-        # floor is always 1). render_interval = n: one render per control step
+        # ``n_substeps`` smaller steps inside each control step.
+        # render_interval = n: one render per control step
         # (Isaac Lab DirectRLEnv uses the same decimation pattern).
         self.n_substeps = physics_substeps(cfg)
         self.physics_dt = dt / self.n_substeps
 
         # Isaac calls must come after AppLauncher has started (see module top).
         if self.n_substeps == 1:
-            sim_cfg = sim_utils.SimulationCfg(dt=dt, device=device)  # legacy, unchanged
+            sim_cfg = sim_utils.SimulationCfg(dt=dt, device=device)
         else:
             sim_cfg = sim_utils.SimulationCfg(
                 dt=self.physics_dt, render_interval=self.n_substeps, device=device
@@ -334,45 +332,21 @@ class Phase0Scene:
         )
         self._house_meta: dict[str, Any] = {}
         self._play_layout = None
-        self._table_box: tuple[np.ndarray, np.ndarray] | None = None  # house table XY footprint
-        # Weld = old scripted glue. Default: weld on the floor slab, real physics in a house.
-        self._weld = bool(sc.get("use_weld_grasp", not self._use_house))
-        # Bounce only in the legacy floor box. House throws coast straight.
-        self._bounce = not self._use_house
+        self._table_box: tuple[np.ndarray, np.ndarray] | None = None  # table XY footprint
+        # Weld = optional scripted glue. Default = real PhysX grasp.
+        self._weld = bool(sc.get("use_weld_grasp", False))
 
         # One seeded rng for house + mesh choice (same asset_seed → same world).
         asset_rng = np.random.default_rng(self._asset_seed)
 
-        # Invisible floor under the work surface. House mode drops it slightly so
-        # it does not fight the table top at z=0.
-        ground_z = -0.1 if self._use_house else 0.0
+        # Invisible floor under the table (slightly low so it does not fight z=0).
         sim_utils.GroundPlaneCfg().func(
             "/World/GroundPlane",
             sim_utils.GroundPlaneCfg(),
-            translation=(0.0, 0.0, ground_z),
+            translation=(0.0, 0.0, -0.1),
         )
 
-        if self._use_house:
-            self._setup_house_world(cfg, asset_rng)
-        else:
-            light_cfg = sim_utils.DomeLightCfg(intensity=800.0, color=(0.95, 0.95, 0.95))
-            light_cfg.func("/World/Light", light_cfg)
-            try:
-                table_size = tuple(float(x) for x in sc["table_size"])
-                table_pos = tuple(float(x) for x in sc["table_pos"])
-            except KeyError as ex:
-                logger.error("missing required yaml key: scene.%s", ex.args[0])
-                raise KeyError(f"scene.{ex.args[0]}") from None
-            # Table is kinematic: fixed solid slab, never pushed.
-            table_cfg = sim_utils.CuboidCfg(
-                size=table_size,
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-                collision_props=sim_utils.CollisionPropertiesCfg(),
-                visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(0.45, 0.35, 0.25)
-                ),
-            )
-            table_cfg.func("/World/Table", table_cfg, translation=table_pos)
+        self._setup_house_world(cfg, asset_rng)
 
         robot_cfg = FRANKA_PANDA_HIGH_PD_CFG.copy()
         robot_cfg.prim_path = "/World/Robot"
@@ -425,6 +399,8 @@ class Phase0Scene:
         self._active_usd: Path | None = None
         self._object_size: np.ndarray | None = None
         self._object_half_height = self._object_radius
+        # Per-episode sit height (tipped cans use diameter/2, not upright height/2).
+        self._episode_object_half_height = float(self._object_half_height)
         self.abort_reason: str | None = None  # set mid-episode by safety checks
 
         if not self._use_primitive:
@@ -471,12 +447,10 @@ class Phase0Scene:
                 100.0 * float(self._object_half_height),
             )
 
-        # Table top Z. House mode maps the chosen table edge to z=0.
-        self._table_z = (
-            float(self._play_layout.table_z)
-            if self._play_layout is not None
-            else float(_require(cfg, "scene", "table_height"))
-        )
+        # Table top Z. Layout maps the chosen table edge to z=0.
+        if self._play_layout is None:
+            raise RuntimeError("house layout missing after _setup_house_world")
+        self._table_z = float(self._play_layout.table_z)
 
         # Start resting on the table top. Real start pose is set in reset_episode.
         z0 = self._table_z + self._object_half_height
@@ -637,7 +611,7 @@ class Phase0Scene:
         self.ik = DifferentialIKController(ik_cfg, num_envs=1, device=self.robot.device)
 
         # Three object velocities on purpose:
-        #   _obj_velocity  — live speed that drives the slide (wall bounces flip it)
+        #   _obj_velocity  — live speed that drives the coast
         #   _obj_speed_cmd — same speed latched, so a grab/release does not lose it
         #   _obj_vel_obs   — measured after the step; what logs and the policy see
         self._obj_velocity = np.zeros(3, dtype=np.float64)
@@ -658,6 +632,8 @@ class Phase0Scene:
             (float(bounds[1][0]), float(bounds[1][1])),
         )
         self._sim_time = 0.0
+        # Sim time of the last camera render (Step 1 frame stamp t0).
+        self._last_capture_t0 = 0.0
         self._gripper_open = float(_require(cfg, "robot", "gripper_open"))
         self._gripper_close = float(_require(cfg, "robot", "gripper_close"))
         # Last commanded open∈[0,1]. Attach grasp snaps fingers to this (no squeeze).
@@ -696,10 +672,19 @@ class Phase0Scene:
         for _try in range(40):
             try:
                 cand = pick_house(scene_dir, asset_rng, cam_specs, max_tries=1)
+                # Prefer yaml container_xy (meters after cfg_units); else house defaults.
+                bowl_kw: dict = {}
+                ctr = cfg["scene"].get("container_xy")
+                if ctr is not None and len(ctr) >= 2:
+                    bowl_kw["container_x"] = float(ctr[0])
+                    bowl_kw["container_y"] = float(ctr[1])
                 layout = compute_play_layout(
                     cand.table_bbox_min_w,
                     cand.table_bbox_max_w,
-                    max_reach_dist=min(max_reach, 0.75),
+                    # Full arm reach: old min(..., 0.75) clipped far-edge spawns
+                    # to mid-table on short coffee tables.
+                    max_reach_dist=float(max_reach),
+                    **bowl_kw,
                 )
                 house = cand
                 break
@@ -1012,45 +997,83 @@ class Phase0Scene:
         rng = np.random.default_rng(int(seed))
 
         speed = float(speed)
-        (xmin, xmax), (ymin, ymax) = self._xy_bounds
         pad = self._spawn_xy_pad
-        z = self._table_z + self._object_half_height
+        sc = self.cfg.get("scene", {}) if isinstance(self.cfg.get("scene"), dict) else {}
+        throw_r = float(sc.get("throw_randomness", 1.0))
 
-        if self._use_house:
-            # Throw toward the bowl (straight / diagonal / side). Catch is still
-            # inside the play band; a miss heads at the bowl and fail-fasts.
-            from sim.house_layout import sample_throw
+        # Throw: always +X → −X (toward robot). randomness only spreads the Y angle.
+        from sim.house_layout import (
+            ROLL_TIP_CATEGORIES,
+            sample_throw,
+            sit_half_height_m,
+            tip_on_side_quat_wxyz,
+        )
 
-            bowl_xy = None
-            if self.container is not None:
-                bowl_xy = (
-                    self._play_layout.container_xy
-                    if self._play_layout is not None
-                    else self._container_pos[:2]
-                )
-            pos0, lin_vel = sample_throw(
-                rng,
-                self._xy_bounds,
-                speed=speed,
-                spawn_pad=pad,
-                container_xy=bowl_xy,
-            )
-            pos = np.array([pos0[0], pos0[1], z], dtype=np.float64)
+        pos0, lin_vel = sample_throw(
+            rng,
+            self._xy_bounds,
+            speed=speed,
+            spawn_pad=pad,
+            throw_randomness=throw_r,
+        )
+
+        # Tip cans/bottles/cups on their side so they can roll (not upright slide).
+        # Empty tip_roll_categories → never tip (physics grasp cannot reach the
+        # low center of a side-lying can; see phase0_cfg comment).
+        tip_cats = sc.get("tip_roll_categories")
+        tip_set = (
+            {str(c).lower() for c in tip_cats}
+            if tip_cats is not None
+            else set(ROLL_TIP_CATEGORIES)
+        )
+        cat = (
+            "primitive"
+            if self._use_primitive
+            else (self._active_usd.parent.name if self._active_usd is not None else "")
+        )
+        tip = (not self._use_primitive) and cat.lower() in tip_set and speed > 1e-6
+        upright = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        size = (
+            self._object_size
+            if self._object_size is not None
+            else np.array([0.06, 0.06, 0.06], dtype=np.float64)
+        )
+        if tip:
+            quat = tip_on_side_quat_wxyz(lin_vel[:2], rng).astype(np.float64)
+            sit_h = sit_half_height_m(size, tipped=True)
         else:
-            # Floor mode: random start + random heading (legacy G0).
-            if speed <= 1e-6:
-                lin_vel = np.zeros(3, dtype=np.float64)
-            else:
-                angle = float(rng.uniform(0.0, 2.0 * np.pi))
-                lin_vel = np.array(
-                    [speed * np.cos(angle), speed * np.sin(angle), 0.0],
-                    dtype=np.float64,
+            quat = upright.copy()
+            sit_h = float(self._object_half_height)
+        # Episode sit height (coast keeps this Z). Upright mesh uses mesh half-height.
+        self._episode_object_half_height = float(sit_h)
+        pos = np.array(
+            [pos0[0], pos0[1], self._table_z + sit_h], dtype=np.float64
+        )
+        # Far-rim spawn is the play +X edge; mesh half-width can hang past the
+        # table (egg seed-50194: center 0.78 → PhysX walked it to 0.82 off-table
+        # during settle). Pull the center in by half-XY + 5 mm.
+        half_xy = 0.5 * float(max(abs(size[0]), abs(size[1])))
+        rim_pad = float(half_xy) + 0.005
+        if self._table_box is not None:
+            pos[0] = min(float(pos[0]), float(self._table_box[1][0]) - rim_pad)
+            pos[0] = max(float(pos[0]), float(self._table_box[0][0]) + rim_pad)
+            pos[1] = float(
+                np.clip(
+                    pos[1],
+                    float(self._table_box[0][1]) + rim_pad,
+                    float(self._table_box[1][1]) - rim_pad,
                 )
-            x = float(rng.uniform(xmin + pad, xmax - pad))
-            y = float(rng.uniform(ymin + pad, ymax - pad))
-            pos = np.array([x, y, z], dtype=np.float64)
-
-        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            )
+        (bx0, bx1), (by0, by1) = self._xy_bounds
+        pos[0] = float(np.clip(pos[0], bx0, bx1))
+        pos[1] = float(np.clip(pos[1], by0, by1))
+        # Cap spawn inside arm reach. Long tables put the far rim at ~1.5 m
+        # (smoke i14); DiffIK never meets the object before the catch-box exit.
+        robot_cfg = self.cfg.get("robot", {}) if isinstance(self.cfg.get("robot"), dict) else {}
+        max_reach = float(robot_cfg.get("max_reach_dist", 0.85))
+        reach_spawn_cap = max(float(bx0) + 0.05, float(max_reach) - 0.05)
+        if float(pos[0]) > reach_spawn_cap:
+            pos[0] = reach_spawn_cap
 
         # Small random box shift per episode, clipped to where the arm can reach.
         # House layout already parked the bowl off the throw band.
@@ -1095,7 +1118,7 @@ class Phase0Scene:
         if self.container is not None:
             croot = torch.zeros((1, 13), device=self.robot.device, dtype=torch.float32)
             croot[0, 0:3] = torch.tensor(self._container_pos, device=self.robot.device)
-            croot[0, 3:7] = torch.tensor(quat, device=self.robot.device)
+            croot[0, 3:7] = torch.tensor(upright, device=self.robot.device)
             self.container.write_root_state_to_sim(croot)
             self.container.write_data_to_sim()
 
@@ -1103,26 +1126,35 @@ class Phase0Scene:
             self._distractor_pos = self._place_distractor(pos, rng)
             droot = torch.zeros((1, 13), device=self.robot.device, dtype=torch.float32)
             droot[0, 0:3] = torch.tensor(self._distractor_pos, device=self.robot.device)
-            droot[0, 3:7] = torch.tensor(quat, device=self.robot.device)
+            droot[0, 3:7] = torch.tensor(upright, device=self.robot.device)
             self.distractor.write_root_state_to_sim(droot)
             self.distractor.write_data_to_sim()
 
         self.robot.write_data_to_sim()
 
-        # A few idle control steps so everything settles before the episode starts.
+        # Pin kinematic hold BEFORE settle. Without `_coast_pos`, each substep
+        # read back a PhysX-nudged rim pose and wrote it again — the object
+        # walked off the far edge before the throw armed (smoke egg @ 0.15).
+        self._obj_kinematic = True
+        self._phys_free = False
+        self._obj_velocity = np.zeros(3, dtype=np.float64)
+        self._coast_pos = None if self._weld else pos.copy()
+        self.off_table = False
+        self.abort_reason = None
+
+        # A few idle control steps so the arm settles; object stays pinned.
         for _ in range(8):
             for k in range(self.n_substeps):
                 self._physics_substep(last=(k == self.n_substeps - 1))
 
-        # Clear all per-episode state so nothing leaks from the last run.
+        # Arm the throw from the commanded spawn (ignore any settle jitter).
         self._obj_velocity = lin_vel.copy()
         self._obj_speed_cmd = lin_vel.copy()
         self._obj_vel_obs = lin_vel.copy()
-        self._prev_obj_pos = (
-            self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64).copy()
-        )
-        # Scripted throw path (physics grasp): starts where the object settled.
-        self._coast_pos = None if self._weld else self._prev_obj_pos.copy()
+        if not self._weld:
+            self._coast_pos = pos.copy()
+            self._write_object_pose(pos, quat, np.zeros(3))
+        self._prev_obj_pos = pos.copy()
         self._obj_kinematic = True
         self._phys_free = False
         self.off_table = False
@@ -1132,6 +1164,7 @@ class Phase0Scene:
         self._freeze_pose: tuple[np.ndarray, np.ndarray] | None = None
         self._was_frozen = False
         self._sim_time = 0.0
+        self._last_capture_t0 = 0.0
         self._last_gripper_open = 1.0
         self.ik.reset()
 
@@ -1143,7 +1176,12 @@ class Phase0Scene:
             "category": "primitive" if self._use_primitive else (
                 self._active_usd.parent.name if self._active_usd else "object"
             ),
-            "object_half_height": float(self._object_half_height),
+            # Sit height this episode (tipped cans: diameter/2). Expert uses this for z_grasp.
+            "object_half_height": float(self._episode_object_half_height),
+            "object_half_height_upright": float(self._object_half_height),
+            "object_tipped": bool(tip),
+            "throw_randomness": float(throw_r),
+            "table_z": float(self._table_z),
             "container_usd": str(self._container_usd) if self._container_usd else None,
             "container_category": (
                 self._container_usd.parent.name if self._container_usd else None
@@ -1161,10 +1199,9 @@ class Phase0Scene:
             "tags": [tag],
             "init_pos": pos.tolist(),
             "init_vel": lin_vel.tolist(),
-            "use_house": bool(self._use_house),
+            "init_quat_wxyz": quat.tolist(),
             "grasp_mode": "weld" if self._weld else "physics",
-            "bounce": bool(self._bounce),
-            **(self._house_meta if self._use_house else {}),
+            **self._house_meta,
         }
         return dict(self._meta)
 
@@ -1211,7 +1248,7 @@ class Phase0Scene:
         else:
             pos = self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
             # Post-step pose FD. With kinematic_enabled, this should match the
-            # scripted motion command (constant velocity + wall bounce).
+            # scripted coast command (constant velocity).
             vel = self._obj_vel_obs.copy()
         return oracle_from_gt(pos, vel, timestamp=self._sim_time, valid=True)
 
@@ -1250,7 +1287,7 @@ class Phase0Scene:
 
         Same math as ``conditioning_vector`` / ``ObjectState.predict``.
 
-        Table bounce stays in ``kinematic_advance`` (world motion), not in this predictor.
+        Coast stays in ``kinematic_advance`` (world motion), not in this predictor.
         When the object is welded to the EE or free in PhysX, return now.
         """
         now = self.get_object_state()
@@ -1298,13 +1335,26 @@ class Phase0Scene:
             target[0, fi] = finger
         self.robot.set_joint_position_target(target)
 
+    @property
+    def last_capture_t0(self) -> float:
+        """Sim time when the latest camera frames were captured (Step 1 stamp)."""
+        return float(self._last_capture_t0)
+
     def get_images(self) -> dict[str, np.ndarray]:
-        """Latest RGB frame per camera, keyed by camera name."""
+        """Latest RGB frame per camera, keyed by camera name.
+
+        Capture time is ``last_capture_t0`` (set at the end of ``step`` when
+        cameras update). Use ``get_image_packet`` when you need both together.
+        """
         out: dict[str, np.ndarray] = {}
         for name, cam in self.cameras.items():
             if "rgb" in cam.data.output:
                 out[name] = cam.data.output["rgb"][0].detach().cpu().numpy()
         return out
+
+    def get_image_packet(self) -> tuple[dict[str, np.ndarray], float]:
+        """RGB frames plus their capture sim-time t0 (same stamp for all cams)."""
+        return self.get_images(), self.last_capture_t0
 
     @property
     def weld_grasp(self) -> bool:
@@ -1321,6 +1371,32 @@ class Phase0Scene:
     def get_wrist_depth_m(self) -> float:
         """Nearest thing between the fingertips in the wrist view (m). NaN = no reading."""
         return gripper_depth_m(self.get_wrist_depth())
+
+    def get_wrist_cam_pose(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Wrist camera world pose: (position xyz, quat wxyz), or None if off.
+
+        Use this for depth→height (cam sits on the hand, not at the TCP).
+        """
+        cam = self.cameras.get("wrist_cam")
+        if cam is None:
+            return None
+        pos = cam.data.pos_w[0].detach().cpu().numpy().astype(np.float64).copy()
+        quat = cam.data.quat_w_world[0].detach().cpu().numpy().astype(np.float64).copy()
+        return pos, quat
+
+    def get_static_depth(self) -> np.ndarray | None:
+        """Static camera depth (H, W) float32 metres, or None if depth is off."""
+        cam = self.cameras.get("static_cam")
+        if cam is None or "depth" not in cam.data.output:
+            return None
+        return cam.data.output["depth"][0, ..., 0].detach().cpu().numpy().astype(np.float32)
+
+    def static_cam_z(self) -> float:
+        """World Z of the static camera (for rough depth→height)."""
+        cam = self.cameras.get("static_cam")
+        if cam is None:
+            return float(self._table_z) + 0.6
+        return float(cam.data.pos_w[0, 2].detach().cpu().item())
 
     def _write_object_pose(self, pos: np.ndarray, quat: np.ndarray, vel: np.ndarray) -> None:
         """Teleport the object to a pose and tell PhysX its speed (we move it, not physics)."""
@@ -1348,25 +1424,45 @@ class Phase0Scene:
             # each step (tools/diag/check_coast_speed.py), which used to add up
             # to a throw ~20% slower than commanded.
             pos = self._coast_pos
-        # Bounce only in floor mode. House / throw: xy_bounds=None → straight line.
+        # Coast straight; a miss leaves the table.
         new_pos, new_vel = kinematic_advance(
             pos,
             self._obj_velocity,
             self.physics_dt,
-            xy_bounds=self._xy_bounds if self._bounce else None,
         )
         # Keep it flat on the table: motion is XY only.
-        new_pos[2] = self._table_z + self._object_half_height
+        new_pos[2] = self._table_z + float(self._episode_object_half_height)
         self._obj_velocity = new_vel
         if not self._weld:
             self._coast_pos = new_pos.copy()
         # Dynamic body: PhysX velocity 0 so it does not add a second v·dt.
         self._write_object_pose(new_pos, quat, new_vel if self._weld else np.zeros(3))
 
-    def _free_object(self) -> None:
-        """Hand the object to PhysX (physics grasp / fell off the table). Keeps its speed once."""
+    def _ee_lin_vel_w(self) -> np.ndarray:
+        """Hand linear velocity in world (m/s). Used to match the object on grasp free."""
+        return (
+            self.robot.data.body_lin_vel_w[0, self._ee_idx]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+
+    def _free_object(self, *, match_ee: bool = False) -> None:
+        """Hand the object to PhysX (physics grasp / fell off the table).
+
+        ``match_ee=True`` (grasp close): give the object the hand's velocity so
+        relative speed ≈ 0 when the fingers shut. 
+        Coast speed alone made ≥50 cm/s closes slip, then retries chased off the table (ee-off-table).
+        """
+        if match_ee:
+            vel = self._ee_lin_vel_w()
+            self._obj_velocity = vel.copy()
+            self._obj_vel_obs = vel.copy()
+        else:
+            vel = np.asarray(self._obj_velocity, dtype=np.float64).reshape(3)
         v = torch.zeros((1, 6), device=self.robot.device, dtype=torch.float32)
-        v[0, 0:3] = torch.tensor(self._obj_velocity, device=self.robot.device)
+        v[0, 0:3] = torch.tensor(vel, device=self.robot.device, dtype=torch.float32)
         self.object.write_root_velocity_to_sim(v)
         self._phys_free = True
         self._obj_kinematic = False
@@ -1378,29 +1474,31 @@ class Phase0Scene:
         object keeps being teleported along its path until the next ``step`` call
         gets ``attach_object=True``. One-way, like the expert's close.
         Weld mode: does nothing, returns False (weld needs ``attach_object``).
+        Match hand speed so a mid-step reflex close does not free at coast speed.
         """
         if self._weld:
             return False
         if not self._phys_free:
-            self._free_object()
+            self._free_object(match_ee=True)
         return True
 
     def _step_physics_object(self, release: bool) -> None:
         """Physics-grasp object update, before ``sim.step``.
 
-        Scripted coast (no bounce) until the expert closes (``release``) or the
+        Scripted coast until the expert closes (``release``) or the
         object leaves the table footprint (then it falls: a real miss).
         """
         if self._phys_free:
             return
         if release:
-            self._free_object()
+            # Grasp free: match hand velocity so fingers can close without a 50 cm/s shear.
+            self._free_object(match_ee=True)
             return
         self._write_kinematic_object()
         pos = self.object.data.root_pos_w[0].detach().cpu().numpy()  # pose we just wrote
         if self._table_box is not None and xy_outside_box(pos[:2], *self._table_box):
             self.off_table = True
-            self._free_object()
+            self._free_object(match_ee=False)
 
     def check_safety_abort(self, *, attached: bool) -> str | None:
         """Return a short reason to stop the episode early, else None.
@@ -1434,14 +1532,18 @@ class Phase0Scene:
             return self.abort_reason
 
         # Through the place box while still on the scripted path.
+        # Skip when the hand is already on the object (about to close): a 50 cm/s
+        # near-hit used to die as object-through-container with gap ~2 cm.
         if self.container is not None and self._container_size is not None:
-            half = 0.5 * np.asarray(self._container_size[:2], dtype=np.float64)
-            # Shrink slightly so sitting *next to* the box is fine; only the interior counts.
-            half = np.maximum(half - 0.01, 0.01)
-            cxy = self._container_pos[:2]
-            if np.all(np.abs(obj[:2] - cxy) <= half):
-                self.abort_reason = "object-through-container"
-                return self.abort_reason
+            hand_gap = float(np.linalg.norm(ee[:3] - obj[:3]))
+            if hand_gap > 0.05:
+                half = 0.5 * np.asarray(self._container_size[:2], dtype=np.float64)
+                # Shrink slightly so sitting *next to* the box is fine; only the interior counts.
+                half = np.maximum(half - 0.01, 0.01)
+                cxy = self._container_pos[:2]
+                if np.all(np.abs(obj[:2] - cxy) <= half):
+                    self.abort_reason = "object-through-container"
+                    return self.abort_reason
         return None
 
     def _write_attached_object(self) -> None:
@@ -1554,7 +1656,7 @@ class Phase0Scene:
             self._was_frozen = False
             self._write_attached_object()
         else:
-            # After place, keep pinning — never resume table-slide / bounce bounds.
+            # After place, keep pinning — never resume table-slide.
             if self._was_frozen and self._freeze_pose is not None:
                 self._obj_velocity[:] = 0.0
                 pos, quat = self._freeze_pose
@@ -1571,8 +1673,7 @@ class Phase0Scene:
     def _physics_substep(self, *, last: bool) -> None:
         """One PhysX step + refresh the asset buffers. Renders only on the ``last`` substep.
 
-        n_substeps == 1 keeps the legacy call (``sim.step()`` steps physics AND
-        renders), so floor mode is bit-for-bit what it was.
+        n_substeps == 1 keeps ``sim.step()`` (physics AND render in one call).
         """
         if self.n_substeps == 1:
             self.sim.step()
@@ -1595,13 +1696,13 @@ class Phase0Scene:
     ) -> None:
         """Advance the world one CONTROL step (``dt``). The expert calls this once per step.
 
-        Physics runs ``n_substeps`` times inside it (``physics_dt = dt / n``; house
-        mode only, floor is 1). Cameras render once, at the end. Logs, timestamps
-        and images stay at the control rate.
+        Physics runs ``n_substeps`` times inside it (``physics_dt = dt / n``).
+        Cameras render once, at the end. Logs, timestamps and images stay at
+        the control rate.
 
         Weld mode, object has three modes, checked in this order:
         frozen (placed, pinned) > attached (held in hand) > sliding on the table.
-        Physics mode: scripted coast (no bounce) until the expert closes, then PhysX.
+        Physics mode: scripted coast until the expert closes, then PhysX.
         Order per substep: [substep_cb] → write object / robot / container →
         PhysX step → refresh buffers → re-fix anything physics nudged.
         After the last substep: update cameras, measure object speed.
@@ -1622,7 +1723,7 @@ class Phase0Scene:
           - It must NOT call ``step`` and cannot change kinematic / attach /
             freeze for this control step (those are this call's arguments).
           - k = 0 sees the same state the caller saw before ``step``.
-        Calls per control step = ``n_substeps`` (1 in floor mode).
+        Calls per control step = ``n_substeps``.
         """
         n = self.n_substeps
         for k in range(n):
@@ -1675,4 +1776,6 @@ class Phase0Scene:
             self._sim_time = round(self._sim_time / self.dt) * self.dt
         for cam in self.cameras.values():
             cam.update(self.dt)
+        # Stamp frames with the sim time of this render (Step 1 t0).
+        self._last_capture_t0 = float(self._sim_time)
         self._refresh_object_vel_obs()

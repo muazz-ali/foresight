@@ -25,7 +25,7 @@ from sim.house_layout import (
 SCENE_DIR = Path("/home/gpuadmin/Desktop/muazzam/scenes")
 # One camera, foresight yaml style: {name, position, rotation_deg}.
 CAMERAS = [
-    {"name": "static_cam", "position": [1.0, 0.0, 0.60], "rotation_deg": [0.0, 60.0, 90.0]}
+    {"name": "static_cam", "position": [1.2, 0.0, 0.80], "rotation_deg": [0.0, 48.0, 90.0]}
 ]
 
 _has_pxr = True
@@ -92,7 +92,7 @@ def test_pick_house_puts_anchor_at_origin_and_layout_valid():
 
     (xlo, xhi), (ylo, yhi) = layout.object_xy_bounds
     assert xlo < xhi and ylo < yhi  # positive area
-    assert (xhi - xlo) >= 0.12 - 1e-9
+    assert (xhi - xlo) >= 0.35 - 1e-9  # min runway for ≤50 cm/s chase
     assert layout.table_z == 0.0
 
     # container is clear of the play band by >= 3 cm
@@ -117,13 +117,31 @@ def test_compute_play_layout_positive_area_and_container_outside_band():
     layout = _synthetic_layout()
     (xlo, xhi), (ylo, yhi) = layout.object_xy_bounds
     assert xlo < xhi and ylo < yhi
-    assert xlo >= 0.32 - 1e-9 and xhi <= 0.75 - 0.08 + 1e-9
-    cy = float(layout.container_xy[1])
-    # pocket must clear the play band with a >=3cm gap
-    assert cy - 0.04 >= yhi + 0.03 - 1e-9 or cy + 0.04 <= ylo - 0.03 + 1e-9
+    assert xlo >= 0.30 - 1e-9
+    # Far X reaches near the real table rim (bmax=1.30 − 2 cm), not mid-table.
+    assert xhi >= 1.20 - 1e-6
+    cx, cy = float(layout.container_xy[0]), float(layout.container_xy[1])
+    # Toward +Y rim, clear of play, but reach-clamped (not raw rim 0.64).
+    assert cy >= 0.28 - 1e-6
+    assert cy <= 0.64 + 1e-6
+    assert cy - 0.04 >= yhi + 0.03 - 1e-9
+    # Default seed 0.43 − 3 cm toward −X.
+    assert cx == pytest.approx(0.40, abs=1e-6)
     # clip box never overlaps the play band in y
     (_, _), (clo, chi) = layout.container_xy_clip
-    assert clo >= yhi + 0.03 - 1e-9 or chi <= ylo - 0.03 + 1e-9
+    assert clo >= yhi - 1e-9
+    assert chi > clo
+
+
+def test_throw_spawns_on_far_x_edge_not_mid_table():
+    """Spawn X must sit on the play-band +X rim (policy needs a long track runway)."""
+    bounds = ((0.40, 0.80), (-0.14, 0.14))
+    for s in range(50):
+        out = _sample_throw_full(
+            np.random.default_rng(s), bounds, speed=0.5, throw_randomness=1.0
+        )
+        assert out["spawn"][0] == pytest.approx(0.80, abs=1e-9)
+        assert out["spawn"][0] > out["target"][0] - 1e-9  # heads toward robot
 
 
 def test_compute_play_layout_raises_on_empty():
@@ -143,59 +161,39 @@ def test_compute_play_layout_raises_on_empty():
 # "dot(vel, +X) > 0" is the wrong check. We assert the honest invariant: the
 # aim target lies in the catch band and the velocity points toward it.)
 # --------------------------------------------------------------------------
-def test_sample_throw_velocity_points_toward_catch_band():
+def test_sample_throw_uses_180_deg_fan_toward_robot():
+    """r sets the fan around 90° (straight at robot); velocity stays in the half-plane."""
     rng = np.random.default_rng(7)
-    bounds = ((0.40, 0.66), (-0.14, 0.14))  # symmetric -> reach_dir ~ +X
-    catch_band = (0.38, 0.55)
-    lateral = 0.18
-    for _ in range(300):
-        out = _sample_throw_full(
-            rng, bounds, speed=0.3, catch_band=catch_band, lateral=lateral
-        )
-        spawn, vel, target = out["spawn"], out["vel_xy"], out["target"]
-        reach_dir = out["reach_dir"]
-
-        # velocity magnitude is the requested speed
-        assert np.linalg.norm(vel) == pytest.approx(0.3, rel=1e-6)
-        # velocity points toward the catch point (into the band)
-        d = target - spawn
-        if np.linalg.norm(d) > 1e-6:
-            assert float(np.dot(vel, d)) > 0.0
-
-        # the catch point really sits inside the band
-        along = float(np.dot(target, reach_dir))
-        across = float(np.dot(target, [-reach_dir[1], reach_dir[0]]))
-        assert catch_band[0] - 1e-9 <= along <= catch_band[1] + 1e-9
-        assert abs(across) <= lateral + 1e-9
+    bounds = ((0.40, 0.66), (-0.14, 0.14))
+    for r, lo, hi in ((0.0, 90.0, 90.0), (0.5, 45.0, 135.0), (1.0, 0.0, 180.0)):
+        angles = []
+        for _ in range(200):
+            out = _sample_throw_full(rng, bounds, speed=0.3, throw_randomness=r)
+            ang = float(out["throw_angle_deg"])
+            vel = out["vel_xy"]
+            angles.append(ang)
+            assert np.linalg.norm(vel) == pytest.approx(0.3, rel=1e-6)
+            assert vel[0] <= 1e-9  # never away from the robot (+X)
+            assert lo - 1e-6 <= ang <= hi + 1e-6
+        if r > 0.0:
+            assert max(angles) - min(angles) > 20.0 * r
 
 
-def test_sample_throw_aims_toward_bowl_with_side_variety():
-    """With a bowl XY, throws head toward it (straight / diagonal / side)."""
+def test_sample_throw_ignores_bowl_and_goes_toward_robot():
+    """Bowl XY must not steer the throw; heading stays in the 180° robot-facing fan."""
     rng = np.random.default_rng(21)
     bounds = ((0.40, 0.66), (-0.14, 0.14))
-    bowl = np.array([0.50, 0.30])  # +Y pocket, same as layout default
-    sides = set()
-    toward_bowl = 0
-    for _ in range(400):
+    bowl = np.array([0.48, 0.33])  # +Y pocket — must not be the aim
+    for _ in range(200):
         out = _sample_throw_full(
-            rng, bounds, speed=0.2, container_xy=bowl
+            rng, bounds, speed=0.2, container_xy=bowl, throw_randomness=1.0
         )
-        spawn, vel, target = out["spawn"], out["vel_xy"], out["target"]
-        sides.add(out["side"])
+        vel = out["vel_xy"]
         assert np.linalg.norm(vel) == pytest.approx(0.2, rel=1e-6)
-        # Catch stays inside the padded play rect.
-        assert 0.40 + 0.03 - 1e-9 <= target[0] <= 0.66 - 0.03 + 1e-9
-        assert -0.14 + 0.03 - 1e-9 <= target[1] <= 0.14 - 0.03 + 1e-9
-        # Velocity points at the catch point.
-        d = target - spawn
-        if np.linalg.norm(d) > 1e-6:
-            assert float(np.dot(vel, d)) > 0.0
-        # Path from spawn through catch is bowl-ward (catch between spawn and bowl).
-        if float(np.dot(bowl - spawn, d)) > 1e-6:
-            toward_bowl += 1
-    assert toward_bowl >= 300  # most throws are bowl-facing
-    # Need more than one spawn style (far / diag / side).
-    assert len(sides) >= 3
+        assert vel[0] <= 1e-9
+        assert 0.0 - 1e-6 <= float(out["throw_angle_deg"]) <= 180.0 + 1e-6
+        # Catch stays in the play band, not pulled into the +Y bowl pocket.
+        assert abs(out["target"][1]) <= 0.14 + 1e-6
 
 
 def test_sample_throw_public_shapes_and_padded_bounds():
@@ -205,8 +203,8 @@ def test_sample_throw_public_shapes_and_padded_bounds():
         pos, vel = sample_throw(rng, bounds, speed=0.3)
         assert pos.shape == (3,) and vel.shape == (3,)
         assert pos[2] == 0.0 and vel[2] == 0.0
-        # spawn stays inside the padded bounds
-        assert 0.40 + 0.03 - 1e-9 <= pos[0] <= 0.66 - 0.03 + 1e-9
+        # Spawn on the far +X rim; Y stays inside the padded band.
+        assert pos[0] == pytest.approx(0.66, abs=1e-9)
         assert -0.14 + 0.03 - 1e-9 <= pos[1] <= 0.14 - 0.03 + 1e-9
         assert np.linalg.norm(vel) == pytest.approx(0.3, rel=1e-6)
 
@@ -219,6 +217,101 @@ def test_sample_throw_zero_speed_is_still():
     assert pos.shape == (3,) and pos[2] == 0.0
     # still-object spawn also respects the padded bounds
     assert 0.40 + 0.03 - 1e-9 <= pos[0] <= 0.66 - 0.03 + 1e-9
+
+
+def test_throw_randomness_zero_is_fixed_90_deg_center_line():
+    """r=0: only 90° — straight at the robot (−X), reproducible."""
+    from sim.house_layout import _sample_throw_full
+
+    bounds = ((0.40, 0.66), (-0.14, 0.14))
+    a = _sample_throw_full(
+        np.random.default_rng(0), bounds, speed=0.2, throw_randomness=0.0
+    )
+    b = _sample_throw_full(
+        np.random.default_rng(99), bounds, speed=0.2, throw_randomness=0.0
+    )
+    assert a["side"] == b["side"] == "front"
+    assert a["throw_angle_deg"] == pytest.approx(90.0)
+    np.testing.assert_allclose(a["spawn"], b["spawn"], atol=1e-9)
+    np.testing.assert_allclose(a["vel_xy"], b["vel_xy"], atol=1e-9)
+    np.testing.assert_allclose(a["vel_xy"], [-0.2, 0.0], atol=1e-9)
+
+
+def test_throw_randomness_keeps_catchable_diverse_fan():
+    """r=1: diverse headings, but every coast stays in the play band to catch_x.
+
+    Grazing ~0°/180° throws from the far edge leave the table before the hand
+    can meet them — those are rejected (smoke off-table fix).
+    """
+    from sim.house_layout import _coast_reaches_catch, _heading_from_edge_deg, _sample_throw_full
+
+    bounds = ((0.40, 0.66), (-0.14, 0.14))
+    (xmin, xmax), (ymin, ymax) = bounds
+    angles = []
+    for s in range(400):
+        out = _sample_throw_full(
+            np.random.default_rng(s),
+            bounds,
+            speed=0.2,
+            throw_randomness=1.0,
+        )
+        ang = float(out["throw_angle_deg"])
+        angles.append(ang)
+        assert out["vel_xy"][0] <= 1e-9
+        heading = _heading_from_edge_deg(ang)
+        assert _coast_reaches_catch(
+            out["spawn"],
+            heading,
+            0.2,
+            xmin=xmin,
+            xmax=xmax,
+            ymin=ymin,
+            ymax=ymax,
+            until_x=0.55,
+        )
+    # Still a wide fan (not only 90°), but not the uncatchable extremes.
+    assert max(angles) - min(angles) > 40.0
+    assert min(angles) > 15.0
+    assert max(angles) < 165.0
+
+
+def test_grazing_heading_is_rejected_by_coast_check():
+    """Pure ±Y from the far rim never reaches the catch zone on the band."""
+    from sim.house_layout import _coast_reaches_catch, _heading_from_edge_deg
+
+    spawn = np.array([0.66, -0.10])
+    for theta in (0.0, 5.0, 175.0, 180.0):
+        ok = _coast_reaches_catch(
+            spawn,
+            _heading_from_edge_deg(theta),
+            0.5,
+            xmin=0.40,
+            xmax=0.66,
+            ymin=-0.14,
+            ymax=0.14,
+            until_x=0.55,
+        )
+        assert not ok, theta
+
+
+def test_tip_on_side_quat_yaws_with_travel():
+    """Tip ±90°; yaw follows velocity so the long axis is across travel."""
+    from scipy.spatial.transform import Rotation
+
+    from sim.house_layout import sit_half_height_m, tip_on_side_quat_wxyz
+
+    rng = np.random.default_rng(3)
+    vel = np.array([0.2, 0.0])
+    q = tip_on_side_quat_wxyz(vel, rng)
+    assert q.shape == (4,)
+    # wxyz → xyzw for scipy
+    eul = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_euler("xyz")
+    assert abs(abs(eul[0]) - 0.5 * np.pi) < 1e-6
+    assert abs(eul[2]) < 1e-6  # travel along +X → yaw ~ 0
+    # Tipped sit height uses diameter, not upright height.
+    size = np.array([0.06, 0.06, 0.12])
+    assert sit_half_height_m(size, tipped=True) == pytest.approx(0.03)
+    assert sit_half_height_m(size, tipped=False) == pytest.approx(0.06)
 
 
 # --------------------------------------------------------------------------

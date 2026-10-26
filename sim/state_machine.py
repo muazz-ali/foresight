@@ -166,9 +166,6 @@ class PickPlaceStateMachine:
         # Chasing a fast object takes longer than other stages: give the
         # approach 3x the normal stage time unless the yaml says otherwise.
         self.grasp_stage_timeout_s = self._f("grasp_stage_timeout_s", self.stage_timeout_s * 3.0)
-        # Min straight-line time we need before the object hits a wall and turns.
-        self.bounce_guard_s = self._f("bounce_guard_s")
-
         # --- interception ------------------------------------------------
         self.lookahead_s = self._f("lookahead_s")  # (plan: 0.25 s)
         # The look-ahead we write into the policy's 4 numbers. Kept separate from
@@ -195,12 +192,31 @@ class PickPlaceStateMachine:
         self.servo_xy_tol = self._f("servo_xy_tol")
         self.place_xy_tol = self._f("place_xy_tol")
         self.home_z_tol = self._f("home_z_tol")
-        self.ee_settle_tol = self._f("ee_settle_tol")
 
         # --- heights ------------------------------------------------------
         self.lift_height = self._f("lift_height")
         self.drop_z_gap = self._f("drop_z_gap")
-        # Wrist depth close gate (m). 0 = off (use GT hand-object Z). Needs a depth reading.
+        # Claim p̂z / z_grasp (collect ≥20 cm, lock median <10 cm). See grasp_height.
+        from interfaces.grasp_height import ZLatch
+
+        self._z_latch = ZLatch.from_cfg(cfg)
+        self.z_grasp: float | None = None
+        # Approx half-height for GT top when wrist depth is missing (sphere on table).
+        # Overwritten each episode via set_object_half_height(scene mesh size).
+        self._obj_half_h = float((scene.get("object_radius") or 0.03))
+        # Expert aim Z = object centre (reliable demos). Pack p̂z can come from
+        # wrist depth latch so the policy trains on estimated height, not GT.
+        ch = cfg.get("claim_height") if isinstance(cfg.get("claim_height"), dict) else {}
+        self.close_at_object_center = bool(ch.get("close_at_object_center", True))
+        self.pack_z_from_depth = bool(ch.get("pack_z_from_depth", True))
+        self.depth_rmse_max_m = float(ch.get("depth_rmse_max_m", 0.01))
+        if float(self._z_latch.insert_m) <= 0.015:
+            self._z_latch.insert_m = float(self._obj_half_h)
+        # Fallback if live cam pose is missing (hand cam above TCP).
+        tcp = robot.get("tcp_offset") or [0.0, 0.0, 0.107]
+        self._wrist_cam_above_tcp_m = float(tcp[2]) if len(tcp) >= 3 else 0.107
+        self.p_hat_z: float | None = None  # pack height (depth or centre)
+        # Wrist depth close gate (m). 0 = off (use GT / latched z_grasp). Needs a depth reading.
         self.close_depth_m = self._f("close_depth_m", 0.0)
         # Held object farther than this from the hand = it slipped out (physics grasp).
         self.slip_dist_m = self._f("slip_dist_m", 0.10)
@@ -218,26 +234,30 @@ class PickPlaceStateMachine:
         self.init_pose = np.asarray(robot["init_pose"], dtype=np.float64)
         self._down_quat = self.init_pose[3:].copy()
 
-        # Walls of the object's play area. Used to predict bounces. None = no walls.
-        # House / throw mode: NO bounce. The object coasts straight, so there is no
-        # wall to wait for (_bounce_clear is always true) and the forecast is constant velocity.
-        bounds = scene.get("object_xy_bounds")
-        self.throw_mode = bool(scene.get("use_house", False))
-        self.xy_bounds = (
-            ((float(bounds[0][0]), float(bounds[0][1])), (float(bounds[1][0]), float(bounds[1][1])))
-            if bounds is not None and not self.throw_mode
-            else None
-        )
-        # Real PhysX grasp (no weld) — same default rule as sim/scene.py.
-        self.physics_grasp = not bool(scene.get("use_weld_grasp", not self.throw_mode))
+        # Real PhysX grasp (no weld) — same default as sim/scene.py.
+        self.physics_grasp = not bool(scene.get("use_weld_grasp", False))
+        # Finger travel time (robot). Physics close waits this long before freeing
+        # the object to PhysX so the pads are already shut (else ≥50 cm/s slips).
+        self.finger_close_s = float(robot.get("gripper_close_time_s", 0.08))
         if self.physics_grasp:
             # Fingers need the longer dwell before lift starts.
             self.close_gripper_s = self._f("physics_close_s")
+            # Dwell must cover finger travel + a squeeze beat.
+            if self.close_gripper_s < self.finger_close_s + 0.15:
+                self.close_gripper_s = self.finger_close_s + 0.15
 
         # Placeholders. The episode loop calls set_box_poses() each episode with
         # the real box location.
         self.carry_pose = np.concatenate([np.zeros(3), self._down_quat])
         self._drop_pose: np.ndarray | None = None
+        # Table XY for clipping intercept aims (set each episode from the scene).
+        # Without this, a long lead at ≥50 cm/s pulls the hand off the table.
+        # Use the full table footprint — not the thin play band (that starved FakeArm).
+        self._aim_xy: tuple[tuple[float, float], tuple[float, float]] | None = None
+        # Looser box for "object escaped — stop chase". Aim is inset for hand
+        # safety; escape must still allow the far-edge spawn rim (smoke lemon
+        # seed 50194 sat 6 mm past inset xmax and went home on frame 1).
+        self._escape_xy: tuple[tuple[float, float], tuple[float, float]] | None = None
         self.reset()
 
     # ------------------------------------------------------------------ cfg
@@ -282,17 +302,93 @@ class PickPlaceStateMachine:
             d[0], d[1] = p[0], p[1]
             self._drop_pose = d
 
+    def set_aim_xy_bounds(self, bounds) -> None:
+        """Clip intercept / close aims to the table footprint.
+
+        Call once per episode with the scene table XY box (not the thin play
+        band). Stops a long look-ahead from commanding the hand off the table
+        at ≥50 cm/s (``ee-off-table`` abort).
+        """
+        if bounds is None:
+            self._aim_xy = None
+            return
+        bx, by = bounds[0], bounds[1]
+        self._aim_xy = (
+            (float(bx[0]), float(bx[1])),
+            (float(by[0]), float(by[1])),
+        )
+
+    def set_escape_xy_bounds(self, bounds) -> None:
+        """Where the object may still be chased (full table / play, not aim inset).
+
+        Call once per episode after ``set_aim_xy_bounds``. If unset, chase escape
+        falls back to the aim box (old behaviour). 
+        Prefer the raw table XY so a spawn on the far rim is not treated as "already escaped."
+        """
+        if bounds is None:
+            self._escape_xy = None
+            return
+        bx, by = bounds[0], bounds[1]
+        self._escape_xy = (
+            (float(bx[0]), float(bx[1])),
+            (float(by[0]), float(by[1])),
+        )
+
+    def _object_left_catch_box(self, obj: np.ndarray) -> bool:
+        """True if the object left the catch region — stop chase, go home.
+
+        Uses ``_escape_xy`` when set; else the tighter aim box. Near-base and
+        off-table misses should trip this; far-rim spawns should not.
+        """
+        box = self._escape_xy if self._escape_xy is not None else self._aim_xy
+        if box is None:
+            return False
+        (ax0, ax1), (ay0, ay1) = box
+        x, y = float(obj[0]), float(obj[1])
+        return not (ax0 <= x <= ax1 and ay0 <= y <= ay1)
+
+    def _clip_aim_xy(self, aim: np.ndarray) -> np.ndarray:
+        """Keep aim XY on the table when bounds are set."""
+        out = np.asarray(aim, dtype=np.float64).reshape(3).copy()
+        if self._aim_xy is None:
+            return out
+        (xmin, xmax), (ymin, ymax) = self._aim_xy
+        out[0] = float(np.clip(out[0], xmin, xmax))
+        out[1] = float(np.clip(out[1], ymin, ymax))
+        return out
+
+    def set_object_half_height(
+        self, half_h: float, *, z_table: float | None = None
+    ) -> None:
+        """Use this episode's mesh half-height for GT top and close insert.
+
+        Call once per episode after ``scene.reset_episode`` 
+        (meta has ``object_half_height``). Sets insert ≈ half-height so ``z_grasp`` lands
+        near the object centre — 10 mm insert was closing in the air above fruit.
+        Pass ``z_table`` (scene table top) so the clear floor matches the real
+        table, not a stale yaml height.
+        """
+        h = float(half_h)
+        if not np.isfinite(h) or h <= 0.0:
+            return
+        self._obj_half_h = h
+        self._z_latch.insert_m = h
+        if z_table is not None and np.isfinite(float(z_table)):
+            self._z_latch.z_table = float(z_table)
+
     def reset(self) -> None:
         """Back to stage 0 and clear all per-episode memory (timers, retries, grasp stats)."""
         self._grasp_quat = None
         self.stage = STAGE_RESET
         self.timer_s = 0.0  # time spent in the current stage
         self.retries = 0
-        self._blocked_s = 0.0  # only throttles the "waiting for a straight run" log
         self.lift_z: float | None = None
         self.grasp_xy: np.ndarray | None = None
         self._home_anchor: np.ndarray | None = None  # hand pose when go-home began
         self._open_anchor: np.ndarray | None = None  # hand pose when open began
+        self._z_latch.reset()
+        self.z_grasp: float | None = None  # expert aim height
+        self.p_hat_z: float | None = None  # policy pack height
         # Grasp quality, surfaced in meta so a loosened tolerance cannot hide.
         self.grasp_err_xy: float | None = None
         self.grasp_err_z: float | None = None
@@ -307,19 +403,20 @@ class PickPlaceStateMachine:
             "grasp_err_xy": self.grasp_err_xy,
             "grasp_err_z": self.grasp_err_z,
             "grasp_speed_m_s": self.grasp_speed,
+            "z_grasp": self.z_grasp,
             "retries": int(self.retries),
         }
 
     # -------------------------------------------------------------- helpers
     def _forecast(self, pos: np.ndarray, vel: np.ndarray, horizon_s: float) -> np.ndarray:
-        """Where the object will be in ``horizon_s`` — with wall bounces.
+        """Where the object will be in ``horizon_s`` (straight coast).
 
         Uses the same ``kinematic_forecast`` the scene integrates with, so the
         prediction and the world cannot disagree.
         """
         if horizon_s <= 0.0:
             return np.asarray(pos, dtype=np.float64).reshape(3).copy()
-        p, _ = kinematic_forecast(pos, vel, float(horizon_s), self.dt, xy_bounds=self.xy_bounds)
+        p, _ = kinematic_forecast(pos, vel, float(horizon_s), self.dt)
         return p
 
     def _intercept_lead_s(
@@ -355,72 +452,140 @@ class PickPlaceStateMachine:
         ee: np.ndarray,
         obj: np.ndarray,
         wrist_depth_m: float | None = None,
+        *,
+        goal_z: float | None = None,
     ) -> tuple[bool, float, float]:
-        """True when the hand is inside ``grasp_xyz_ok`` (ready to close).
+        """True when the hand is inside the grasp box (ready to close).
 
-        XY uses |dx| and |dy|. Z always uses GT |dz| — never wrist depth alone.
-        Wrist depth used to *replace* GT Z and caused both early closes (wrist
-        under threshold while |dz| was still ~17 mm) and stuck retries (GT fine
-        but wrist stuck ~6 mm above the depth gate). ``wrist_depth_m`` is kept
-        for the call site / logs only. Returns (ok, err_xy_norm, err_z).
+        XY: |dx|, |dy| vs ``grasp_xyz_ok``. Z: vs ``goal_z`` (z_grasp / p̂z)
+        with tol = ``grasp_xyz_ok[2]`` (floor 2 mm). 
+        Do not clamp with claim ``z_slack/2`` — that made a 15 mm yaml gate into 2.5 mm and missed near-hits at ≥30 cm/s.
+        Never uses wrist depth alone as the Z gate
+        (that caused early closes). ``wrist_depth_m`` is logs-only.
         """
-        del wrist_depth_m  # logged elsewhere; must not override GT Z
+        del wrist_depth_m
+        gz = float(obj[2] if goal_z is None else goal_z)
         err_dx = abs(float(ee[0] - obj[0]))
         err_dy = abs(float(ee[1] - obj[1]))
-        err_z = abs(float(ee[2] - obj[2]))
+        err_z = abs(float(ee[2]) - gz)
         err_xy = float(np.hypot(err_dx, err_dy))
         xy_ok = err_dx <= float(self.grasp_xyz_ok[0]) and err_dy <= float(
             self.grasp_xyz_ok[1]
         )
-        low_enough = err_z <= float(self.grasp_xyz_ok[2])
+        # Honor yaml Z; floor 2 mm so a zero knob cannot freeze the expert.
+        z_tol = max(float(self.grasp_xyz_ok[2]), 0.002)
+        low_enough = err_z <= z_tol
         return xy_ok and low_enough, err_xy, err_z
 
-    def _time_to_wall_s(self, pos: np.ndarray, vel: np.ndarray) -> float:
-        """Seconds until the object reverses off a play-band wall (inf if never)."""
-        if self.xy_bounds is None:
-            return float("inf")
-        best = float("inf")
-        for i, (lo, hi) in enumerate(self.xy_bounds):
-            v = float(vel[i])
-            if abs(v) < 1e-6:
-                continue
-            bound = hi if v > 0.0 else lo
-            t = (bound - float(pos[i])) / v
-            if t >= 0.0:
-                best = min(best, t)
-        return best
+    def _plausible_z_top(self, z_top: float, ee_z: float) -> bool:
+        """True if a depth/GT top height is usable (not under table / above the hand)."""
+        if not np.isfinite(z_top):
+            return False
+        z_lo = float(self._z_latch.z_table) - 0.01
+        # Top must sit between table and roughly the hand (depth bugs go negative).
+        return z_lo < float(z_top) < float(ee_z) + 0.05
 
-    def _close_time_s(self, ee: np.ndarray, obj: np.ndarray) -> float:
-        """Seconds of Z still to burn before the grasp gate can pass.
-
-        First-order settle of the remaining height to ``grasp_z_tol``. Chase aims
-        at object Z, so this is usually one or two steps once XY is close.
-        """
-        dz = max(0.0, float(ee[2] - obj[2]))
-        if dz <= self.grasp_z_tol:
-            return self.dt
-        return self.tau * float(np.log(dz / self.grasp_z_tol))
-
-    def _grasp_window_s(self, ee: np.ndarray | None = None, obj: np.ndarray | None = None) -> float:
-        """Straight-line time the grasp needs before the object reverses.
-
-        Only the leftover Z drop has to fit. Once CLOSE attaches, the object
-        is welded to the hand and stops following the table, so nothing after
-        attach cares about walls. ``bounce_guard_s`` is the floor.
-        """
-        need = self.dt if ee is None or obj is None else self._close_time_s(ee, obj)
-        return max(self.bounce_guard_s, need)
-
-    def _bounce_clear(
+    def _depth_z_top(
         self,
-        pos: np.ndarray,
-        vel: np.ndarray,
-        ee: np.ndarray | None = None,
-    ) -> bool:
-        """Enough straight-line time left to close without a wall reversal."""
-        if float(np.linalg.norm(vel[:2])) < self.ee_settle_tol:
-            return True
-        return self._time_to_wall_s(pos, vel) > self._grasp_window_s(ee, pos)
+        ee: np.ndarray,
+        obj: np.ndarray,
+        wrist_depth: np.ndarray | None,
+        ee_quat: np.ndarray | None,
+        static_depth: np.ndarray | None,
+        static_cam_z: float | None,
+        wrist_cam_z: float | None,
+    ) -> float:
+        """One fused object-top Z from wrist (+ optional static). NaN if unusable.
+
+        Prefers live wrist cam world Z. Rejects tops that disagree with GT by more
+        than ~1.5 radii (sim sanity). Static is backup only — its formula is rough.
+        """
+        from interfaces.grasp_height import (
+            fuse_z_top,
+            z_top_from_gt_center,
+            z_top_from_static_depth,
+            z_top_from_wrist_depth,
+        )
+
+        ee_z = float(ee[2])
+        wrist_z = float("nan")
+        if wrist_depth is not None and ee_quat is not None:
+            wrist_z = z_top_from_wrist_depth(
+                wrist_depth,
+                ee,
+                ee_quat,
+                cam_z=wrist_cam_z,
+                cam_above_tcp_m=float(self._wrist_cam_above_tcp_m),
+            )
+            if not self._plausible_z_top(wrist_z, ee_z):
+                wrist_z = float("nan")
+        static_z = float("nan")
+        if static_depth is not None and static_cam_z is not None:
+            static_z = z_top_from_static_depth(static_depth, cam_z=float(static_cam_z))
+            if not self._plausible_z_top(static_z, ee_z):
+                static_z = float("nan")
+        gt_top = z_top_from_gt_center(float(obj[2]), half_height_m=float(self._obj_half_h))
+        # Wrist preferred: static alone was latching ~18 cm mid-air closes.
+        if np.isfinite(wrist_z) and np.isfinite(static_z):
+            gap = ee_z - float(wrist_z)
+            z_top = fuse_z_top(
+                wrist_z,
+                static_z,
+                gap_m=gap,
+                latch_hi_m=float(self._z_latch.latch_hi_m),
+            )
+        elif np.isfinite(wrist_z):
+            z_top = float(wrist_z)
+        else:
+            z_top = float("nan")
+        if not self._plausible_z_top(z_top, ee_z):
+            return float("nan")
+        if abs(float(z_top) - gt_top) > max(0.02, 1.5 * float(self._obj_half_h)):
+            return float("nan")
+        return float(z_top)
+
+    def _update_z_grasp(
+        self,
+        ee: np.ndarray,
+        obj: np.ndarray,
+        wrist_depth: np.ndarray | None = None,
+        ee_quat: np.ndarray | None = None,
+        static_depth: np.ndarray | None = None,
+        static_cam_z: float | None = None,
+        wrist_cam_z: float | None = None,
+    ) -> float:
+        """Refresh expert aim Z and pack p̂z; return the aim height.
+
+        * Expert aim (``z_grasp``): object centre when ``close_at_object_center``.
+        * Pack (``p_hat_z``): wrist-depth latch when ``pack_z_from_depth`` (gap
+          ≥ 7 cm collect / lock below) so training sees estimated height, not GT.
+        """
+        center = float(obj[2])
+        ee_z = float(ee[2])
+        z_top = self._depth_z_top(
+            ee, obj, wrist_depth, ee_quat, static_depth, static_cam_z, wrist_cam_z
+        )
+        if np.isfinite(z_top):
+            depth_zg = self._z_latch.update(z_top=z_top, ee_z=ee_z)
+        else:
+            # No good depth this frame: keep latch ticking with GT top so lock
+            # still has samples if the hand never saw a clean wrist crop.
+            from interfaces.grasp_height import z_top_from_gt_center
+
+            gt_top = z_top_from_gt_center(center, half_height_m=float(self._obj_half_h))
+            depth_zg = self._z_latch.update(z_top=gt_top, ee_z=ee_z)
+
+        if self.pack_z_from_depth and np.isfinite(depth_zg):
+            # Close height from top − insert ≈ centre when insert ≈ half-height.
+            self.p_hat_z = float(depth_zg)
+        else:
+            self.p_hat_z = center
+
+        if self.close_at_object_center:
+            self.z_grasp = center
+        else:
+            self.z_grasp = float(self.p_hat_z)
+        return float(self.z_grasp)
 
     def _retract_z(self) -> float:
         """Height to travel at while holding the object: the higher of lift height and carry height.
@@ -506,23 +671,20 @@ class PickPlaceStateMachine:
         ee_pos: np.ndarray,
         ee_quat: np.ndarray,
         wrist_depth_m: float | None = None,
+        wrist_depth_img: np.ndarray | None = None,
+        static_depth_img: np.ndarray | None = None,
+        static_cam_z: float | None = None,
+        wrist_cam_z: float | None = None,
     ) -> ExpertCommand:
         """Advance one control step. Returns the EE command for this tick.
-        
-        This is the core state machine logic that runs every control step.
-        It takes the current state of the object, the end effector position and
-        orientation, and returns the next end effector command.
 
         Input is the TRUE object state from the sim (not a camera guess). Each
         stage block below sets the hand target and decides when to move on.
-        There is no "drop -> stage 1" shortcut: a miss goes to
-        ``_restart_approach``, which re-enters stage 1 (until retries run out).
-        ``wrist_depth_m``: nearest thing in the wrist view (NaN / None = no reading).
+        ``wrist_depth_m``: nearest depth (logs). ``wrist_depth_img`` /
+        ``static_depth_img``: depth maps. ``wrist_cam_z``: live cam world Z.
         """
-        # Hand rotation is not read: every stage picks its own target rotation.
-        del ee_quat
-
         ee = np.asarray(ee_pos, dtype=np.float64).reshape(3)
+        ee_q = np.asarray(ee_quat, dtype=np.float64).reshape(4)
         obj = np.asarray(state.position, dtype=np.float64).reshape(3)
         vel = np.asarray(state.velocity, dtype=np.float64).reshape(3)
         speed = float(np.linalg.norm(vel))
@@ -549,68 +711,98 @@ class PickPlaceStateMachine:
                 self.timer_s = 0.0
 
         elif self.stage in (STAGE_APPROACH, STAGE_DESCEND):
-            # Chase: aim where the object will be when the hand arrives. Target Z
-            # is the object itself (no hover). One grasp_xyz_ok gate → close.
-            # STAGE_DESCEND is unused in the happy path; if entered, same logic.
-            target_z = float(obj[2])
-            lead_s = self._intercept_lead_s(ee, obj, vel, goal_z=target_z)
-            aim = self._forecast(obj, vel, lead_s)
-            target = np.array([aim[0], aim[1], target_z], dtype=np.float64)
-
-            gate_ok, err_xy, err_z = self._grasp_gate_ok(ee, obj, wrist_depth_m)
-            if gate_ok and not self._bounce_clear(obj, vel, ee):
-                self._blocked_s += self.dt
-                if self._blocked_s >= 1.0:
-                    self._blocked_s = 0.0
-                    logger.info(
-                        "    in grasp box, but waiting for a straight run: need %.2f s, "
-                        "wall in %.2f s (widen scene.object_xy_bounds or cut "
-                        "tip_lag_pad_ms)",
-                        self._grasp_window_s(ee, obj),
-                        self._time_to_wall_s(obj, vel),
-                    )
-            if gate_ok and self._bounce_clear(obj, vel, ee):
+            # Chase: aim XY where the object will be; Z = latched z_grasp (p̂z).
+            # Height lives in p̂, not in a fixed desk height. STAGE_DESCEND unused
+            # in the happy path; if entered, same logic.
+            #
+            # If the object left the catch box (past keepout / off table), do
+            # not chase into ee-off-table — go home and let success label it.
+            # Catch box ≠ aim inset (far-rim spawn must still be chaseable).
+            if self._object_left_catch_box(obj):
                 logger.info(
-                    "    grasp gate: XY %.1f cm, Z %.1f cm, speed %.0f cm/s, "
-                    "lead %.0f ms, wall in %.2f s",
-                    100.0 * err_xy,
-                    100.0 * err_z,
-                    100.0 * speed,
-                    1000.0 * lead_s,
-                    self._time_to_wall_s(obj, vel),
+                    "    object left catch box at (%.3f, %.3f); going home",
+                    float(obj[0]),
+                    float(obj[1]),
                 )
-                self.grasp_err_xy = err_xy
-                self.grasp_err_z = err_z
-                self.grasp_speed = speed
-                self.grasp_xy = obj[:2].copy()
-                self.lift_z = float(ee[2]) + self.lift_height
-                self.stage = STAGE_CLOSE
+                self.stage = STAGE_HOME
                 self.timer_s = 0.0
-            elif self.timer_s > self.grasp_stage_timeout_s:
-                self._restart_approach("could not reach grasp gate")
+                target = self._home_target(ee)
+            else:
+                target_z = self._update_z_grasp(
+                    ee,
+                    obj,
+                    wrist_depth=wrist_depth_img,
+                    ee_quat=ee_q,
+                    static_depth=static_depth_img,
+                    static_cam_z=static_cam_z,
+                    wrist_cam_z=wrist_cam_z,
+                )
+                lead_s = self._intercept_lead_s(ee, obj, vel, goal_z=target_z)
+                aim = self._clip_aim_xy(self._forecast(obj, vel, lead_s))
+                target = np.array([aim[0], aim[1], target_z], dtype=np.float64)
+
+                gate_ok, err_xy, err_z = self._grasp_gate_ok(
+                    ee, obj, wrist_depth_m, goal_z=target_z
+                )
+                if gate_ok:
+                    logger.info(
+                        "    grasp gate: XY %.1f cm, Z %.1f cm, speed %.0f cm/s, "
+                        "lead %.0f ms",
+                        100.0 * err_xy,
+                        100.0 * err_z,
+                        100.0 * speed,
+                        1000.0 * lead_s,
+                    )
+                    self.grasp_err_xy = err_xy
+                    self.grasp_err_z = err_z
+                    self.grasp_speed = speed
+                    self.grasp_xy = obj[:2].copy()
+                    self.lift_z = float(ee[2]) + self.lift_height
+                    self.stage = STAGE_CLOSE
+                    self.timer_s = 0.0
+                elif self.timer_s > self.grasp_stage_timeout_s:
+                    self._restart_approach("could not reach grasp gate")
 
         # Stage 3 — CLOSE FINGERS: shut the gripper. ``attach`` means "grasp now":
         # weld mode glues the object to the hand; physics mode frees it to PhysX
         # and the fingers squeeze it. Same flag, the scene decides (sim/scene.py).
         elif self.stage == STAGE_CLOSE:
-            # No freeze needed and none used: freezing a fast object is a teleport-stop.
+            # Ride XY with tau so ≥50 cm/s throws stay in the fingers while they shut.
             grip = 0.0
-            attach = True
-            kin = False
-            target = ee.copy()
-            target[2] = obj[2]
+            aim = self._clip_aim_xy(self._forecast(obj, vel, self.tau))
+            z_close = float(self.z_grasp) if self.z_grasp is not None else float(obj[2])
+            target = np.array([aim[0], aim[1], z_close], dtype=np.float64)
+            if self.physics_grasp and self.timer_s < self.finger_close_s:
+                # Keep the scripted coast until pads are closed. Freeing on tick 0
+                # left a 50 cm/s shear and every close slipped at ~10 cm.
+                attach, kin = False, True
+            else:
+                attach, kin = True, False
             if self.timer_s >= self.close_gripper_s:
                 self.stage = STAGE_LIFT
                 self.timer_s = 0.0
 
-        # Physics grasp can lose the object. Held but far from the hand → try again.
-        # (Weld mode never trips this: the object sits within 1 cm of the hand.)
+        # Physics grasp can lose the object. Held but far from the hand → try again
+        # only while the object is still in the catch box. Near the base / past the
+        # aim walls, a re-chase caused ee-off-table (seeds 1502/1504/1505).
         elif self.stage in (STAGE_LIFT, STAGE_CARRY, STAGE_LOWER) and (
             float(np.linalg.norm(obj - ee)) > self.slip_dist_m
         ):
-            self._restart_approach(
-                f"object slipped ({100.0 * float(np.linalg.norm(obj - ee)):.0f} cm from hand)"
-            )
+            gap_cm = 100.0 * float(np.linalg.norm(obj - ee))
+            near_keepout = False
+            if self._aim_xy is not None:
+                (ax0, ax1), (ay0, ay1) = self._aim_xy
+                in_box = ax0 <= float(obj[0]) <= ax1 and ay0 <= float(obj[1]) <= ay1
+                near_keepout = (not in_box) or (float(obj[0]) < float(ax0) + 0.05)
+            if near_keepout:
+                logger.info(
+                    "    object slipped (%.0f cm) near keepout; going home", gap_cm
+                )
+                self.stage = STAGE_HOME
+                self.timer_s = 0.0
+                target = self._home_target(ee)
+            else:
+                self._restart_approach(f"object slipped ({gap_cm:.0f} cm from hand)")
 
         # Stages 4-6 (lift, carry, lower): the object is held, so no table slide.
         # If any of them stalls, give up and go home (no retry once holding).

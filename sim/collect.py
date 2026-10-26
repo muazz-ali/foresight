@@ -217,14 +217,57 @@ def run_episode(
     if delta is None:
         delta = float(getattr(expert, "conditioning_delta_s", expert.lookahead_s))
     meta = scene.reset_episode(seed=seed, speed=speed)
-    meta["language"] = default_language(meta.get("category"), meta.get("container_category"))
+    meta["language"] = default_language(
+        meta.get("category"),
+        meta.get("container_category"),
+        seed=int(seed),
+    )
     expert.reset()
+    # Real mesh half-height + table Z → close near object centre (not in the air).
+    hh = meta.get("object_half_height")
+    if hh is not None:
+        expert.set_object_half_height(
+            float(hh),
+            z_table=float(getattr(scene, "_table_z", meta.get("table_z", 0.0))),
+        )
     # Tell the expert where this episode's box is, so carry / lower aim at it.
     # (Aim PLACE at container, or cfg fallback.)
     expert.set_box_poses(
         scene.get_carry_pose(),
         drop_pos=scene.get_drop_target(),
     )
+    # Clip intercept aims inside the table, inset by the ee-off-table margin,
+    # and outside the robot-base keepout so DiffIK cannot overshoot into abort.
+    # Escape/catch box stays the full table (keepout on −X only) so a far-rim
+    # spawn is still chaseable — aim inset alone made lemon seed-50194 go home
+    # on frame 1 ("left aim box" at x just past inset xmax).
+    if hasattr(expert, "set_aim_xy_bounds"):
+        table_box = getattr(scene, "_table_box", None)
+        if table_box is not None:
+            lo = np.asarray(table_box[0], dtype=np.float64).copy()
+            hi = np.asarray(table_box[1], dtype=np.float64).copy()
+            margin = float(getattr(scene, "_ee_table_margin_m", 0.02))
+            keepout = float(getattr(scene, "_robot_base_keepout_m", 0.12))
+            esc_lo = lo.copy()
+            esc_hi = hi.copy()
+            esc_lo[0] = max(float(esc_lo[0]), keepout)
+            aim_lo = lo + margin
+            aim_hi = hi - margin
+            aim_lo[0] = max(float(aim_lo[0]), keepout)
+            expert.set_aim_xy_bounds(
+                [[float(aim_lo[0]), float(aim_hi[0])], [float(aim_lo[1]), float(aim_hi[1])]]
+            )
+            if hasattr(expert, "set_escape_xy_bounds"):
+                expert.set_escape_xy_bounds(
+                    [
+                        [float(esc_lo[0]), float(esc_hi[0])],
+                        [float(esc_lo[1]), float(esc_hi[1])],
+                    ]
+                )
+        else:
+            expert.set_aim_xy_bounds(None)
+            if hasattr(expert, "set_escape_xy_bounds"):
+                expert.set_escape_xy_bounds(None)
 
     done_stage = int(getattr(expert, "stage_done", STAGE_DONE))
     # Hard cap on steps from the yaml, so a stuck run still ends.
@@ -259,11 +302,17 @@ def run_episode(
         "timestamp": [],
         "container_pos": [],
         "wrist_depth_m": [],
+        # Step 1 claim timing (filled only when claim_timing.enabled).
+        "capture_t0": [],
+        "applied_delta_s": [],
+        "reported_delta_s": [],
     }
     if save_images:
         log["static_cam_rgb"] = []
         log["wrist_cam_rgb"] = []
         log["wrist_cam_depth"] = []
+        log["static_cam_depth"] = []
+        log["wrist_cam_z"] = []
 
     # Phase 3 timing: last-cm reflex (opt-in). Default off until catch rate is
     # proven with it on; set state_machine_params.use_reflex: true to enable.
@@ -285,52 +334,166 @@ def run_episode(
         reflex.reset()
     meta["reflex"] = bool(reflex is not None)
 
-    # Main loop: expert looks → scene acts → we write down what happened.
+    # Step 1: delay injection. When enabled, log t0 / applied / reported Δ and
+    # (if enforce_apply_at) hold motions until apply_at = t0 + applied_Δ.
+    delay = None
+    ct = scene.cfg.get("claim_timing", {}) if isinstance(scene.cfg, dict) else {}
+    ct = ct if isinstance(ct, dict) else {}
+    if bool(ct.get("enabled", False)):
+        from control import DelayInjection
+
+        delay = DelayInjection.from_cfg(scene.cfg, seed=int(seed))
+    enforce_apply = bool(delay is not None) and bool(ct.get("enforce_apply_at", True))
+    use_noisy = bool(ct.get("use_noisy_gt", False))
+    close_guard = bool(ct.get("close_speed_guard", False))
+    meta["claim_timing"] = bool(delay is not None)
+    meta["enforce_apply_at"] = bool(enforce_apply)
+    meta["use_noisy_gt"] = bool(use_noisy)
+    meta["close_speed_guard"] = bool(close_guard)
+
+    noisy_filt = None
+    if use_noisy:
+        from perception.noisy_gt import WindowedCVFilter
+
+        noisy_filt = WindowedCVFilter(dt=float(scene.dt))
+
+    from sim.state_machine import STAGE_CLOSE
+
+    # Pending expert cmds waiting for apply_at; held = last released cmd.
+    pending: list[tuple[float, Any, Any]] = []
+    held_cmd = None
+    prev_ee = None
+
+    # Main loop: expert looks → (optional delay) → scene acts → log.
     for t in range(n_steps):
         state = scene.get_object_state()
         ee_pos, ee_quat = scene.get_ee_pose()
-        # Wrist depth (m) in front of the hand; NaN = no reading. Logged every step.
         depth_m = scene.get_wrist_depth_m() if "wrist_cam" in scene.cameras else float("nan")
-        cmd = expert.step(state, ee_pos, ee_quat, wrist_depth_m=depth_m)
+        depth_img = scene.get_wrist_depth() if "wrist_cam" in scene.cameras else None
+        static_depth = scene.get_static_depth() if "static_cam" in scene.cameras else None
+        static_z = scene.static_cam_z() if static_depth is not None else None
+        wrist_pose = (
+            scene.get_wrist_cam_pose() if "wrist_cam" in scene.cameras else None
+        )
+        wrist_cam_z = float(wrist_pose[0][2]) if wrist_pose is not None else None
+        planned = expert.step(
+            state,
+            ee_pos,
+            ee_quat,
+            wrist_depth_m=depth_m,
+            wrist_depth_img=depth_img,
+            static_depth_img=static_depth,
+            static_cam_z=static_z,
+            wrist_cam_z=wrist_cam_z,
+        )
         if reflex is not None:
             from control import overlay_reflex
 
-            cmd, _ = overlay_reflex(cmd, reflex, state, ee_pos)
+            planned, _ = overlay_reflex(planned, reflex, state, ee_pos)
 
+        # Optional close-speed: if hand and object slide apart, ride object XY.
+        if close_guard and int(planned.stage) == int(STAGE_CLOSE):
+            from control import close_speed_check
+
+            dt = float(scene.dt)
+            if prev_ee is None:
+                v_hand = np.asarray(state.velocity, dtype=np.float64)
+            else:
+                v_hand = (np.asarray(ee_pos, dtype=np.float64) - prev_ee) / max(dt, 1e-6)
+            chk = close_speed_check(v_hand, state.velocity)
+            if not chk.ok:
+                pos = np.asarray(planned.position, dtype=np.float64).copy()
+                pos[0:2] = np.asarray(state.position, dtype=np.float64)[0:2]
+                planned.position = pos
+
+        # Obs stamp for this plan: last camera capture (or current sim time).
+        t0 = float(
+            getattr(scene, "last_capture_t0", getattr(scene, "_sim_time", state.timestamp))
+        )
+        pack_delta = float(delta)
+        applied_s = float("nan")
+        reported_s = float("nan")
+        sample = None
+        if delay is not None:
+            sample = delay.sample(t0, mode="train")
+            pack_delta = float(sample.reported_delta_s)
+            applied_s = float(sample.applied_delta_s)
+            reported_s = float(sample.reported_delta_s)
+            if enforce_apply:
+                pending.append((float(sample.apply_at), planned, sample))
+            else:
+                held_cmd = planned
+        else:
+            held_cmd = planned
+
+        now = float(getattr(scene, "_sim_time", t0))
+        if enforce_apply and pending:
+            still: list[tuple[float, Any, Any]] = []
+            for apply_at, cmd_i, samp_i in pending:
+                if now + 1e-9 >= float(apply_at):
+                    held_cmd = cmd_i
+                else:
+                    still.append((apply_at, cmd_i, samp_i))
+            pending = still
+        if held_cmd is None:
+            held_cmd = planned
+
+        cmd = held_cmd
         scene.set_ee_target(cmd.position, cmd.quat_wxyz, cmd.gripper_open)
         scene.step(
             kinematic_object=cmd.kinematic_object,
             attach_object=cmd.attach_object,
             freeze_object=cmd.freeze_object,
         )
+        prev_ee = np.asarray(ee_pos, dtype=np.float64).copy()
 
         # Log post-step state (world after action).
         state2 = scene.get_object_state()
-        # Weld only: a welded object has no table speed (scene already zeroes it; belt+suspenders).
-        # Physics grasp: keep the real velocity, so a slipping object shows up in the logs.
         if cmd.attach_object and scene.weld_grasp:
             state2.velocity = np.zeros(3, dtype=np.float64)
         ee_pos2, ee_quat2 = scene.get_ee_pose()
-        # The 4 numbers the policy will see: future XY spot + XY speed.
-        # Built from sim truth here; same helper as at eval, so train = test.
-        cond = conditioning_vector(state2, delta=delta)
+        t0_log = float(getattr(scene, "last_capture_t0", state2.timestamp))
+
+        pack_state = state2
+        if noisy_filt is not None:
+            from perception.noisy_gt import add_gt_noise, measure_noise_std
+
+            rng = np.random.default_rng(int(seed) + t)
+            std = measure_noise_std(ee_pos2, state2.position)
+            noisy = add_gt_noise(state2, rng, pos_std=std)
+            filt_st = noisy_filt.step(
+                float(state2.timestamp),
+                noisy.position[:2],
+                plane_z=float(state2.position[2]),
+            )
+            if filt_st is not None:
+                pack_state = filt_st
+
+        # Pack height: depth latch (p_hat_z) when enabled; else expert aim z_grasp.
+        p_hat_z = getattr(expert, "p_hat_z", None)
+        if p_hat_z is None:
+            p_hat_z = getattr(expert, "z_grasp", None)
+        cond = conditioning_vector(pack_state, delta=pack_delta, p_hat_z=p_hat_z)
 
         log["stage"].append(cmd.stage)
-        log["holding"].append(float(cmd.attach_object))  # "grasp commanded" (stages 3-6), not contact
+        log["holding"].append(float(cmd.attach_object))
         log["wrist_depth_m"].append(depth_m)
         log["object_pos"].append(state2.position.copy())
         log["object_vel"].append(state2.velocity.copy())
         log["ee_pos"].append(ee_pos2.copy())
         log["ee_quat"].append(ee_quat2.copy())
         log["proprio"].append(scene.get_proprio())
-        log["action_pos"].append(cmd.position.copy())
-        log["action_quat"].append(cmd.quat_wxyz.copy())
-        log["gripper"].append(cmd.gripper_open)
+        # Log the *planned* action (what the expert wanted), not the delayed hold.
+        log["action_pos"].append(planned.position.copy())
+        log["action_quat"].append(planned.quat_wxyz.copy())
+        log["gripper"].append(planned.gripper_open)
         log["oracle_state"].append(state2.to_flat())
         log["conditioning"].append(cond)
         log["timestamp"].append(state2.timestamp)
+        log["capture_t0"].append(t0_log)
+        log["applied_delta_s"].append(applied_s)
+        log["reported_delta_s"].append(reported_s)
         ctr = scene.get_container_pose()
-        # NaN (not 0) when there is no box, so "no box" cannot pass for a real spot.
         log["container_pos"].append(
             ctr[0].copy() if ctr is not None else np.full(3, np.nan)
         )
@@ -341,17 +504,22 @@ def run_episode(
                 log["static_cam_rgb"].append(imgs["static_cam"])
             if "wrist_cam" in imgs:
                 log["wrist_cam_rgb"].append(imgs["wrist_cam"])
-                log["wrist_cam_depth"].append(scene.get_wrist_depth().astype(np.float16))
+            wd = scene.get_wrist_depth()
+            if wd is not None and "wrist_cam_depth" in log:
+                log["wrist_cam_depth"].append(wd.astype(np.float16))
+            sd = scene.get_static_depth()
+            if sd is not None and "static_cam_depth" in log:
+                log["static_cam_depth"].append(sd.astype(np.float16))
+            if "wrist_cam_z" in log:
+                log["wrist_cam_z"].append(
+                    float(wrist_cam_z) if wrist_cam_z is not None else float("nan")
+                )
 
-        # Early stop once retract-after-place completed (done stage = 9).
-        # t > 20: never stop in the first few steps, even if stage reads "done".
-        if cmd.stage >= done_stage and t > 20:
+        if planned.stage >= done_stage and t > 20:
             break
-        # Miss: object left the table — do not keep chasing under the floor.
         if scene.off_table:
             logger.info("  stop: object off the table")
             break
-        # Safety: hand left the table, or coast path went through the box / base.
         abort = scene.check_safety_abort(attached=bool(cmd.attach_object))
         if abort:
             logger.info("  stop: safety abort (%s)", abort)

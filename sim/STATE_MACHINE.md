@@ -116,22 +116,20 @@ If we aim a little *ahead by `tau`*, the hand can ride **on** the object in stea
 The lead time is **not** always 0.25 s. It is roughly:
 
 > how long the hand needs to reach the meeting point  
-> (capped at `lookahead_s` = 0.25 s)  
+> (capped at `lookahead_s` = 0.40 s)  
 > **plus** `tau`
 
 Code: [`_intercept_lead_s`](state_machine.py#L231).
 
-- Far away → lead near the 0.25 s cap.
+- Far away → lead near the 0.40 s cap.
 - On top of the object → travel time → 0 → lead collapses to `tau` → hand rides the object.
 
-### Bounce-aware guess
+### Coast forecast
 
-> House / throw mode (`scene.use_house: true`): no bounce. `xy_bounds` is `None`, the forecast is constant velocity and the bounce guard is always clear. The next sections describe the floor (bounce box) mode.
-> Physics grasp (house default): `attach_object` means "close now", the scene frees the object to PhysX instead of welding it. A held object more than `slip_dist_m` from the hand sends the expert back to intercept.
+> Forecast is constant velocity (can leave the table).
+> Physics grasp (default): `attach_object` means "close now", the scene frees the object to PhysX instead of welding it. A held object more than `slip_dist_m` from the hand sends the expert back to intercept.
 
-The object bounces off the play-band walls. A straight-line “fly 0.25 s ahead” guess can leave the table.
-
-We roll the object forward with the **same** bounce rules the scene uses: [`_forecast`](state_machine.py#L220) → [`kinematic_forecast`](motion.py#L34).
+We roll the object forward with the **same** coast rules the scene uses: [`_forecast`](state_machine.py) → [`kinematic_forecast`](motion.py).
 
 ### Object-frame gates
 
@@ -144,11 +142,6 @@ With lag compensation, that error can go to zero. Without it, the aim stays ahea
 Chase aims at the object (XY ahead, Z = object Z). Close when the hand is inside
 `grasp_xyz_ok_mm` (`|dx|`, `|dy|`, `|dz|`) on GT pose — [`_grasp_gate_ok`](state_machine.py).
 Wrist depth is logged only; it must not replace GT Z.
-
-### Bounce guard
-
-Do not close if the object is about to reverse off a wall before the hand can
-finish the last Z drop — [`_bounce_clear`](state_machine.py).
 
 ---
 
@@ -183,7 +176,6 @@ Arm sits at home. Wait `settle_s` so the scene is ready.
 - Compute lead with [`_intercept_lead_s`](state_machine.py).
 - Aim with [`_forecast`](state_machine.py); target Z is the object (no hover).
 - One gate: `grasp_xyz_ok_mm` (GT only) — [`_grasp_gate_ok`](state_machine.py).
-- Wall clear check (`min_wait_after_bounce_ms`) must pass before close (floor mode).
 
 → **close fingers**.  
 If stuck too long → retry intercept ([`_restart_approach`](state_machine.py)).
@@ -242,10 +234,10 @@ Move down to the drop pose inside the container ([`_drop_target`](state_machine.
 
 [`STAGE_OPEN` branch](state_machine.py#L512)
 
-Release. The hand holds still where the open began. Weld mode (floor) pins the
-object; physics grasp (house) lets it drop into the box. A lower that is blocked
-over the box (object on the floor, finger on the rim) also comes here, so every
-place shows a real open.
+Release. The hand holds still where the open began. Weld mode pins the object;
+physics grasp (default) lets it drop into the box. A lower that is blocked over
+the box (object on the floor, finger on the rim) also comes here, so every place
+shows a real open.
 
 Require object XY near box center (`place_xy_tol`) — [`_in_container`](state_machine.py#L343).
 
@@ -286,7 +278,7 @@ Success latch. Arm home, fingers open, object frozen in the box. The episode loo
       │  settle_s
       ▼
   [1 intercept]  ←── chase object (lag + shrinking lead); Z on object
-      │  grasp_xyz_ok (GT) + bounce clear
+      │  grasp_xyz_ok (GT)
       │
       │  (2 go down — unused id; happy path skips it)
       ▼
@@ -321,13 +313,12 @@ Loader maps them to SI keys; the expert reads those in [`__init__`](state_machin
 | Yaml name | Default | Plain meaning |
 |---|---|---|
 | `policy_look_ahead_ms` | 250 | Policy pack look-ahead (not for aiming) |
-| `wait_at_home_ms` | 200 | Pause at home before first chase |
-| `max_aim_ahead_ms` | 250 | Cap on meeting-point look-ahead |
+| `wait_at_home_ms` | 50 | Pause at home before first chase |
+| `max_aim_ahead_ms` | 400 | Cap on meeting-point look-ahead |
 | `tip_lag_pad_ms` | 160 | Aim farther for tip lag (not a wait) |
-| `hand_speed_max_cm_s` | 90 | Assumed hand speed for meet-time |
-| `grasp_xyz_ok_mm` | [10, 10, 15] | One close gate: \|dx\|, \|dy\|, \|dz\| (mm) |
+| `hand_speed_max_cm_s` | 250 | Assumed hand speed for meet-time (faster than ~1 m/s objects) |
+| `grasp_xyz_ok_mm` | [10, 10, 20] | One close gate: \|dx\|, \|dy\|, \|dz\| (mm) |
 | `wrist_close_depth_mm` | 0 | Logged only; expert close Z always uses GT \|dz\| |
-| `min_wait_after_bounce_ms` | 100 | Min clear path before wall (floor only) |
 | `hold_closed_weld_ms` / `hold_closed_physics_ms` | 100 / 300 | Dwell after close before lift |
 | `near_enough_xy_mm` | 30 | Close enough XY for carry / lower / home |
 | `arrived_z_ok_mm` | 30 | Height arrival for lift / carry / lower (not grasp) |
@@ -355,7 +346,7 @@ Failure labels (plain): [`WHY_FAILED`](state_machine_logs.py#L39) — never reac
 | Piece | Role |
 |---|---|
 | [`scene.py`](scene.py) | Table, arm, object, box, cameras; applies slide / freeze / glue |
-| [`motion.py`](motion.py) | On-table bounce + forecast |
+| [`motion.py`](motion.py) | On-table coast + forecast |
 | [`state_machine.py`](state_machine.py) | Stage logic above |
 | [`collect.py`](collect.py) | Step loop: expert → scene → log |
 | [`success.py`](success.py) | Pass / fail label |

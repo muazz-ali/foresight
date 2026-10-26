@@ -10,9 +10,6 @@ and a number for "how sure am I" (covariance). It fills the frozen message:
 State [x, y, vx, vy]. Predict is the same straight-line physics the oracle pack
 uses; update takes one table point per camera frame. Two plain additions:
 
-  bounce — a point far outside the predicted spread (a wall hit flips the
-           velocity) re-runs that predict step with a large acceleration
-           allowance, so the same update also re-learns the speed.
   jump   — a point farther from the guess than any real object could get
            (``outlier_m`` + ``max_speed`` × time since the last point) is a
            tracker slip (e.g. onto the gripper): treated as "no point".
@@ -28,7 +25,6 @@ import numpy as np
 from interfaces.state import ObjectState
 
 _H = np.eye(2, 4)  # we only measure x, y (not the speeds): picks the first 2 of 4 state numbers
-_CHI2_2DOF_999 = 13.8  # 99.9% gate for a 2-D residual
 
 
 def _transition(dt: float, accel_std: float) -> tuple[np.ndarray, np.ndarray]:
@@ -62,9 +58,7 @@ class CVKalman:
         *,
         meas_std: float = 0.004,
         accel_std: float = 2.0,
-        bounce_accel_std: float = 10.0,
         init_vel_std: float = 0.3,
-        bounce_nis: float = _CHI2_2DOF_999,
         max_coast_s: float = 0.5,
         outlier_m: float = 0.03,
         max_speed: float = 0.5,
@@ -73,9 +67,7 @@ class CVKalman:
         self.R = np.eye(2) * meas_std**2
         self.meas_std = float(meas_std)
         self.accel_std = float(accel_std)  # m/s²: normal speed wobble
-        self.bounce_accel_std = float(bounce_accel_std)  # m/s²: wobble allowed after a wall hit
         self.init_vel_std = float(init_vel_std)  # m/s: doubt about speed at the first point
-        self.bounce_nis = float(bounce_nis)  # surprise level that means "bounce"
         self.max_coast_s = float(max_coast_s)  # seconds blind before ``valid`` goes False
         self.outlier_m = float(outlier_m)  # m: slack before a jump counts as a slip
         self.max_speed = float(max_speed)  # m/s: faster than any throw we expect
@@ -84,7 +76,6 @@ class CVKalman:
         self.P: np.ndarray | None = None
         self.t = 0.0  # time of the current estimate (s)
         self.last_meas_t = 0.0  # time of the last real point (s)
-        self.n_bounces = 0
 
     @property
     def started(self) -> bool:
@@ -118,20 +109,12 @@ class CVKalman:
                 self.n_outliers += 1
         if z_xy is None:
             if self.coast_s() > self.max_coast_s:
-                # Blind too long: a straight line through unseen wall hits only gets
-                # worse. Hold the last place (plan §6: hold, re-detect).
+                # Blind too long: hold the last place (plan §6: hold, re-detect).
                 self.x[2:] = 0.0
             return
         z = np.asarray(z_xy, dtype=np.float64)
         y = z - _H @ self.x  # surprise: seen point minus predicted point (m)
         S = _H @ self.P @ _H.T + self.R  # how big a surprise we expect
-        # Surprise in units of expected spread (chi-square). Huge = not just noise.
-        if float(y @ np.linalg.solve(S, y)) > self.bounce_nis:
-            # Wall hit: redo this step allowing a sharp speed change.
-            _, Qb = _transition(dt, self.bounce_accel_std)
-            self.P = F @ P_prev @ F.T + Qb
-            S = _H @ self.P @ _H.T + self.R
-            self.n_bounces += 1
         # UPDATE: K is the trust knob (0 = ignore the point, 1 = believe it fully).
         # Nudge the state toward the seen point by K × surprise; doubt shrinks.
         K = self.P @ _H.T @ np.linalg.inv(S)
@@ -158,9 +141,9 @@ class CVKalman:
         cov[np.ix_(idx, idx)] = self.P
         cov[2, 2] = cov[5, 5] = 1e-8  # on-table: z and vz are known
         return ObjectState(
-            position=np.array([self.x[0], self.x[1], plane_z]),
-            velocity=np.array([self.x[2], self.x[3], 0.0]),
+            position=np.array([self.x[0], self.x[1], float(plane_z)], dtype=np.float64),
+            velocity=np.array([self.x[2], self.x[3], 0.0], dtype=np.float64),
             covariance=cov,
-            timestamp=self.t,
+            timestamp=float(self.t),
             valid=self.coast_s() <= self.max_coast_s,
         )

@@ -64,10 +64,6 @@ _SM_RENAMES: dict[str, str] = {
     "grasp_tol_grows_k": "grasp_xyz_ok_mm",
     "physics_grasp_z_tol_mm": "grasp_xyz_ok_mm",
     "physics_grasp_z_ok_mm": "grasp_xyz_ok_mm",
-    "bounce_guard_ms": "min_wait_after_bounce_ms",
-    "wait_after_bounce_ms": "min_wait_after_bounce_ms",
-    "min_clear_before_wall_ms": "min_wait_after_bounce_ms",
-    "ee_settle_tol_cm_s": "object_still_cm_s",
     "close_gripper_ms": "hold_closed_weld_ms",
     "physics_close_ms": "hold_closed_physics_ms",
     "close_depth_mm": "wrist_close_depth_mm",
@@ -123,9 +119,6 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
 
     scene = cfg.get("scene")
     if isinstance(scene, dict):
-        _take(scene, "table_height_mm", "table_height", _MM)
-        _take(scene, "table_size_mm", "table_size", _MM)
-        _take(scene, "table_pos_mm", "table_pos", _MM)
         _take(scene, "object_radius_mm", "object_radius", _MM)
         _take(scene, "place_hover_above_container_mm", "place_hover_above_container", _MM)
         _take(scene, "spawn_xy_pad_mm", "spawn_xy_pad", _MM)
@@ -181,7 +174,6 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
             ("wait_at_home_ms", "settle_s"),
             ("max_aim_ahead_ms", "lookahead_s"),
             ("tip_lag_pad_ms", "robot_approach_pad_s"),
-            ("min_wait_after_bounce_ms", "bounce_guard_s"),
             ("hold_closed_weld_ms", "close_gripper_s"),
             ("hold_closed_physics_ms", "physics_close_s"),
             ("episode_max_ms", "inference_window_s"),
@@ -218,7 +210,6 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
         ):
             _take(sm, human, si, _MM)
         # speeds (cm/s → m/s)
-        _take(sm, "object_still_cm_s", "ee_settle_tol", _CM)
         _take(sm, "hand_speed_max_cm_s", "ee_speed_max", _CM)
         # unitless / ints (rename in place; SI name kept for the expert)
         if "aim_refine_iters" in sm:
@@ -229,5 +220,23 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
     sim = cfg.get("sim")
     if isinstance(sim, dict):
         _take(sim, "dt_ms", "dt", _MS)
+
+    # Main-claim delay injection (Step 1). Optional block; absent = no change.
+    ct = cfg.get("claim_timing")
+    if isinstance(ct, dict):
+        _take(ct, "delta_jitter_ms", "delta_jitter_s", _MS)
+        _take(ct, "train_delta_min_ms", "train_delta_min_s", _MS)
+        _take(ct, "train_delta_max_ms", "train_delta_max_s", _MS)
+        _take(ct, "eval_delta_ms", "eval_delta_s", _MS)
+
+    # Grasp-height / p̂z (claim Z update). Optional.
+    ch = cfg.get("claim_height")
+    if isinstance(ch, dict):
+        _take(ch, "finger_insert_mm", "finger_insert_m", _MM)
+        _take(ch, "table_clear_mm", "table_clear_m", _MM)
+        _take(ch, "z_slack_mm", "z_slack_m", _MM)
+        _take(ch, "latch_lo_mm", "latch_lo_m", _MM)
+        _take(ch, "latch_hi_mm", "latch_hi_m", _MM)
+        _take(ch, "depth_rmse_max_mm", "depth_rmse_max_m", _MM)
 
     return cfg

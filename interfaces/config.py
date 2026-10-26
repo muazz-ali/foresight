@@ -101,4 +101,6 @@ def policy_train_defaults(policy_path: str | Path | None = None) -> dict[str, An
         "log_every": int(pol.get("log_every", 50)),
         "eval_every": int(pol.get("eval_every", 100)),
         "val_fraction": float(pol.get("val_fraction", 0.05)),
+        "chunk_size": int(pol.get("chunk_size", 25)),
+        "n_action_steps": int(pol.get("n_action_steps", 10)),
     }

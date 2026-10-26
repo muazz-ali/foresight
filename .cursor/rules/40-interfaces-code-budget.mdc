@@ -6,31 +6,20 @@ alwaysApply: false
 
 # Interfaces & code budgets
 
-## Conditioning vector (live pack = **4** numbers, Phases 1–2)
+## Conditioning vector (live pack = **5** numbers — claim Z update)
 Logged / trained layout (`CONDITIONING_LAYOUT`):
 | Field | Dim | Meaning |
 |---|---|---|
 | `p_hat_x/y(t+Δ)` | 2 | Predicted object XY at action-landing time |
+| `p_hat_z` | 1 | Grasp height `z_grasp` (latched; vz = 0) |
 | `v_hat_x/y` | 2 | Object XY velocity |
 
-**Δ is fixed** from `sim/phase0_cfg.yaml` → `state_machine_params.conditioning_delta_s`
-(collect / train / eval must agree). It is **not** packed while it is constant.
-Train noise comes from `policy/configs/smolvla.yaml`. Pack Δ as a 5th number
-only when deploy latency genuinely varies (Phase 3 latency sweep / Phase 4 real arm).
+**Height changes p̂z, never relative d_z** (`z_grasp = max(z_top−g, z_table+c)`).
+Δ (look-ahead) is baked into XY p̂; claim path uses measured/reported Δ via
+`claim_timing`. Legacy G1 used fixed yaml Δ and a **4**-number pack — old
+checkpoints are not bit-compatible; retrain after this change.
 
-With fixed Δ, clean `[p̂, v̂]` is an invertible transform of `[p, v]` — phrase
-G1 as “explicit object state helps,” and use a Δ=0 ablation if you need to
-isolate *future* vs *current*.
-
-**G2 does not change the pack.** The G2 swap feeds filter-made `[p̂, v̂]` to the
-**unchanged** G1 model (12-D state). Oracle and filter must emit the same pack,
-built by the same `interfaces.state.conditioning_vector` (plain constant-velocity
-predict — no bounce-aware forecast; model never trained on bounce-aware forecast).
-
-Still dropped: `p_hat_z`, `v_hat_z`, `sigma_*`, `valid`, `coast_time`. The filter
-already fills `covariance` / `valid` in `ObjectState`; packing them needs a retrain,
-so do it only **after** the G2 swap result, and only if the swap drop is ≥10 points
-and retraining the model on filter-made vectors did not fix it (`foresight_plan.md` §5).
+Still dropped: `v_hat_z`, `sigma_*`, `valid`, `coast_time`.
 
 ## Budgets (glue, not frameworks)
 | Module | Budget |

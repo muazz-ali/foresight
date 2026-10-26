@@ -106,29 +106,7 @@ def test_kalman_straight_line_converges():
         kf.step(t, x)
     s = kf.state(0.03)
     assert np.linalg.norm(s.position[:2] - xs[-1]) < 1e-4  # clean track: exact
-    assert s.valid and kf.n_bounces == 0
-
-
-def _bounce_track():
-    ts = np.arange(40) * DT
-    x = 0.60 + 0.2 * ts
-    x = np.where(x > 0.72, 2 * 0.72 - x, x)  # wall at x = 0.72
-    return np.c_[x, np.zeros_like(x)], ts
-
-
-def test_kalman_recovers_after_wall_bounce():
-    xs, ts = _bounce_track()
-    assert _vel_rms(xs, ts, np.array([-0.2, 0.0])) < VEL_BAR
-
-
-def test_kalman_bounce_reset_fires_when_filter_is_slow():
-    # A sluggish filter cannot follow a reversal on its own; the NIS gate must fire.
-    xs, ts = _bounce_track()
-    kf = CVKalman(accel_std=0.3)
-    for x, t in zip(xs, ts):
-        kf.step(t, x)
-    assert kf.n_bounces >= 1
-    assert abs(kf.state(0.03).velocity[0] - (-0.2)) < VEL_BAR
+    assert s.valid
 
 
 def test_kalman_coast_turns_invalid():

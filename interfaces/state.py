@@ -123,18 +123,17 @@ def oracle_from_gt(
     return ObjectState(position, velocity, diag, timestamp, valid)
 
 
-# Phase-1 live pack = 4 numbers. Δ is fixed from yaml (conditioning_delta_s) at
-# collect / train / eval — not packed. Dropped until G2: p_hat_z, v_hat_z,
-# sigma_*, valid, coast_time. Pack Δ (5th) only when deploy latency genuinely varies.
+# Live pack = 5 numbers. Δ drives XY predict (p̂ = p + v·Δ) and is NOT packed.
+# p̂z is grasp height (latched; vz = 0) — height changes p̂, never the relative d_z.
+# Claim path: measured/reported Δ via DelayInjection. Legacy: fixed yaml Δ.
+# Still dropped: v_hat_z, sigma_*, valid, coast_time.
 #
-# Plain words: the policy gets 4 numbers.
+# Plain words: the policy gets:
 #   p_hat_x, p_hat_y = where the object WILL be (XY) in Δ seconds
+#   p_hat_z           = grasp height z_grasp (constant while sliding)
 #   v_hat_x, v_hat_y = how fast it moves now (XY)
-# Δ ("delta") = how far ahead we look, in seconds. It is the time between "now"
-# and "when the robot action actually lands". It is a fixed number from the yaml,
-# so the model never needs to be told it.
-CONDITIONING_DIM = 4
-CONDITIONING_LAYOUT = ("p_hat_x", "p_hat_y", "v_hat_x", "v_hat_y")
+CONDITIONING_DIM = 5
+CONDITIONING_LAYOUT = ("p_hat_x", "p_hat_y", "p_hat_z", "v_hat_x", "v_hat_y")
 
 
 def conditioning_vector(
@@ -142,17 +141,18 @@ def conditioning_vector(
     delta: float,
     *,
     workspace_scale: float = 1.0,
+    p_hat_z: float | None = None,
 ) -> np.ndarray:
-    """4 live numbers: future XY place + XY speed (workspace-scaled).
+    """5 live numbers: future XY + grasp Z + XY speed (workspace-scaled).
 
-    ``delta`` drives the CV predict (``p̂ = p + v·Δ``); it is not in the vector.
-    Keep train/eval Δ equal via ``state_machine_params.conditioning_delta_s``.
-
-    Oracle and filter must both call THIS function, so the policy sees the same
-    kind of numbers from either source. ``workspace_scale`` shrinks meters to a
-    small range (divide by table size) so the numbers are easy for the net to read.
+    ``delta`` drives the CV XY predict; it is not in the vector.
+    ``p_hat_z`` overrides future Z when set (latched z_grasp). Else uses
+    ``state.position[2]`` after predict (vz usually 0).
     """
     future = state.predict(delta)
+    if p_hat_z is not None and np.isfinite(p_hat_z):
+        future.position = future.position.copy()
+        future.position[2] = float(p_hat_z)
     return pack_conditioning(future, delta, valid=state.valid, workspace_scale=workspace_scale)
 
 
@@ -163,18 +163,15 @@ def pack_conditioning(
     valid: bool | None = None,
     workspace_scale: float = 1.0,
 ) -> np.ndarray:
-    """Pack future ObjectState into the 4-D live conditioning layout.
+    """Pack future ObjectState into the 5-D live conditioning layout.
 
-    ``delta`` / ``valid`` kept for call-site compatibility; unused in the pack.
-    Takes a state that is ALREADY moved forward by Δ and keeps only XY position + XY velocity.
-    Z is dropped on purpose (the table is flat; z is not needed in Phase 1).
+    Layout: [p̂x, p̂y, p̂z, vx, vy]. ``delta`` / ``valid`` unused in the pack.
     """
     del delta, valid  # call-site compat; not in live layout
-    # Guard: scale 0 or None would divide by zero, so fall back to 1 (no scaling).
     scale = float(workspace_scale) if workspace_scale else 1.0
     return np.concatenate(
         [
-            future.position[:2] / scale,
+            future.position[:3] / scale,
             future.velocity[:2] / scale,
         ]
     ).astype(np.float64)

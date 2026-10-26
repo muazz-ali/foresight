@@ -1,4 +1,4 @@
-# Sim — table scene + scripted expert
+# Sim — house scene + scripted expert
 
 How the expert works (plain words + code links): [`STATE_MACHINE.md`](STATE_MACHINE.md).
 
@@ -7,8 +7,8 @@ How the expert works (plain words + code links): [`STATE_MACHINE.md`](STATE_MACH
 | Path | What it does |
 |---|---|
 | `phase0_cfg.yaml` | Scene, cameras, expert timings, mesh folders |
-| `scene.py` | Franka + table + object + container + cameras |
-| `motion.py` | On-table sliding motion; bounce only when `xy_bounds` is given (floor). House / throw passes `None` = straight line |
+| `scene.py` | Franka + house USD + throw object + container + cameras |
+| `motion.py` | On-table coast (straight line; miss leaves the table) |
 | `physics_grasp.py` | Helpers for the real PhysX grasp: sticky material, table-footprint check, wrist depth between the fingertips |
 | `state_machine.py` | Intercept-servo pick stages (0–9) |
 | `STATE_MACHINE.md` | Simple full walkthrough with links into the code |
@@ -23,7 +23,7 @@ Shared object message: `interfaces/state.py`.
 | Root | Use |
 |---|---|
 | `/home/gpuadmin/Desktop/muazzam/objects` | Grasp objects + place containers |
-| `/home/gpuadmin/Desktop/muazzam/scenes` | Unused for now |
+| `/home/gpuadmin/Desktop/muazzam/scenes` | House USDs (random table) |
 
 Object + container meshes are chosen **once per process** (`--seed` / `--object-usd` / `--container-usd`). For more variety, run several workers with different seeds or category names.
 

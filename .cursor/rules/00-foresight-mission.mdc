@@ -27,7 +27,7 @@ Phase-1 **live pack** into the policy is 5 numbers: `p_hat_x, p_hat_y, v_hat_x, 
 - **G0** expert ≥70% @ 0–20 cm/s (0 / 10 / 15 / 20); collection hundreds/hr
 - **G1** Grasp rate stays flat 0→20 cm/s (<15 pt drop); zero the 4 numbers at eval and success collapses (proof the model uses them). **n≥80 per bin** to claim; 20 is scout. A-vs-B comparison is retired — do not train Model A. Do not call G1 / the hypothesis dead while Δ is unpacked, eval glue unsticks on open, or labels are `{0,4}` vs expert stages.
 - **G2** pred RMSE @250 ms ≤1–2 cm; swap drop <10 pts
-- **G3** throw + timing in one: catch before off-table (no bounce box); buffer/reflex/wrist; recover ≥half late/early; smoother paths; **one last sim collect + one retrain**
+- **G3** throw + timing in one: catch before off-table; buffer/reflex/wrist; recover ≥half late/early; smoother paths; **one last sim collect + one retrain**
 - **G4** real ≥60–70% @ 10–20 cm/s
 
 ## Deliberately do NOT build

@@ -336,23 +336,24 @@ def compute_play_layout(
     table_bbox_min_w,
     table_bbox_max_w,
     *,
-    max_reach_dist: float = 0.75,
-    play_x: tuple[float, float] = (0.40, 0.68),
+    max_reach_dist: float = 0.85,
+    play_x: tuple[float, float] = (0.40, 0.80),
     play_y_half: float = 0.14,
-    container_y: float = 0.30,
-    container_x: float = 0.50,
+    # Bowl X seed (m). Y is always the +Y inner-half edge (not this |y|).
+    # Scene may pass cfg scene.container_xy; layout overwrites Y.
+    container_y: float = 0.35,
+    container_x: float = 0.43,
     container_y_half_width: float = 0.04,
     min_play_y_half: float = 0.08,
     container_gap: float = 0.03,
+    table_edge_pad: float = 0.02,
 ) -> PlayLayout:
     """Where objects may spawn (play rect) and where the drop container sits.
 
-    Robot is at the origin facing +X into the table. We keep the play rect
-    inside the table's middle 50% and inside the arm's reach. The container
-    goes to one side (prefer +Y), kept on the table and clear of the play band.
-
-    On a narrow table we shrink the play band in Y so the bowl still has a
-    clear side pocket. If that would make the play band too thin, we raise.
+    Robot at origin facing +X. Near X stays in the reachable catch zone; **far
+    X** is the real table +X rim so throws get a long track runway. Bowl sits
+    on the **real +Y table rim** (not inner-half), X = seed − 3 cm toward the
+    robot, clear of the throw path.
     """
     bmin = np.asarray(table_bbox_min_w, dtype=float)
     bmax = np.asarray(table_bbox_max_w, dtype=float)
@@ -360,36 +361,47 @@ def compute_play_layout(
     ix0, ix1 = _inner_half(bmin[0], bmax[0])
     iy0, iy1 = _inner_half(bmin[1], bmax[1])
 
-    # Play rect X = desired band ∩ table inner half ∩ reach limits.
+    # Near X: catch zone (inner half ∩ reach floor). Far X: **real table +X
+    # rim** — do NOT clip by arm reach (object runs into the catch zone).
+    # max_reach_dist still clamps the bowl place pose below.
+    table_far = float(bmax[0]) - float(table_edge_pad)
     px0 = max(play_x[0], ix0, 0.32)
-    px1 = min(play_x[1], ix1, max_reach_dist - 0.08)
-    if px1 - px0 < 0.12:
+    px1 = float(table_far)
+    # Need enough runway to chase under 50 cm/s. Smoke i16 had only ~15 cm of
+    # play and closed once then slipped off the near edge.
+    min_play_x = 0.35
+    if px1 - px0 < min_play_x:
+        # Prefer keeping the far rim; slide the near edge in if needed.
+        px0 = min(px0, px1 - min_play_x)
+        px0 = max(px0, 0.30)
+    if px1 - px0 < min_play_x:
         raise ValueError(
-            f"play rect too thin in X: x=({px0:.3f},{px1:.3f}) (need ≥0.12 m)"
+            f"play rect too thin in X: x=({px0:.3f},{px1:.3f}) "
+            f"(need ≥{min_play_x:.2f} m); table_far={table_far:.3f}"
         )
 
     hw = container_y_half_width
-    cx = float(np.clip(container_x, ix0 + 0.06, ix1 - 0.06))
+    # Seed X nudged 3 cm toward the robot (−X). Smoke H5 had the bowl at
+    # x≈0.35 mid-reach; −3 cm keeps place closer to the catch zone.
+    cx = float(np.clip(float(container_x) - 0.03, ix0 + 0.06, ix1 - 0.06))
 
-    # Park the bowl near the preferred |y|, clipped to the table inner half.
-    # Prefer +Y; fall back to -Y if that side has more room.
-    def side_room(sign: float) -> tuple[float, float]:
-        cy = float(np.clip(sign * container_y, iy0 + hw, iy1 - hw))
-        # How far we can push the play edge before we hit the bowl pocket.
-        if sign > 0:
-            room = (cy - hw - container_gap)  # play ymax must be ≤ this
-        else:
-            room = -(cy + hw + container_gap)  # |play ymin| must be ≤ this
-        return cy, room
-
-    cy_p, room_p = side_room(1.0)
-    cy_m, room_m = side_room(-1.0)
-    if room_p >= room_m:
-        sign, cy, room = 1.0, cy_p, room_p
-    else:
-        sign, cy, room = -1.0, cy_m, room_m
-
-    # Shrink play Y so the bowl keeps a clear gap; never grow past play_y_half.
+    # Toward the **real +Y table rim**, but clamped to arm reach so place does
+    # not DiffIK-swing the hand off the table (rim-only put cy≈0.74 → timeouts
+    # / ee-off-table). Inner-half alone sat at ~0.36 (looked mid-table).
+    _ = container_y  # API compat; Y is forced toward the +Y rim, not this seed.
+    table_y_far = float(bmax[1]) - float(table_edge_pad)
+    cy_rim = float(table_y_far - hw)
+    # ~72% of max reach keeps Franka place inside the table footprint.
+    reach_xy = 0.72 * float(max_reach_dist)
+    cy_reach = float(np.sqrt(max(reach_xy * reach_xy - cx * cx, 0.05)))
+    cy_min = float(play_y_half + container_gap + hw)  # clear of the throw band
+    cy = float(np.clip(min(cy_rim, cy_reach), cy_min, cy_rim))
+    if cy <= hw:
+        raise ValueError(
+            f"table too narrow for +Y bowl pocket: cy={cy:.3f} (need >{hw})"
+        )
+    # Play band stays on the robot side of the bowl (below +Y pocket).
+    room = cy - hw - container_gap  # play ymax must be ≤ this
     py_half = min(play_y_half, max(0.0, room), abs(iy0), abs(iy1))
     if py_half < min_play_y_half:
         raise ValueError(
@@ -397,7 +409,7 @@ def compute_play_layout(
             f"py_half={py_half:.3f} (need ≥{min_play_y_half})"
         )
     py0 = max(-py_half, iy0)
-    py1 = min(py_half, iy1)
+    py1 = min(py_half, iy1, room)
     if not (py0 < py1):
         raise ValueError(
             f"play rect has no Y span: y=({py0:.3f},{py1:.3f})"
@@ -408,12 +420,8 @@ def compute_play_layout(
     # Small pocket box around the container, never crossing into the play band.
     clip_x0 = max(cx - 0.06, ix0)
     clip_x1 = min(cx + 0.06, ix1)
-    clip_y0 = max(cy - hw, iy0)
-    clip_y1 = min(cy + hw, iy1)
-    if sign > 0:
-        clip_y0 = max(clip_y0, py1)
-    else:
-        clip_y1 = min(clip_y1, py0)
+    clip_y0 = max(cy - hw, py1, iy0)  # start at/above play ymax
+    clip_y1 = min(cy + hw, table_y_far)
     if not (clip_x0 < clip_x1 and clip_y0 < clip_y1):
         raise ValueError("container clip box empty after play shrink")
     container_xy_clip = (
@@ -430,6 +438,226 @@ def compute_play_layout(
 
 
 # ------------------------------- throw sampler -----------------------------
+# Categories laid on their side so cylinders can roll (DynamicVLA-style tip).
+ROLL_TIP_CATEGORIES = frozenset({"can", "bottle", "cup", "beer", "fcan"})
+
+
+def tip_on_side_quat_wxyz(vel_xy, rng: np.random.Generator) -> np.ndarray:
+    """Tip a tall object onto its side; long axis across travel (for rolling).
+
+    Same idea as DynamicVLA ``get_object_init_quat``: ±90° tip about X, yaw =
+    travel heading. Returns quaternion wxyz. Call only for roll categories.
+    """
+    v = np.asarray(vel_xy, dtype=float).reshape(2)
+    n = float(np.linalg.norm(v))
+    yaw = float(np.arctan2(v[1], v[0])) if n > 1e-9 else 0.0
+    tip = 0.5 * np.pi * float(rng.choice([-1.0, 1.0]))
+    q_xyzw = Rotation.from_euler("xyz", [tip, 0.0, yaw]).as_quat()
+    return _xyzw_to_wxyz(q_xyzw)
+
+
+def sit_half_height_m(size_xyz, *, tipped: bool) -> float:
+    """Table sit height (half extent along world Z) for upright or tipped mesh."""
+    size = np.asarray(size_xyz, dtype=float).reshape(3)
+    if tipped:
+        # Upright Z was height; on its side the diameter (XY) is vertical.
+        return 0.5 * float(min(abs(size[0]), abs(size[1])))
+    return 0.5 * float(abs(size[2]))
+
+
+def _padded_play(object_xy_bounds, spawn_pad: float):
+    (xmin, xmax), (ymin, ymax) = object_xy_bounds
+    pxmin, pxmax = xmin + spawn_pad, xmax - spawn_pad
+    pymin, pymax = ymin + spawn_pad, ymax - spawn_pad
+    if pxmin > pxmax:
+        pxmin = pxmax = 0.5 * (xmin + xmax)
+    if pymin > pymax:
+        pymin = pymax = 0.5 * (ymin + ymax)
+    return (pxmin, pxmax), (pymin, pymax), (xmin, xmax, ymin, ymax)
+
+
+def _finish_throw(spawn, target, speed, reach_dir, side, pad_box) -> dict:
+    """Clip spawn/target, build unit velocity * speed."""
+    (pxmin, pxmax), (pymin, pymax) = pad_box
+    spawn = np.asarray(spawn, dtype=float).copy()
+    target = np.asarray(target, dtype=float).copy()
+    spawn[0] = float(np.clip(spawn[0], pxmin, pxmax))
+    spawn[1] = float(np.clip(spawn[1], pymin, pymax))
+    target[0] = float(np.clip(target[0], pxmin, pxmax))
+    target[1] = float(np.clip(target[1], pymin, pymax))
+    d = target - spawn
+    n = float(np.linalg.norm(d))
+    if n < 1e-3:
+        push = -np.asarray(reach_dir, dtype=float).reshape(2)
+        pn = float(np.linalg.norm(push))
+        push = (push / pn) if pn > 1e-6 else np.array([-1.0, 0.0])
+        spawn = np.clip(target + push * 0.15, [pxmin, pymin], [pxmax, pymax])
+        d = target - spawn
+        n = float(np.linalg.norm(d))
+        if n < 1e-6:
+            d = np.array([1.0, 0.0])
+            n = 1.0
+    vel_xy = d / n * float(speed)
+    return {
+        "spawn": spawn,
+        "vel_xy": vel_xy,
+        "target": target,
+        "reach_dir": np.asarray(reach_dir, dtype=float).reshape(2),
+        "side": side,
+    }
+
+
+def _heading_from_edge_deg(theta_deg: float) -> np.ndarray:
+    """Unit velocity from a 180° fan at the far (+X) table edge.
+
+    Standing on the far edge looking at the robot:
+      0°   → along +Y (table edge left)
+      90°  → straight at the robot (−X)
+      180° → along −Y (table edge right)
+
+    ``vx = -sin(θ)``, ``vy = cos(θ)`` so the open half-plane always has vx ≤ 0.
+    """
+    t = np.deg2rad(float(theta_deg))
+    return np.array([-np.sin(t), np.cos(t)], dtype=float)
+
+
+def _coast_reaches_catch(
+    spawn,
+    heading,
+    speed: float,
+    *,
+    xmin: float,
+    xmax: float,
+    ymin: float,
+    ymax: float,
+    until_x: float,
+    margin: float = 0.01,
+    dt: float = 0.02,
+    tmax: float = 3.0,
+) -> bool:
+    """True if a scripted coast stays in the play box until ``x <= until_x``.
+
+    Why: a full 180° fan from the far edge includes grazing throws that leave
+    the table before the hand can meet them (smoke off-table at ~±80° from −X).
+    Callers only keep headings that pass this GT check.
+    """
+    if float(speed) <= 1e-9:
+        return True
+    p = np.asarray(spawn, dtype=float).reshape(2).copy()
+    v = np.asarray(heading, dtype=float).reshape(2) * float(speed)
+    if float(v[0]) >= -1e-9:
+        return False  # not heading toward the robot
+    # Near/side walls get a pad; far +X is the spawn rim — do not inset xmax
+    # or the first step from the rim looks "already off" and every throw fails.
+    lo_x = float(xmin) + float(margin)
+    hi_x = float(xmax) + 1e-6
+    lo_y = float(ymin) + float(margin)
+    hi_y = float(ymax) - float(margin)
+    goal_x = float(until_x)
+    t = 0.0
+    while t <= float(tmax) + 1e-12:
+        if float(p[0]) <= goal_x:
+            return True
+        p = p + v * float(dt)
+        t += float(dt)
+        if not (lo_x <= float(p[0]) <= hi_x and lo_y <= float(p[1]) <= hi_y):
+            return False
+    return False
+
+
+def _throw_toward_robot(
+    rng: np.random.Generator,
+    object_xy_bounds,
+    *,
+    speed: float,
+    spawn_pad: float,
+    catch_band: tuple[float, float],
+    lateral: float,
+    jitter: float,
+) -> dict:
+    """Spawn on the far +X edge; aim with a catchable fan toward the robot.
+
+    ``jitter`` (= ``throw_randomness``) in [0, 1] sets the fan width around 90°:
+      0 → only 90° (straight −X center line)
+      1 → try uniform on [0°, 180°], keep only paths that stay in the play
+          band until the catch zone (rejects grazing off-table throws)
+      r → same with fan [90° − 90°r, 90° + 90°r]
+
+    ``lateral`` unused (API compat). Never aims at the bowl.
+    """
+    del lateral
+    (xmin, xmax), (ymin, ymax) = object_xy_bounds
+    # Pad only Y so the object stays on the band; keep spawn on the true +X rim
+    # (do not inset xmax — that made throws look mid-table on short play bands).
+    pymin = float(ymin + spawn_pad)
+    pymax = float(ymax - spawn_pad)
+    if pymin > pymax:
+        pymin = pymax = 0.5 * (ymin + ymax)
+    pxmin = float(xmin + spawn_pad)
+    pxmax = float(xmax)  # far table/play rim
+    j = float(np.clip(jitter, 0.0, 1.0))
+
+    # Catch zone far edge: path must stay on the band at least this far in.
+    until_x = float(np.clip(max(catch_band), pxmin + 0.05, pxmax - 0.10))
+
+    # Spawn on the far +X edge. r=0 pins Y to center; else anywhere on the edge.
+    spawn_x = float(pxmax)
+    mid_y = 0.5 * (pymin + pymax)
+    spawn_y = mid_y if j <= 0.0 else float(rng.uniform(pymin, pymax))
+    spawn = np.array([spawn_x, spawn_y], dtype=float)
+
+    half_deg = 90.0 * j
+    theta_lo = 90.0 - half_deg
+    theta_hi = 90.0 + half_deg
+
+    def _pack(theta_deg: float) -> dict:
+        heading = _heading_from_edge_deg(theta_deg)
+        vel_xy = heading * float(speed)
+        depth = 0.35 if j <= 0.0 else float(rng.uniform(0.25, 0.50))
+        target = spawn + heading * depth
+        target[0] = float(np.clip(target[0], pxmin, pxmax))
+        target[1] = float(np.clip(target[1], pymin, pymax))
+        if j <= 0.0:
+            side = "front"
+        else:
+            side = "angle_left" if theta_deg < 90.0 else "angle_right"
+        return {
+            "spawn": spawn,
+            "vel_xy": vel_xy,
+            "target": target,
+            "reach_dir": np.array([1.0, 0.0], dtype=float),
+            "side": side,
+            "throw_angle_deg": float(theta_deg),
+        }
+
+    if j <= 0.0:
+        return _pack(90.0)
+
+    # Rejection sample: keep diversity, drop headings that leave the band
+    # before the catch zone (those were the off-table smoke fails).
+    for _ in range(48):
+        theta_deg = float(rng.uniform(theta_lo, theta_hi))
+        heading = _heading_from_edge_deg(theta_deg)
+        if _coast_reaches_catch(
+            spawn,
+            heading,
+            speed,
+            xmin=xmin,
+            xmax=xmax,
+            ymin=ymin,
+            ymax=ymax,
+            until_x=until_x,
+        ):
+            return _pack(theta_deg)
+
+    # Fallback: straight at the robot (always catchable from the far rim).
+    return _pack(90.0)
+
+
+# Old name kept so call sites / tests that still import it keep working.
+_throw_edge_toward_robot = _throw_toward_robot
+
+
 def _sample_throw_full(
     rng: np.random.Generator,
     object_xy_bounds,
@@ -439,33 +667,19 @@ def _sample_throw_full(
     catch_band: tuple[float, float] = (0.38, 0.55),
     lateral: float = 0.18,
     container_xy=None,
+    throw_randomness: float = 1.0,
 ) -> dict:
-    """Core throw math. Returns spawn/vel plus the catch target it aims at.
+    """Core throw math: far +X edge, 180° fan toward the robot.
 
-    Aim a catch point in front of the robot (reachable band), then spawn from a
-    side or the far edge so the straight path crosses that point.
-
-    When ``container_xy`` (the bowl) is set, the catch sits on the way toward
-    the bowl and spawns come from the opposite side / diagonals — so a miss
-    heads at the bowl (fail-fast pass-through) instead of random table edges.
+    ``throw_randomness`` r ∈ [0, 1] = fan width around the 90° center line:
+      0 → straight at robot; 1 → uniform over the full 180° half-circle.
+    ``container_xy`` is ignored (kept for call-site compatibility).
     """
-    (xmin, xmax), (ymin, ymax) = object_xy_bounds
-
-    # Padded bounds: inset from the walls so objects don't spawn on an edge.
-    pxmin, pxmax = xmin + spawn_pad, xmax - spawn_pad
-    pymin, pymax = ymin + spawn_pad, ymax - spawn_pad
-    if pxmin > pxmax:
-        pxmin = pxmax = 0.5 * (xmin + xmax)
-    if pymin > pymax:
-        pymin = pymax = 0.5 * (ymin + ymax)
-
+    del container_xy  # throws must not aim at the bowl
+    (pxmin, pxmax), (pymin, pymax), _ = _padded_play(object_xy_bounds, spawn_pad)
     U = lambda a, b: float(rng.uniform(a, b))
+    r = float(np.clip(throw_randomness, 0.0, 1.0))
 
-    cx = 0.5 * (xmin + xmax)
-    cy = 0.5 * (ymin + ymax)
-    center = np.array([cx, cy], dtype=float)
-
-    # Still object: random spawn, no velocity, no aim.
     if speed <= 1e-6:
         spawn = np.array([U(pxmin, pxmax), U(pymin, pymax)])
         return {
@@ -474,108 +688,18 @@ def _sample_throw_full(
             "target": spawn.copy(),
             "reach_dir": np.array([1.0, 0.0]),
             "side": "still",
+            "throw_angle_deg": 90.0,
         }
 
-    bowl = None if container_xy is None else np.asarray(container_xy, dtype=float).reshape(2)
-
-    if bowl is not None:
-        # Straight / diagonal throws toward the bowl, catch still inside play.
-        toward = bowl - center
-        tn = float(np.linalg.norm(toward))
-        if tn < 1e-6:
-            toward = np.array([0.0, 1.0 if bowl[1] >= 0.0 else -1.0], dtype=float)
-            tn = 1.0
-        toward = toward / tn
-        # Across-table axis (left/right relative to bowl direction).
-        across = np.array([-toward[1], toward[0]], dtype=float)
-
-        # Catch: in the play rect, biased onto the bowl-ward half (+ small jitter).
-        # Keep it reachable in X (catch_band) when the bowl is mostly off to +Y/-Y.
-        along_x = U(*catch_band)
-        # Blend robot-forward catch with a step toward the bowl (not into the pocket).
-        bowl_pull = U(0.35, 0.75)  # how far from centre toward the bowl edge of play
-        # Play half-extent along `toward` from centre.
-        # Clamp catch into padded play bounds below.
-        target = center + toward * (bowl_pull * min(abs(ymax - cy), abs(cy - ymin), 0.12))
-        target[0] = float(np.clip(along_x + U(-0.04, 0.04), pxmin, pxmax))
-        target[1] = float(np.clip(target[1] + U(-0.03, 0.03), pymin, pymax))
-
-        # Spawn: far side, left diagonal, or right diagonal — path aims at bowl.
-        side = str(rng.choice(["far", "diag_left", "diag_right", "side_left", "side_right"]))
-        if side == "far":
-            # Opposite the bowl, still in play.
-            spawn = target - toward * U(0.18, 0.40) + across * U(-0.06, 0.06)
-        elif side.startswith("diag"):
-            s = 1.0 if side.endswith("left") else -1.0
-            spawn = target - toward * U(0.10, 0.30) + s * across * U(0.12, 0.28)
-        else:
-            s = 1.0 if side.endswith("left") else -1.0
-            spawn = target + s * across * U(0.16, 0.32) - toward * U(0.0, 0.12)
-
-        reach_dir = toward.copy()
-    else:
-        # Legacy: catch band in front of the robot (no bowl hint).
-        cnorm = float(np.linalg.norm(center))
-        if cx > 0 and cnorm > 1e-6:
-            reach_dir = center / cnorm
-        else:
-            reach_dir = np.array([1.0, 0.0], dtype=float)
-        perp = np.array([-reach_dir[1], reach_dir[0]], dtype=float)
-        target = reach_dir * U(*catch_band) + perp * U(-lateral, lateral)
-
-        side = str(rng.choice(["left", "right", "front"]))
-        if side == "front":
-            spawn = target + reach_dir * U(0.25, 0.45)
-        else:
-            s = 1.0 if side == "left" else -1.0
-            spawn = target + s * perp * U(0.30, 0.50) + reach_dir * U(0.0, 0.25)
-
-    spawn = np.asarray(spawn, dtype=float).copy()
-    spawn[0] = float(np.clip(spawn[0], pxmin, pxmax))
-    spawn[1] = float(np.clip(spawn[1], pymin, pymax))
-    target = np.asarray(target, dtype=float).copy()
-    target[0] = float(np.clip(target[0], pxmin, pxmax))
-    target[1] = float(np.clip(target[1], pymin, pymax))
-
-    # If spawn landed on the catch point, push it away from the bowl / +X.
-    d = target - spawn
-    n = float(np.linalg.norm(d))
-    if n < 1e-3:
-        push = -reach_dir if bowl is None else -(bowl - center)
-        pn = float(np.linalg.norm(push[:2]))
-        push = (push[:2] / pn) if pn > 1e-6 else np.array([-1.0, 0.0])
-        spawn = np.clip(target + push * 0.15, [pxmin, pymin], [pxmax, pymax])
-        d = target - spawn
-        n = float(np.linalg.norm(d))
-        if n < 1e-6:
-            d = np.array([1.0, 0.0])
-            n = 1.0
-    vel_xy = d / n * speed
-
-    # With a bowl: prefer paths where the catch sits between spawn and bowl.
-    if bowl is not None:
-        to_bowl = bowl - spawn
-        if float(np.dot(to_bowl, d)) < 0.0:
-            # Flip catch past spawn toward the bowl.
-            target = spawn + to_bowl / max(float(np.linalg.norm(to_bowl)), 1e-6) * min(
-                0.20, 0.5 * float(np.linalg.norm(to_bowl))
-            )
-            target[0] = float(np.clip(target[0], pxmin, pxmax))
-            target[1] = float(np.clip(target[1], pymin, pymax))
-            d = target - spawn
-            n = float(np.linalg.norm(d))
-            if n < 1e-6:
-                d = to_bowl
-                n = float(np.linalg.norm(d)) or 1.0
-            vel_xy = d / n * speed
-
-    return {
-        "spawn": spawn,
-        "vel_xy": vel_xy,
-        "target": target,
-        "reach_dir": reach_dir,
-        "side": side,
-    }
+    return _throw_toward_robot(
+        rng,
+        object_xy_bounds,
+        speed=speed,
+        spawn_pad=spawn_pad,
+        catch_band=catch_band,
+        lateral=lateral,
+        jitter=r,
+    )
 
 
 def sample_throw(
@@ -587,12 +711,13 @@ def sample_throw(
     catch_band: tuple[float, float] = (0.38, 0.55),
     lateral: float = 0.18,
     container_xy=None,
+    throw_randomness: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pick a spawn point and a velocity for a thrown object.
 
-    Returns (pos (3,) with z=0, lin_vel (3,) with z=0). The caller adds
-    table_z + half object height to z. Pass ``container_xy`` so throws aim
-    toward the bowl (straight / diagonal / side). See `_sample_throw_full`.
+    Returns (pos (3,) with z=0, lin_vel (3,) with z=0). Spawns on the far
+    (+X) edge. ``throw_randomness`` sets the 180° fan width: 0 = 90° straight
+    at the robot, 1 = full half-circle randomness.
     """
     out = _sample_throw_full(
         rng,
@@ -602,6 +727,7 @@ def sample_throw(
         catch_band=catch_band,
         lateral=lateral,
         container_xy=container_xy,
+        throw_randomness=throw_randomness,
     )
     s = out["spawn"]
     v = out["vel_xy"]
@@ -643,7 +769,7 @@ def look_at_quat_wxyz(from_pos, to_pos=(0.0, 0.0, 0.0)) -> list[float]:
 
 def sample_light(
     rng: np.random.Generator,
-    camera_pos=(1.0, 0.0, 0.60),
+    camera_pos=(1.2, 0.0, 0.80),
     *,
     lighting: dict | None = None,
 ) -> dict:

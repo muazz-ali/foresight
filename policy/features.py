@@ -1,18 +1,16 @@
-"""Frozen LeRobot feature schema for Foresight Phase 1.
+"""Frozen LeRobot feature schema for Foresight 
 
 This file is the one place that says what the numbers mean.
 Convert, train, and infer must all read the same layout from here.
 If they disagree, the model reads the wrong slots and fails with no error.
 
-What the policy sees as "state" (12 numbers):
+What the policy sees as "state" (13 numbers today):
   * 8 robot numbers: hand XYZ (3), hand rotation (4), gripper (1).
-  * 4 "future object" numbers: where the object will be (XY position),
-    and how fast it moves (XY velocity).
-The 4 numbers come from `interfaces.state` (CONDITIONING_LAYOUT).
+  * 5 "future object" numbers: p̂x, p̂y, p̂z, vx, vy
+    (p̂z = grasp height; height changes p̂, not relative d_z).
+Numbers come from `interfaces.state` (CONDITIONING_LAYOUT).
 
-Delta (the look-ahead time) is NOT in the pack while it is a fixed value.
-Only when the real delay can change, add it as a 5th number. Then train
-and eval must both pack it.
+Delta (look-ahead) is baked into p̂ XY and is NOT packed separately.
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ from interfaces.state import CONDITIONING_DIM, CONDITIONING_LAYOUT
 PROPRIO_DIM = 8  # ee_pos(3) + ee_quat_wxyz(4) + gripper(1)
 ORACLE_DIM = 14  # perfect sim object state saved per frame (see ORACLE_NAMES)
 ACTION_DIM = 8   # same layout as PROPRIO: target hand pose + gripper
-STATE_DIM = PROPRIO_DIM + CONDITIONING_DIM  # 12 (8 proprio + 4 live cond)
+STATE_DIM = PROPRIO_DIM + CONDITIONING_DIM  # 13 (8 proprio + 5 live cond)
 
 # Names are only labels for humans and LeRobot meta. Order must match the data.
 PROPRIO_NAMES = [
@@ -107,8 +105,113 @@ def make_features(*, include_aux: bool = True) -> dict:
     return features
 
 
-def default_language(object_category: str | None, container_category: str | None) -> str:
-    # Fallback task text when the episode JSON has no "language" field.
-    obj = object_category or "object"
-    ctr = container_category or "container"
-    return f"Pick the {obj} and place it in the {ctr}."
+_INSTR_CACHE: dict | None = None
+
+
+def _load_instructions() -> dict:
+    """Load ``policy/configs/instructions.yaml`` once (templates per fruit)."""
+    global _INSTR_CACHE
+    if _INSTR_CACHE is not None:
+        return _INSTR_CACHE
+    from pathlib import Path
+
+    import yaml
+
+    path = Path(__file__).resolve().parent / "configs" / "instructions.yaml"
+    if not path.is_file():
+        _INSTR_CACHE = {}
+        return _INSTR_CACHE
+    with path.open() as f:
+        _INSTR_CACHE = yaml.safe_load(f) or {}
+    return _INSTR_CACHE
+
+
+# Longer names first so "tangerine" is not read as "orange".
+_OBJECT_KEYS = (
+    "tangerine",
+    "avocado",
+    "orange",
+    "apple",
+    "peach",
+    "lemon",
+    "onion",
+    "kiwi",
+    "lime",
+    "egg",
+    "can",
+)
+_CONTAINER_KEYS = ("basket", "bowl", "box")
+
+
+def _stem(name: str | None, fallback: str) -> str:
+    """Letters only, so ``apple12`` becomes ``apple``."""
+    raw = (name or fallback).strip().lower()
+    return "".join(ch for ch in raw if ch.isalpha()) or fallback
+
+
+def object_key(name: str | None) -> str:
+    """Map a category or a full sentence onto a template key."""
+    key = _stem(name, "object")
+    low = (name or "").lower()
+    for name_i in _OBJECT_KEYS:
+        if key == name_i or key.startswith(name_i) or name_i in low:
+            return name_i
+    return key
+
+
+def container_word(name: str | None) -> str:
+    """Bowl / box / basket word used inside a task sentence."""
+    data = _load_instructions()
+    containers = (data.get("containers") or {}) if isinstance(data, dict) else {}
+    key = _stem(name, "bowl")
+    low = (name or "").lower()
+    for name_i in _CONTAINER_KEYS:
+        if key == name_i or name_i in low:
+            key = name_i
+            break
+    return str(containers.get(key, containers.get("default", "bowl")))
+
+
+def _format_task(obj_key: str, ctr_word: str, *, seed: int | None) -> str:
+    """One random wording for this object + container. Noun stays in the sentence."""
+    data = _load_instructions()
+    templates = (data.get("templates") or {}) if isinstance(data, dict) else {}
+    lines = templates.get(obj_key) or templates.get("default") or []
+    if not lines:
+        return f"Pick the {obj_key} and place it in the {ctr_word}."
+    rng = __import__("random").Random(
+        None if seed is None else int(seed)
+    )
+    line = str(rng.choice(list(lines)))
+    return line.format(object=obj_key, container=ctr_word)
+
+
+def default_language(
+    object_category: str | None,
+    container_category: str | None,
+    *,
+    seed: int | None = None,
+) -> str:
+    """Pick a task string that names the object (apple ≠ tangerine) and container.
+
+    Templates live in ``policy/configs/instructions.yaml``. Same object gets
+    many wordings so the model cannot memorize one sentence. No seed → a
+    stable pick (eval). Train redraws wording via ``paraphrase_task``.
+    """
+    obj = object_key(object_category)
+    if seed is None:
+        seed = hash(obj) & 0xFFFF
+    return _format_task(obj, container_word(container_category), seed=seed)
+
+
+def paraphrase_task(task: str, *, seed: int | None = None) -> str:
+    """Replace a saved task sentence with another wording of the same ask.
+
+    Train calls this each batch. The object noun and the container stay, so
+    the model has to read the words and match them to the picture — not one
+    frozen phrase from the demo file.
+    """
+    text = str(task).strip()
+    if not text:
+        return text
+    return _format_task(object_key(text), container_word(text), seed=seed)

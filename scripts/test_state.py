@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from interfaces.state import conditioning_vector, oracle_from_gt, pack_conditioning
+from interfaces.state import conditioning_vector, oracle_from_gt
 from interfaces.state import CONDITIONING_DIM, CONDITIONING_LAYOUT
 from sim.motion import kinematic_forecast
 
@@ -27,11 +27,10 @@ def test_flat_roundtrip_len():
     assert st.to_flat().shape == (14,)
 
 
-def test_kinematic_forecast_matches_cv_away_from_wall():
+def test_kinematic_forecast_matches_cv():
     pos = np.array([0.5, 0.0, 0.05])
     vel = np.array([0.2, 0.0, 0.0])
-    bounds = ((0.30, 0.70), (-0.30, 0.30))
-    fp, fv = kinematic_forecast(pos, vel, 0.25, 0.04, xy_bounds=bounds)
+    fp, fv = kinematic_forecast(pos, vel, 0.25, 0.04)
     np.testing.assert_allclose(fp, pos + vel * 0.25, atol=1e-9)
     np.testing.assert_allclose(fv, vel, atol=1e-9)
 
@@ -100,33 +99,6 @@ def test_write_episode_h5_is_4d_not_12():
             raise AssertionError("expected 12-D conditioning to fail")
 
 
-def test_kinematic_forecast_bounces_unlike_cv():
-    # Sim motion bounces; policy pack must stay CV (can leave the table in numbers).
-    pos = np.array([0.68, 0.0, 0.05])
-    vel = np.array([0.4, 0.0, 0.0])
-    bounds = ((0.30, 0.70), (-0.30, 0.30))
-    fp, fv = kinematic_forecast(pos, vel, 0.25, 0.04, xy_bounds=bounds)
-    cv = pos + vel * 0.25
-    assert fp[0] <= 0.70 + 1e-9
-    assert abs(fp[0] - cv[0]) > 1e-3
-    assert fv[0] < 0.0  # bounced in the world model
-    st = oracle_from_gt(pos, vel, timestamp=0.0)
-    vec = conditioning_vector(st, delta=0.25)
-    np.testing.assert_allclose(vec[:2], cv[:2])
-    np.testing.assert_allclose(vec[2:4], vel[:2])
-    bounce_pack = pack_conditioning(oracle_from_gt(fp, fv, timestamp=0.25), 0.25)
-    assert abs(float(bounce_pack[0] - vec[0])) > 1e-3
-
-
-def test_kinematic_forecast_no_bounce_without_bounds():
-    # House / throw: xy_bounds=None → straight line, can leave the band.
-    pos = np.array([0.68, 0.0, 0.05])
-    vel = np.array([0.4, 0.0, 0.0])
-    fp, fv = kinematic_forecast(pos, vel, 0.25, 0.04, xy_bounds=None)
-    np.testing.assert_allclose(fp, pos + vel * 0.25, atol=1e-9)
-    np.testing.assert_allclose(fv, vel, atol=1e-9)
-
-
 def test_sm_stage_order_and_success_latch():
     from sim.state_machine import (
         STAGE_APPROACH,
@@ -160,9 +132,7 @@ def test_sm_stage_order_and_success_latch():
 if __name__ == "__main__":
     test_oracle_predict_and_condition()
     test_flat_roundtrip_len()
-    test_kinematic_forecast_matches_cv_away_from_wall()
-    test_kinematic_forecast_bounces_unlike_cv()
-    test_kinematic_forecast_no_bounce_without_bounds()
+    test_kinematic_forecast_matches_cv()
     test_episode_for_json_is_light()
     test_write_episode_h5_is_4d_not_12()
     test_sm_stage_order_and_success_latch()

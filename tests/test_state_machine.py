@@ -4,9 +4,10 @@ Run from the repo root:  pytest tests/test_state_machine.py -v
 
 The speed tests use ``FakeArm``, a first-order surrogate for the IK + joint-PD
 chain (``ee += (cmd - ee) * dt / tau`` with a TCP speed cap) plus the scene's
-own ``kinematic_advance`` for the object. It is not the real sim, but it has
-tracking lag and wall bounces — so a change that cannot pass here will not
-pass on GPU either. Treat it as the cheap pre-filter, never as gate evidence.
+own ``kinematic_advance`` for the object (straight coast, no bounce). It is
+not the real sim, but it has tracking lag — so a change that cannot pass here
+will not pass on GPU either. Treat it as the cheap pre-filter, never as gate
+evidence.
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import yaml
 
 from interfaces.state import oracle_from_gt
 from sim.motion import kinematic_advance
@@ -47,18 +47,8 @@ def load_cfg() -> dict:
 
 @pytest.fixture
 def cfg() -> dict:
-    """Floor / bounce-box config (use_house false): the legacy bounce tests run on this."""
-    c = load_cfg()
-    c["scene"]["use_house"] = False
-    return c
-
-
-@pytest.fixture
-def throw_cfg() -> dict:
-    """House / throw config straight from the yaml (use_house true): no bounce."""
-    c = load_cfg()
-    assert c["scene"]["use_house"] is True
-    return c
+    """Shipped yaml (house throw + GT weld grasp)."""
+    return load_cfg()
 
 
 @pytest.fixture
@@ -90,47 +80,161 @@ def test_lead_collapses_to_tau_when_on_top(sm):
 
 
 def test_lead_is_capped_at_lookahead_when_far(sm):
-    """Far away → the plan's 0.25 s look-ahead cap binds (plus tau)."""
-    obj = np.array([0.70, 0.08, 0.03])
-    ee = np.array([0.45, 0.0, 0.40])
+    """Far away → the yaml look-ahead cap binds (plus tau).
+
+    Hand at 2.5 m/s needs >1.0 m of travel before the 400 ms cap binds.
+    """
+    obj = np.array([1.20, 0.50, 0.03])
+    ee = np.array([0.20, 0.0, 0.55])
+    assert sm.lookahead_s == pytest.approx(0.40, abs=1e-9)
     for speed in (0.20, 0.40, 0.80):
         lead = sm._intercept_lead_s(ee, obj, np.array([0.0, speed, 0.0]))
         assert lead == pytest.approx(sm.lookahead_s + sm.tau, abs=1e-6)
 
 
 def test_approach_aims_ahead_of_a_moving_object(sm):
-    """APPROACH command leads the object; the gate still reads the object now."""
+    """APPROACH command leads the object; Z aims at z_grasp (p̂z), not centre."""
     sm.stage = STAGE_APPROACH
     obj = np.array([0.55, 0.08, 0.03])
-    vel = np.array([0.0, -0.40, 0.0])  # away from the near wall, so no bounce
+    vel = np.array([0.0, -0.40, 0.0])
     cmd = sm.step(_state(obj, vel), np.array([0.45, 0.0, 0.40]), sm._down_quat)
     assert cmd.position[1] < obj[1] - 0.05, "command must lead a 40 cm/s object"
-    assert cmd.position[2] == pytest.approx(obj[2])
+    assert sm.z_grasp is not None
+    assert cmd.position[2] == pytest.approx(sm.z_grasp)
 
 
-def test_forecast_bounces_off_the_play_band(sm):
-    """0.25 s at 80 cm/s is 20 cm — longer than the band, so it must bounce.
+def test_z_grasp_is_object_centre(sm):
+    """Expert close height is object centre (height/2), never a depth latch."""
+    sm.set_object_half_height(0.036, z_table=0.0)
+    obj = np.array([0.55, 0.0, 0.036])
+    # Even with a high hand, p̂z must stay on the fruit centre (smoke bug was ~18 cm).
+    zg = sm._update_z_grasp(np.array([0.55, 0.0, 0.40]), obj)
+    assert zg == pytest.approx(0.036, abs=1e-6)
+    assert sm.close_at_object_center is True
 
-    A straight-line predict aims outside the table and the hand chases a point
-    the object can never reach.
+
+def test_close_gate_requires_hand_at_object_centre(sm):
+    """Fingers only shut when EE Z is near object centre — not 14 cm above."""
+    sm.stage = STAGE_APPROACH
+    obj = np.array([0.55, 0.0, 0.036])
+    vel = np.array([0.0, 0.0, 0.0])
+    # Mid-air (old bug height): must NOT enter CLOSE.
+    high = np.array([obj[0], obj[1], 0.177])
+    cmd_hi = sm.step(_state(obj, vel), high, sm._down_quat)
+    assert cmd_hi.stage == STAGE_APPROACH
+    # At centre: CLOSE.
+    at = np.array([obj[0], obj[1], obj[2]])
+    cmd = sm.step(_state(obj, vel), at, sm._down_quat)
+    assert cmd.stage == STAGE_CLOSE
+
+
+def test_z_gate_honors_yaml_not_z_slack_half(sm):
+    """Close Z tol is grasp_xyz_ok[2] (20 mm), not claim z_slack/2 (2.5 mm).
+
+    Why: a 30 cm/s smoke near-hit (8.8 mm above centre) never closed when the
+    gate was clamped to 2.5 mm, then the object hit the pedestal.
     """
-    (xmin, xmax), _ = sm.xy_bounds
-    obj = np.array([xmax - 0.05, 0.0, 0.03])
+    sm.stage = STAGE_APPROACH
+    obj = np.array([0.55, 0.0, 0.036])
+    vel = np.zeros(3)
+    zg = sm._update_z_grasp(obj.copy(), obj)
+    assert sm.grasp_xyz_ok[2] == pytest.approx(0.020, abs=1e-9)
+    # 8 mm above centre: inside yaml box → CLOSE.
+    near = np.array([obj[0], obj[1], zg + 0.008])
+    assert sm.step(_state(obj, vel), near, sm._down_quat).stage == STAGE_CLOSE
+    # 21 mm above: outside yaml box → stay intercept.
+    sm.stage = STAGE_APPROACH
+    sm.timer_s = 0.0
+    far = np.array([obj[0], obj[1], zg + 0.021])
+    assert sm.step(_state(obj, vel), far, sm._down_quat).stage == STAGE_APPROACH
+
+
+def test_close_rides_object_xy(sm):
+    """During CLOSE the hand tracks the moving object (tau lead), not a freeze."""
+    sm.stage = STAGE_CLOSE
+    sm.z_grasp = 0.036
+    sm.timer_s = 0.0
+    sm.set_aim_xy_bounds([[0.40, 0.90], [-0.20, 0.20]])
+    obj = np.array([0.55, 0.0, 0.036])
+    vel = np.array([0.50, 0.0, 0.0])
+    ee = obj.copy()
+    cmd = sm.step(_state(obj, vel), ee, sm._down_quat)
+    assert cmd.stage == STAGE_CLOSE
+    assert cmd.gripper_open == 0.0
+    # Physics: coast until fingers shut; free only after finger_close_s.
+    assert sm.physics_grasp
+    assert not cmd.attach_object and cmd.kinematic_object
+    # Aim ahead of the object by ~tau * speed (lag pad), not stuck at ee XY.
+    assert cmd.position[0] > obj[0] + 0.05
+    assert cmd.position[2] == pytest.approx(0.036, abs=1e-6)
+    # After finger travel, free to PhysX (attach).
+    sm.stage = STAGE_CLOSE
+    sm.timer_s = sm.finger_close_s + 1e-6
+    cmd2 = sm.step(_state(obj, vel), ee, sm._down_quat)
+    assert cmd2.attach_object and not cmd2.kinematic_object
+
+
+def test_intercept_aim_clips_to_table(sm):
+    """Long lead must not command the hand past the table (ee-off-table)."""
+    sm.stage = STAGE_APPROACH
+    sm.set_aim_xy_bounds([[0.20, 0.80], [-0.25, 0.25]])
+    obj = np.array([0.55, 0.0, 0.03])
+    vel = np.array([0.0, 0.80, 0.0])  # 80 cm/s toward +Y
+    ee = np.array([0.45, 0.0, 0.40])
+    cmd = sm.step(_state(obj, vel), ee, sm._down_quat)
+    assert cmd.position[1] <= 0.25 + 1e-9
+    assert cmd.position[0] >= 0.20 - 1e-9
+    assert cmd.position[0] <= 0.80 + 1e-9
+
+
+def test_far_rim_spawn_still_chased(sm):
+    """Object just past aim inset but inside escape box → keep chasing.
+
+    Smoke lemon seed-50194 sat on the far rim past the 2 cm aim inset and the
+    old escape check sent the expert home on frame 1.
+    """
+    sm.stage = STAGE_APPROACH
+    sm.set_aim_xy_bounds([[0.12, 0.76], [-0.23, 0.23]])  # inset
+    sm.set_escape_xy_bounds([[0.12, 0.80], [-0.25, 0.25]])  # full table
+    obj = np.array([0.782, 0.072, 0.034])  # past aim xmax, inside escape
+    vel = np.array([-0.15, -0.05, 0.0])
+    ee = np.array([0.45, 0.0, 0.40])
+    cmd = sm.step(_state(obj, vel), ee, sm._down_quat)
+    assert cmd.stage == STAGE_APPROACH
+    assert not sm._object_left_catch_box(obj)
+
+
+def test_past_keepout_stops_chase(sm):
+    """Object past the near-base escape edge → go home (no ee-off-table chase)."""
+    sm.stage = STAGE_APPROACH
+    sm.set_aim_xy_bounds([[0.12, 0.76], [-0.23, 0.23]])
+    sm.set_escape_xy_bounds([[0.12, 0.80], [-0.25, 0.25]])
+    obj = np.array([0.10, -0.14, 0.03])  # x < escape xmin keepout
+    vel = np.array([-0.20, 0.0, 0.0])
+    ee = np.array([0.45, 0.0, 0.40])
+    cmd = sm.step(_state(obj, vel), ee, sm._down_quat)
+    assert cmd.stage == STAGE_HOME
+
+
+def test_forecast_coasts_straight(sm):
+    """Forecast is constant-velocity coast — can leave the play band."""
+    obj = np.array([0.65, 0.0, 0.03])
     vel = np.array([0.80, 0.0, 0.0])
     pred = sm._forecast(obj, vel, 0.25)
-    assert pred[0] <= xmax + 1e-9, "prediction left the play band"
-    assert pred[0] < (obj + vel * 0.25)[0], "prediction did not bounce"
+    np.testing.assert_allclose(pred, obj + vel * 0.25, atol=1e-9)
 
 
 # ------------------------------------------------------------------- gating
 
 
 def test_chase_gate_is_measured_against_the_object_not_the_aim(sm):
-    """Hand sitting exactly on a fast object closes, even though the aim leads."""
+    """Hand on object XY at z_grasp closes, even though the aim leads."""
     sm.stage = STAGE_APPROACH
     obj = np.array([0.55, 0.0, 0.03])
     vel = np.array([0.80, 0.0, 0.0])
-    cmd = sm.step(_state(obj, vel), obj.copy(), sm._down_quat)
+    zg = sm._update_z_grasp(obj.copy(), obj)
+    ee = np.array([obj[0], obj[1], zg])
+    cmd = sm.step(_state(obj, vel), ee, sm._down_quat)
     assert cmd.stage == STAGE_CLOSE
     assert sm.grasp_err_xy is not None and sm.grasp_err_xy < 1e-6
 
@@ -146,35 +250,6 @@ def test_grasp_xyz_ok_is_a_box(sm):
     assert not sm._grasp_gate_ok(just_out_z, obj)[0]
 
 
-def test_grasp_window_is_only_the_residual_z(sm):
-    """After attach the object is welded to the hand, so walls stop mattering.
-
-    Only the leftover Z has to fit in a straight run — not a long hover drop.
-    """
-    obj = np.array([0.55, 0.0, 0.03])
-    on_top = np.array([0.55, 0.0, 0.03 + sm.grasp_z_tol])
-    high = np.array([0.55, 0.0, 0.03 + 0.08])
-    assert sm._grasp_window_s(on_top, obj) == pytest.approx(sm.bounce_guard_s)
-    assert sm._grasp_window_s(high, obj) > sm._grasp_window_s(on_top, obj)
-    assert sm._grasp_window_s() == pytest.approx(sm.bounce_guard_s)
-
-
-def test_bounce_guard_blocks_a_close_into_a_wall(sm):
-    """Do not commit when the object reverses inside the grasp window."""
-    (_, _), (ymin, ymax) = sm.xy_bounds
-    obj = np.array([0.55, ymax - 0.01, 0.03])
-    on_top = np.array([obj[0], obj[1], obj[2] + sm.grasp_z_tol])
-    high = np.array([obj[0], obj[1], obj[2] + 0.08])
-    toward = np.array([0.0, 0.80, 0.0])  # reverses in 12 ms
-    away = np.array([0.0, -0.80, 0.0])  # whole band ahead of it
-
-    assert not sm._bounce_clear(obj, toward, on_top)
-    assert sm._bounce_clear(obj, away, on_top)
-    assert sm._time_to_wall_s(obj, away) > sm._grasp_window_s(on_top, obj)
-    assert sm._grasp_window_s(high, obj) > sm._grasp_window_s(on_top, obj)
-    assert sm._bounce_clear(obj, np.zeros(3), high), "a still object is always clear"
-
-
 def test_place_tol_is_not_the_servo_tol(sm):
     assert sm.place_xy_tol > sm.servo_xy_tol
     assert sm._in_container(np.array([0.50 + sm.place_xy_tol - 0.005, 0.30, 0.05]))
@@ -182,7 +257,7 @@ def test_place_tol_is_not_the_servo_tol(sm):
 
 
 def test_arrived_z_tol_is_looser_than_grasp_z(sm):
-    """Carry / lower arrival (~30 mm) must not reuse the grasp close Z (~15 mm)."""
+    """Carry / lower arrival (~30 mm) must not reuse the grasp close Z (~20 mm)."""
     assert sm.place_z_tol == pytest.approx(0.03, abs=1e-9)
     assert sm.place_z_tol > sm.grasp_z_tol
 
@@ -294,20 +369,15 @@ def run_fake_episode(
     sm.set_box_poses(CARRY, drop_pos=DROP)
 
     rng = np.random.default_rng(seed)
-    if sm.throw_mode:
-        # Aimed throw, same sampler as the scene. No walls: sm.xy_bounds is None.
-        from sim.house_layout import sample_throw
+    # Aimed throw, same sampler as the scene (straight coast, no walls).
+    from sim.house_layout import sample_throw
 
-        b = cfg["scene"]["object_xy_bounds"]
-        p0, vel = sample_throw(rng, ((b[0][0], b[0][1]), (b[1][0], b[1][1])), speed=speed)
-        obj = np.array([p0[0], p0[1], 0.03])
-    else:
-        (xmin, xmax), (ymin, ymax) = sm.xy_bounds
-        obj = np.array(
-            [rng.uniform(xmin + 0.03, xmax - 0.03), rng.uniform(ymin + 0.03, ymax - 0.03), 0.03]
-        )
-        th = rng.uniform(0.0, 2.0 * np.pi)
-        vel = np.array([speed * np.cos(th), speed * np.sin(th), 0.0])
+    b = cfg["scene"]["object_xy_bounds"]
+    # FakeArm has no table abort; leave aim bounds unset so lead can meet the throw.
+    p0, vel = sample_throw(
+        rng, ((b[0][0], b[0][1]), (b[1][0], b[1][1])), speed=speed
+    )
+    obj = np.array([p0[0], p0[1], 0.03])
 
     arm = FakeArm(
         cfg["robot"]["init_pose"][:3],
@@ -326,7 +396,7 @@ def run_fake_episode(
         elif cmd.freeze_object:
             pass
         elif cmd.kinematic_object:
-            obj, vel = kinematic_advance(obj, vel, dt, xy_bounds=sm.xy_bounds)
+            obj, vel = kinematic_advance(obj, vel, dt)
             obj[2] = 0.03
         max_stage = max(max_stage, cmd.stage)
         z_max = max(z_max, float(obj[2]))
@@ -338,16 +408,14 @@ def run_fake_episode(
         "done": max_stage >= STAGE_DONE,
         "grasp_err_xy": sm.grasp_err_xy,
         "retries": sm.retries,
-        "grasp_window_s": sm._grasp_window_s(),
     }
 
 
-@pytest.mark.parametrize("speed", [0.0, 0.20, 0.40])
+@pytest.mark.parametrize("speed", [0.0, 0.20, 0.40, 0.50, 1.00])
 def test_closed_loop_completes_at_speed(cfg, speed):
-    """0 / 20 / 40 cm/s must finish from every seed with the shipped knobs.
+    """0 / 20 / 40 / 50 / 100 cm/s must finish from every seed with shipped knobs.
 
-    80 cm/s is covered by ``test_80cms_is_bounded_by_the_arm_not_the_logic``:
-    it needs a faster arm, not different expert logic.
+    Hand speed 2.5 m/s + 400 ms aim cap are sized so FakeArm finishes 1 m/s.
     """
     runs = [run_fake_episode(cfg, speed, seed=s) for s in range(10)]
     done = sum(r["done"] for r in runs)
@@ -368,39 +436,12 @@ def test_grasp_error_stays_honest_at_speed(cfg):
             assert r["grasp_err_xy"] <= 0.03, (speed, seed, r)
 
 
-def test_80cms_is_bounded_by_the_arm_not_the_logic(cfg):
-    """At 80 cm/s the binding constraint is arm bandwidth, not the state machine.
-
-    The object reverses off a wall roughly every 0.34 s in the stock 24 x 30 cm
-    band. An arm with a 0.16 s tracking lag needs ~3 tau (0.5 s) to re-converge
-    after each reversal, so it never holds a lock long enough to commit — and no
-    tolerance, look-ahead or gate change fixes that. Cutting the lag does.
-
-    Surrogate sweep (done/10 at 80 cm/s):
-
-        lag / TCP cap   stock band   wide band
-        0.16 / 0.9        0/10         0/10
-        0.12 / 1.3        6/10        10/10
-        0.08 / 0.9        9/10        10/10
-
-    So: get measured lag <= 0.08 s, or <= 0.12 s with a >= 1.3 m/s TCP cap and
-    the wider play band. This test pins both ends so a future change cannot
-    quietly claim 80 cm/s without moving one of those numbers.
-    """
-    stock = [run_fake_episode(cfg, 0.80, seed=s) for s in range(10)]
-    assert sum(r["done"] for r in stock) == 0, "stock arm should not reach 80 cm/s"
-    assert all(r["max_stage"] <= STAGE_APPROACH for r in stock), "expected an intercept stall"
-
-    fast = yaml.safe_load(yaml.safe_dump(cfg))  # deep copy
-    fast["state_machine_params"]["robot_approach_pad_s"] = 0.08
-    # Pin the gate this claim was measured with.
-    fast["state_machine_params"]["grasp_xyz_ok"] = [0.02, 0.02, 0.02]
-    tuned = [
-        run_fake_episode(fast, 0.80, seed=s, tau_true=0.08, speed_max_true=0.90)
-        for s in range(10)
-    ]
-    assert sum(r["done"] for r in tuned) >= 8, [r["max_stage"] for r in tuned]
-    for r in tuned:
+def test_80cms_throw_completes_with_stock_arm(cfg):
+    """Straight-coast throws (no wall reverse): stock lag can still finish at 80 cm/s."""
+    runs = [run_fake_episode(cfg, 0.80, seed=s) for s in range(10)]
+    done = sum(r["done"] for r in runs)
+    assert done >= 8, [r["max_stage"] for r in runs]
+    for r in runs:
         if r["grasp_err_xy"] is not None:
             assert r["grasp_err_xy"] <= 0.03, r
 
@@ -437,43 +478,13 @@ def test_stage_schema_matches_the_constants():
     )
 
 
-# ------------------------------------------------------- throw mode (no bounce)
-
-
-def test_throw_mode_has_no_walls(throw_cfg):
-    sm = PickPlaceStateMachine(throw_cfg, dt=float(throw_cfg["sim"]["dt"]))
-    sm.set_box_poses(CARRY, drop_pos=DROP)
-    assert sm.throw_mode and sm.xy_bounds is None
-    (xmin, xmax), (ymin, ymax) = throw_cfg["scene"]["object_xy_bounds"]
-    # Next to the band edge, flying at it: no wall wait, forecast goes straight through.
-    obj = np.array([xmax - 0.01, 0.0, 0.03])
-    vel = np.array([0.80, 0.0, 0.0])
-    on_top = obj.copy()
-    assert sm._time_to_wall_s(obj, vel) == float("inf")
-    assert sm._bounce_clear(obj, vel, on_top)
-    pred = sm._forecast(obj, vel, 0.25)
-    np.testing.assert_allclose(pred, obj + vel * 0.25, atol=1e-9)
-    assert pred[0] > xmax, "forecast must leave the band (constant velocity)"
-
-
-def test_motion_no_bounce_without_bounds():
+def test_motion_coasts_straight():
     from sim.motion import kinematic_forecast
 
     pos, vel = np.array([0.69, 0.0, 0.03]), np.array([0.4, 0.0, 0.0])
-    p, v = kinematic_forecast(pos, vel, 0.5, 0.04, xy_bounds=None)
+    p, v = kinematic_forecast(pos, vel, 0.5, 0.04)
     np.testing.assert_allclose(p, pos + vel * 0.5, atol=1e-9)
     np.testing.assert_allclose(v, vel)
-    bounds = ((0.4, 0.7), (-0.2, 0.2))
-    pb, vb = kinematic_forecast(pos, vel, 0.5, 0.04, xy_bounds=bounds)
-    assert vb[0] < 0 and pb[0] <= 0.7 + 1e-9, "bounce must stay when bounds are set"
-
-
-@pytest.mark.parametrize("speed", [0.0, 0.10, 0.20])
-def test_throw_closed_loop_completes(throw_cfg, speed):
-    """Fake arm + aimed throw, no walls: expert still reaches done and lifts."""
-    runs = [run_fake_episode(throw_cfg, speed, seed=s) for s in range(10)]
-    done = sum(r["done"] for r in runs)
-    assert done >= 9, [{k: r[k] for k in ("max_stage", "retries", "grasp_err_xy")} for r in runs]
 
 
 def test_slip_goes_back_to_intercept(sm):
@@ -491,19 +502,21 @@ def test_slip_goes_back_to_intercept(sm):
 
 
 def test_wrist_depth_cannot_override_gt_z(cfg):
-    """Wrist depth must not replace GT |dz| (seed-260 stuck-arm / early-close bug)."""
+    """Wrist depth must not replace Z gate (seed-260 stuck-arm / early-close bug)."""
     cfg["state_machine_params"]["close_depth_m"] = 0.08
     sm = PickPlaceStateMachine(cfg, dt=float(cfg["sim"]["dt"]))
     sm.set_box_poses(CARRY, drop_pos=DROP)
     obj = np.array([0.55, 0.0, 0.03])
-    high = np.array([0.55, 0.0, 0.03 + 0.06])  # GT Z outside grasp_xyz_ok
+    zg = sm._update_z_grasp(obj.copy(), obj)
+    high = np.array([0.55, 0.0, zg + 0.06])  # too high vs z_grasp
+    on_grasp = np.array([0.55, 0.0, zg])
     sm.stage = STAGE_APPROACH
     # Shallow wrist used to force a close here — that is no longer allowed.
     assert sm.step(_state(obj, np.zeros(3)), high, sm._down_quat, wrist_depth_m=0.05).stage == STAGE_APPROACH
     sm.stage = STAGE_APPROACH
-    assert sm.step(_state(obj, np.zeros(3)), obj.copy(), sm._down_quat, wrist_depth_m=0.30).stage == STAGE_CLOSE
+    assert sm.step(_state(obj, np.zeros(3)), on_grasp, sm._down_quat, wrist_depth_m=0.30).stage == STAGE_CLOSE
     sm.stage = STAGE_APPROACH
-    assert sm.step(_state(obj, np.zeros(3)), obj.copy(), sm._down_quat, wrist_depth_m=float("nan")).stage == STAGE_CLOSE
+    assert sm.step(_state(obj, np.zeros(3)), on_grasp, sm._down_quat, wrist_depth_m=float("nan")).stage == STAGE_CLOSE
 
 
 def test_hover_over_bowl_is_not_success():

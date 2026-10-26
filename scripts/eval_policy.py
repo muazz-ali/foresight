@@ -7,16 +7,19 @@ WHAT THIS FILE DOES
   and put it in the bowl. Count how often it works at each speed.
 
 WHAT THE POLICY SEES
-  Two camera images, the hand state, and a 4-number pack: where the object
-  will be (x, y) and how fast it moves (vx, vy), looked ahead by delta seconds
-  (constant-velocity guess).
+  Two camera images, the hand state, and a 5-number pack: where the object
+  will be (x, y), grasp height p̂z, and how fast it moves (vx, vy), looked
+  ahead by delta seconds (constant-velocity guess). p̂z uses the same Z latch
+  as collect (sample high, lock below 10 cm).
 
-  `--cond-source oracle|filter` picks where those 4 numbers come from.
+  `--cond-source oracle|filter` picks where those numbers come from.
     oracle = simulator truth (default). This is Gate G1.
     filter = static camera + Kalman filter. This is Gate G2b (filter swap).
-  `--zero-conditioning` sets the 4 numbers to all zeros. It is the sanity
+  `--zero-conditioning` sets the pack to all zeros. It is the sanity
     check: if the policy really uses the numbers, success should drop a lot.
     It cannot be mixed with `--cond-source filter`.
+  `--claim-timing on` enables DelayInjection (reported Δ for the pack).
+  `--forecast-rel on` decodes actions as offsets from the object forecast.
 
 WHAT SUCCESS LOOKS LIKE (see foresight_plan.md for the real gate text)
   G1 needs two runs of this script on the same checkpoint:
@@ -174,6 +177,18 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Timestamped ActionBuffer: drop chunk slots whose time has passed.")
     p.add_argument("--inject-latency-s", type=float, default=0.0,
                    help="Simulated inference delay (s): plan from an observation this old.")
+    p.add_argument(
+        "--claim-timing",
+        choices=["on", "off"],
+        default="off",
+        help="Use DelayInjection reported Δ for the 5-D pack (claim path).",
+    )
+    p.add_argument(
+        "--forecast-rel",
+        choices=["on", "off"],
+        default="off",
+        help="Decode action XYZ as relative to object forecast p̂ (claim Step 4/5).",
+    )
     # Sanity checks: change one input the model reads, keep everything else.
     p.add_argument("--blank-cam", choices=["none", "static", "wrist", "both"], default="none",
                    help="Feed a gray image for this camera (the .mp4 still shows the real view).")
@@ -438,15 +453,21 @@ def build_obs_batch(
     # choose_pack decides the 4 numbers: sim truth (oracle), camera filter,
     # or all zeros (--zero-conditioning). The images and hand state do not change
     # in the zero path; only these 4 numbers are wiped.
+    # Claim 5-D: p̂z from latched grasp height; optional per-step reported Δ.
+    p_hat_z = sanity.get("p_hat_z")
+    pack_delta = sanity.get("_pack_delta")
+    if pack_delta is None:
+        pack_delta = delta
     aux = choose_pack(
         source=cond_source,
         oracle_state=obj,
         filter_state=filter_state,
-        delta=delta,
+        delta=float(pack_delta),
         zero=zero_conditioning,
+        p_hat_z=p_hat_z,
     )
     if sanity.get("cond_donor") is not None and not zero_conditioning:
-        # E1 counterfactual (in-distribution): the 4 numbers of a real, different episode
+        # E1 counterfactual (in-distribution): the pack of a real, different episode
         # at the same speed, replayed frame by frame. The scene, images and hand are unchanged.
         donor = np.asarray(sanity["cond_donor"], dtype=np.float64)
         k = min(int(sanity.get("_step", 0)), len(donor) - 1)
@@ -457,7 +478,8 @@ def build_obs_batch(
         aux["cond"][0:2] += np.asarray(cond_shift, dtype=np.float64).reshape(2)
     if sanity.get("cond_vel") is not None and not zero_conditioning:
         aux["cond"] = np.asarray(aux["cond"], dtype=np.float64).copy()
-        aux["cond"][2:4] = np.asarray(sanity["cond_vel"], dtype=np.float64).reshape(2)
+        # Layout: p̂x,p̂y,p̂z,vx,vy — velocities sit at indices 3:5.
+        aux["cond"][3:5] = np.asarray(sanity["cond_vel"], dtype=np.float64).reshape(2)
     from policy.transforms import cond_to_model
 
     cond_frame = (frames or {}).get("cond_frame", "abs")
@@ -739,16 +761,41 @@ def run_episode_policy(
     if down_quat.size != 4:
         down_quat = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
 
+    # Claim Z: same collect/lock latch as the expert (p̂z).
+    from interfaces.grasp_height import ZLatch, z_top_from_gt_center
+
+    z_latch = ZLatch.from_cfg(scene.cfg if isinstance(scene.cfg, dict) else {})
+    z_latch.z_table = float(getattr(scene, "_table_z", 0.0))
+    z_latch.reset()
+    claim_delay = None
+    if bool(sanity.get("claim_timing")):
+        from control import DelayInjection
+
+        claim_delay = DelayInjection.from_cfg(scene.cfg, seed=int(seed))
+        claim_delay.set_eval_delta(float(sanity.get("claim_eval_delta_s", 0.0)))
+
     # ===== MAIN EPISODE LOOP =====
-    # One turn = one sim step (25 Hz):
-    #   1. read cameras + object   
-    #   2. build the 4-number pack
-    #   3. ask the policy for an action   
+    # One turn = one sim step:
+    #   1. read cameras + object
+    #   2. build the 5-number pack
+    #   3. ask the policy for an action
     #   4. apply glue rules
-    #   5. step the sim   
+    #   5. step the sim
     #   6. log everything
     for t in range(n_steps):
         sanity["_step"] = t
+        # Refresh latched p̂z from GT top (wrist depth fuse can be added later).
+        ee_z_now = float(scene.get_ee_pose()[0][2])
+        obj_now = scene.get_object_state().position
+        half = max(0.03, float(obj_now[2]) - z_latch.z_table)
+        z_top = z_top_from_gt_center(float(obj_now[2]), half_height_m=half)
+        sanity["p_hat_z"] = z_latch.update(z_top=z_top, ee_z=ee_z_now)
+        if claim_delay is not None:
+            t0 = float(getattr(scene, "last_capture_t0", scene.get_object_state().timestamp))
+            samp = claim_delay.sample(t0, mode="eval")
+            sanity["_pack_delta"] = float(samp.reported_delta_s)
+        else:
+            sanity["_pack_delta"] = None
         # Empty plan means the net runs this step.
         will_replan = (len(action_buf) == 0) if action_buf is not None else (len(plan) == 0)
         imgs = scene.get_images()
@@ -811,6 +858,18 @@ def run_episode_policy(
 
             ee_plan = batch_used["observation.state"][0, 0:3].detach().cpu().numpy()
             chunk = action_from_model(chunk, ee_plan, frames.get("action_frame", "abs"))
+            if sanity.get("forecast_rel"):
+                # Claim: model XYZ is relative to forecast p̂; convert to world.
+                from interfaces.forecast import forecast_horizon
+                from policy.relabel import actions_from_forecast_rel
+
+                st = oracle_now if filt_state is None else filt_state
+                d_pack = float(sanity.get("_pack_delta") or delta)
+                pz = sanity.get("p_hat_z")
+                forecasts = forecast_horizon(
+                    st, d_pack, dt=dt, n=len(chunk), p_hat_z=pz
+                )
+                chunk = actions_from_forecast_rel(chunk, forecasts)
             if action_buf is not None:
                 # Action i was meant for obs time + i*dt. Slots already past are dropped.
                 action_buf.push_chunk(chunk, t0=now_k - lat_steps * dt, dt=dt, now=now_k - 1e-6)
@@ -831,7 +890,7 @@ def run_episode_policy(
         pos, quat, grip = action_to_ee(last_act)
 
         # ----- GLUE (grasp latch) -----
-        # Weld mode (G1/G2 bounce box): close near object → weld attach.
+        # Weld mode (optional use_weld_grasp): close near object → weld attach.
         # Physics mode (Phase 3 throw): close near object → free to PhysX (no weld).
         # --no-attach: never set attach; finger contact only.
         obj = scene.get_object_state()
@@ -1454,6 +1513,9 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
                     "hand_shift": getattr(args, "hand_shift_m", None),
                     "cond_donor": _donor_cond(getattr(args, "cond_donor_dir", None), speed, seed),
                     "cond_donor_seed": _donor_seed(getattr(args, "cond_donor_dir", None), speed, seed),
+                    "claim_timing": getattr(args, "claim_timing", "off") == "on",
+                    "claim_eval_delta_s": float(getattr(args, "inject_latency_s", 0.0) or 0.0),
+                    "forecast_rel": getattr(args, "forecast_rel", "off") == "on",
                 },
                 close_gate=(
                     {

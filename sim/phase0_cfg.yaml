@@ -14,17 +14,22 @@
 static_camera:
   width: 480
   height: 360
-  fps: 25                 # match sim.dt_ms (40 → 25 Hz)
+  # Label for videos/logs only — NOT passed to Isaac CameraCfg.
+  # Real capture rate = sim.dt (cam.update once per control step; update_period=0).
+  fps: 30                 # keep equal to 1000/dt_ms (30 Hz)
   focal_length: 2.3
   focus_distance: 400.0
   horizontal_aperture: 4.6
   data_types:
   - rgb
+  - depth                 # claim dual-cam Z fuse (with wrist RGB-D)
   clip:
     near_mm: 10.0
     far_mm: 100000.0
-  position_mm: [1000.0, 0.0, 600.0]
-  rotation_deg: [0.0, 60.0, 90.0]
+  # Pulled back/up vs old [1000,0,600]@60°: throws now spawn on the far +X
+  # table rim (~0.75–1.5 m). Old FOV bottom only reached ~0.76 m (spawn cut off).
+  position_mm: [1200.0, 0.0, 800.0]
+  rotation_deg: [0.0, 48.0, 90.0]
 
 # =============================================================================
 # WRIST CAMERA — RGB-D on panda_hand (log / policy key: wrist_cam)
@@ -32,7 +37,7 @@ static_camera:
 wrist_camera:
   width: 480
   height: 360
-  fps: 25
+  fps: 30                 # label only; same as static_camera.fps
   focal_length: 2.3
   focus_distance: 400.0
   horizontal_aperture: 4.6
@@ -58,16 +63,11 @@ robot:
   gripper_close_time_ms: 80
 
 # =============================================================================
-# SCENE — table / house, throw, meshes
+# SCENE — house USD + throw + meshes
 # =============================================================================
 scene:
-  # true = house USD + throw (no wall bounce). false = floor bounce box + weld.
-  use_house: true
-  # use_weld_grasp: true   # force weld in a house (default: physics in house)
-  table_height_mm: 0.0              # floor mode only; house overwrites
-  table_size_mm: [1000.0, 1000.0, 20.0]
-  table_pos_mm: [500.0, 0.0, -10.0]
-
+  # Physics fingers (no weld). Catchable throws + chase guards handle speed.
+  # use_weld_grasp: true
   object_mass: 0.05
   object_friction: 2.0
   use_primitive: false              # true = debug sphere
@@ -77,23 +77,33 @@ scene:
   place_hover_above_container_mm: 80.0
   spawn_xy_pad_mm: 30.0             # inset spawn from play-band edge
   container_jitter_xy_mm: 20.0
-  container_xy_clip_mm: [[450.0, 580.0], [260.0, 340.0]]  # floor default
-  attach_z_offset_max_mm: -5.0      # weld: object at most this far below EE
-  object_xy_bounds_mm: [[480.0, 720.0], [-200.0, 100.0]]  # spawn / aim band
-  container_xy_mm: [500.0, 300.0]
+  # Throw fan at far +X edge: 0 = 90° straight at robot; 1 = uniform over full 180°.
+  throw_randomness: 1.0
+  # Tip-on-side for rolling. OFF for physics-grasp expert: tipped cans leave
+  # z_grasp ~3 cm but DiffIK stalls with ee_z≈6 cm (XY in gate, Z never),
+  # so the hand never closes and the throw coasts off (fast-smoke 4/4 tipped
+  # cans = timeout/off-table; upright at 50 cm/s was 5/5). Re-enable when a
+  # side-grasp / higher tip aim exists.
+  tip_roll_categories: []
+  # Bowl seed (mm). Layout: X −3 cm from seed, Y = real +Y table rim.
+  container_xy_clip_mm: [[300.0, 400.0], [410.0, 450.0]]  # seed; layout overwrites
+  attach_z_offset_max_mm: -5.0      # weld only: object at most this far below EE
+  object_xy_bounds_mm: [[480.0, 720.0], [-200.0, 100.0]]  # seed; layout overwrites
+  container_xy_mm: [350.0, 420.0]   # X seed (layout does −3 cm); Y → +Y rim
 
   exclude_usd_containers:
   - plate
   - tray
   - placemat
   exclude_usd_objects:
-  - tomato                          # ~85 mm > gripper
-  - beer
+  - tomato   # tiny meshes slip under physics grasp (smoke tomato07 lift-stall)
+  - beer     # tall cans tip out of short bowls after place (smoke beer13)
   - bottle
-  - cup                             # skipped Oct 11 (see object_categories)
-  - potato
-  # Franka open ≈ 2*gripper_open ≈ 80 mm.
-  max_object_width_mm: 75.0
+  - cup      # few fitting meshes; weak tracking
+  - potato   # tipped wedges wedge in the 80 mm gripper
+  # Franka open ≈ 2*gripper_open ≈ 80 mm. Keep margin: 73 mm cans (fcan11)
+  # barely fit and glance when Z is a few mm high.
+  max_object_width_mm: 65.0
   min_container_clearance_mm: 10.0   # box taller than object by this (closed tops)
   min_container_xy_margin_mm: 10.0   # container footprint bigger than object
   # Fingers open along world Y: container Y side ≥ object width + this
@@ -105,6 +115,7 @@ scene:
   robot_base_keepout_mm: 120.0       # coast through pedestal → safety-abort
   ee_table_margin_mm: 20.0           # hand past table footprint → safety-abort
 
+  # Keep in sync with OBJECTS in scripts/launch_p1_collect.sh.
   object_categories:
   - apple
   - avocado
@@ -117,15 +128,14 @@ scene:
   - orange
   - peach
   - tangerine
-  # Skipped for the 5k collect (Oct 11): potato wedges in the 80 mm gripper
-  # when grasped tipped; cup has one fitting mesh and weak tracking.
-  # Held-out `unseen` only via --object-usd.
+
+  # Held-out `unseen` / excluded cats only via --object-usd.
   container_categories:
   - bowl
   - box
 
 # =============================================================================
-# LIGHTING — house mode (behind / above static_camera)
+# LIGHTING — behind / above static_camera
 # =============================================================================
 lighting:
   temperature: [4000, 8000]
@@ -143,19 +153,22 @@ state_machine_params:
   policy_look_ahead_ms: 250
 
   # --- stage 0: start ---
-  wait_at_home_ms: 200
+  # Short wait: at 50 cm/s, 200 ms burns 10 cm of runway before the chase starts.
+  wait_at_home_ms: 50
 
   # --- stage 1: intercept → close (stage 2 go-down unused) ---
-  max_aim_ahead_ms: 250
+  # Hand faster than objects up to ~1 m/s (meet-time + DiffIK chase). Aim cap
+  # 400 ms so a 50 cm/s throw is led ~20 cm when far. Tip 160: longer tip
+  # over-leads so Z never settles inside grasp_xyz_ok (seed-341 near-hit).
+  max_aim_ahead_ms: 400
   # Aim farther for tip lag (not a wait). Measure: tools/diag/calibrate_servo_lag.py
   tip_lag_pad_ms: 160
-  hand_speed_max_cm_s: 90.0
+  hand_speed_max_cm_s: 250.0
   aim_refine_iters: 3
-  # One gate: |dx|,|dy|,|dz| (mm). Pass → close. Sized from g0_speed5_scout.
-  grasp_xyz_ok_mm: [10.0, 10.0, 15.0]
-  # Floor only: need this much clear path before a wall reverse. House: unused.
-  min_wait_after_bounce_ms: 100
-  object_still_cm_s: 5.0            # slower → skip wall check
+  # One gate: |dx|,|dy|,|dz| (mm). Pass → close. Z must be tight for physics
+  # grasp: closing 17–20 mm high on cans glances the rim then slips on lift
+  # (fast-smoke can13/can15). 12 mm still allows DiffIK lag.
+  grasp_xyz_ok_mm: [10.0, 10.0, 12.0]
 
   # --- stage 3: close ---
   # Dwell after close (not finger travel = robot.gripper_close_time_ms).
@@ -195,8 +208,44 @@ paths:
   object_dir: /home/gpuadmin/Desktop/muazzam/objects
   scene_dir: /home/gpuadmin/Desktop/muazzam/scenes
 
+# =============================================================================
+# CLAIM TIMING — Step 1 (30 Hz loop + delay injection)
+# =============================================================================
+# Applied Δ = real wait before motions from a frame at t0 run (t0 + applied).
+# Reported Δ = what forecast/policy see (applied + ~10 ms jitter).
+claim_timing:
+  enabled: true
+  # Reported − applied ~ N(0, 10 ms). Step-1 check: std ≈ 10 ms over 1000 cycles.
+  delta_jitter_ms: 10.0
+  # Train: draw applied each cycle. Eval: fix via eval_delta_ms or DelayInjection.set_eval_delta.
+  train_delta_min_ms: 0.0
+  train_delta_max_ms: 200.0
+  eval_delta_ms: 0.0
+  # Hold expert motion until apply_at = t0 + applied_Δ (opt-in; default off
+  # until delay-hold is proven not to kill expert success).
+  enforce_apply_at: false
+  # Pack conditioning from noisy_gt filter instead of clean GT (optional).
+  use_noisy_gt: false
+  # During CLOSE: require |v_hand−v_obj| ≲ 3.1 cm/s or ride object XY.
+  close_speed_guard: false
+
+# Grasp height: expert aims object centre; policy pack p̂z from wrist depth.
+# Wrist depth only trusted while hand–top gap ≥ 7 cm (D405 bad closer in).
+claim_height:
+  close_at_object_center: true   # expert aim Z = obj centre (reliable demos)
+  pack_z_from_depth: true        # training pack p̂z from wrist depth latch (not GT)
+  # g: insert past top when building z_grasp from a measured top.
+  finger_insert_mm: 30.0
+  table_clear_mm: 5.0          # c: fingertips stay this far above the table
+  z_slack_mm: 5.0              # s_z: vertical slack; close gate uses s_z/2
+  latch_lo_mm: 70.0            # lock when gap < 7 cm (stop trusting new depth)
+  latch_hi_mm: 200.0           # collect continuously while gap ≥ 20 cm
+  depth_percentile: 90.0       # wrist depth: high percentile of object pixels
+  # Gate: wrist z_top RMSE vs GT must stay ≤ this (sim check / diag).
+  depth_rmse_max_mm: 10.0
+
 sim:
-  dt_ms: 40                         # control / cameras / logs = 25 Hz
-  # House only: physics steps per control step (4 → 100 Hz). Floor always 1.
+  dt_ms: 33.333333                  # control / cameras / logs = 30 Hz
+  # House only: physics steps per control step (4 → 120 Hz). Floor always 1.
   physics_substeps: 4
   device: cuda:0

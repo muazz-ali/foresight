@@ -6,8 +6,7 @@ Always saves camera images + a text instruction. Speeds vary 0-20 cm/s.
 What it does: runs our expert over many episodes, keeps the ones that succeed,
 and saves them (images, hand moves, the 4 policy numbers) for training.
 It runs by hand, in the sim conda env, before the training step.
-It must NOT use DynamicVLA code, and it does not train. Training lives in a
-separate env. Speed bins match G1 so train and eval see the same speeds.
+
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ import numpy as np
 
 FORESIGHT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CFG = FORESIGHT_ROOT / "sim" / "phase0_cfg.yaml"
-DEFAULT_OUT = FORESIGHT_ROOT / "data" / "g3-smoke"
+DEFAULT_OUT = FORESIGHT_ROOT / "data" / "smoke"
 
 # So `import sim...` / `import eval...` work when run as a script.
 sys.path.insert(0, str(FORESIGHT_ROOT))
@@ -37,7 +36,7 @@ def _build_parser() -> argparse.ArgumentParser:
     """Command-line flags (Isaac's own flags are added later in main)."""
     p = argparse.ArgumentParser(description="Foresight Phase 1 oracle collection")
     # We stop at N successful demos, not N tries. Failures are skipped for training.
-    p.add_argument("--target-successes", type=int, default=20, help="clean wins to collect (sim/success.clean_reject_reason)")
+    p.add_argument("--target-successes", type=int, default=5, help="clean wins to collect (sim/success.clean_reject_reason)")
     p.add_argument("--max-attempts", type=int, default=None, help="Safety cap (default 3x target)")
     p.add_argument(
         "--speed-mode",
@@ -61,7 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--container-usd", default=None)
     p.add_argument("--save", action="store_true", default=True)
     p.add_argument("--no-save", action="store_false", dest="save")
-    p.add_argument("--save-failures", action="store_true", default=False)
+    p.add_argument("--save-failures", action="store_true", default=True)
     # Debug is ON by default here: it also saves failed runs and an MP4 per run.
     p.add_argument("--debug", action="store_true", default=True)
     p.add_argument("--no-debug", action="store_false", dest="debug")

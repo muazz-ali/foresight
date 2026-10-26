@@ -23,13 +23,21 @@ from interfaces.state import CONDITIONING_DIM, ObjectState, conditioning_vector
 FILTER_WARMUP_BEFORE = 2
 
 
-def live_pack(state: ObjectState, delta: float) -> np.ndarray:
-    """4 numbers, same helper the oracle and the filter share.
+def live_pack(
+    state: ObjectState,
+    delta: float,
+    *,
+    p_hat_z: float | None = None,
+) -> np.ndarray:
+    """5 numbers, same helper the oracle and the filter share.
 
     Oracle and filter use this same helper, which reduces layout drift.
     The shape check catches a wrong-size pack early, before it hits the policy.
+    ``p_hat_z`` is latched grasp height when known.
     """
-    pack = conditioning_vector(state, delta=float(delta)).astype(np.float32)
+    pack = conditioning_vector(
+        state, delta=float(delta), p_hat_z=p_hat_z
+    ).astype(np.float32)
     if pack.shape != (CONDITIONING_DIM,):
         raise ValueError(f"live pack must be ({CONDITIONING_DIM},), got {pack.shape}")
     return pack
@@ -42,6 +50,7 @@ def choose_pack(
     filter_state: ObjectState | None,
     delta: float,
     zero: bool,
+    p_hat_z: float | None = None,
 ) -> dict[str, np.ndarray | float | None]:
     """Pack the policy will see, plus the sim-truth pack beside it.
 
@@ -54,7 +63,7 @@ def choose_pack(
         raise ValueError("zero conditioning and filter source cannot mix")
 
     # Truth pack is always built, even when the policy does not see it.
-    truth = live_pack(oracle_state, delta)
+    truth = live_pack(oracle_state, delta, p_hat_z=p_hat_z)
     filt: np.ndarray | None = None
     valid: float | None = None
     if zero:
@@ -69,7 +78,7 @@ def choose_pack(
             filt = np.zeros(CONDITIONING_DIM, dtype=np.float32)
             valid = 0.0
         else:
-            filt = live_pack(filter_state, delta)
+            filt = live_pack(filter_state, delta, p_hat_z=p_hat_z)
             valid = 1.0 if filter_state.valid else 0.0
         cond = filt.copy()
     # cond = what the policy sees. truth/filter/valid = for logging only.
