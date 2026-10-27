@@ -72,6 +72,10 @@ is not a pure `L·v` effect.
 
 Raw fit: `data/eval/fix1_static_offset/closeout_lag_fit.json`.
 
+## Commit
+
+`590797b530c0bd828f67c1db6f765a3698947830`
+
 ## Files
 
 - `control/close_guard.py` — `predictive_close_check`
