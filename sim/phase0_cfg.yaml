@@ -26,10 +26,10 @@ static_camera:
   clip:
     near_mm: 10.0
     far_mm: 100000.0
-  # Pulled back/up vs old [1000,0,600]@60°: throws now spawn on the far +X
-  # table rim (~0.75–1.5 m). Old FOV bottom only reached ~0.76 m (spawn cut off).
-  position_mm: [1200.0, 0.0, 800.0]
-  rotation_deg: [0.0, 48.0, 90.0]
+  # X=1.2 m back; Z=0.70 m @ 45° tilt (was 0.80 m @ 48°). Far-rim throws
+  # (~0.75–1.5 m) must stay in frame — smoke-check FOV after pose changes.
+  position_mm: [1000.0, 0.0, 700.0]
+  rotation_deg: [0.0, 50.0, 90.0]
 
 # =============================================================================
 # WRIST CAMERA — RGB-D on panda_hand (log / policy key: wrist_cam)
@@ -58,9 +58,16 @@ robot:
   gripper_close_mm: 0.0
   init_pose_mm: [450.0, 0.0, 400.0, 0.0, 1.0, 0.0, 0.0]  # xyz + quat wxyz
   max_reach_dist_mm: 850.0
-  # Finger travel time (reflex). Expert dwell = hold_closed_* below. Measure:
-  # tools/diag/measure_gripper_close.py
-  gripper_close_time_ms: 80
+  # Finger travel time (SPEC-DERIVED from Franka Hand: 50 mm/s, 5 mm travel,
+  # 30 ms cmd + 50 ms force → 180 ms nominal). Re-check on the real Hand.
+  # Expert dwell = hold_closed_* below. Do NOT use the old sim value of 80 ms.
+  gripper_close_time_ms: 180
+  # Physical close model (B1). When enabled, fingers rate-limit instead of snap.
+  gripper_actuator:
+    enabled: true
+    v_finger_mm_s: 50.0
+    t_cmd_ms: 30.0
+    t_force_ms: 50.0
 
 # =============================================================================
 # SCENE — house USD + throw + meshes
@@ -97,12 +104,12 @@ scene:
   - placemat
   exclude_usd_objects:
   - tomato   # tiny meshes slip under physics grasp (smoke tomato07 lift-stall)
-  - beer     # tall cans tip out of short bowls after place (smoke beer13)
+  - beer     # tall / tip-prone; orientation out of scope
   - bottle
-  - cup      # few fitting meshes; weak tracking
+  - cup
+  - can      # tip/yaw out of scope; upright cans still hard for physics
   - potato   # tipped wedges wedge in the 80 mm gripper
-  # Franka open ≈ 2*gripper_open ≈ 80 mm. Keep margin: 73 mm cans (fcan11)
-  # barely fit and glance when Z is a few mm high.
+  # Drop wide meshes (Franka open ≈ 80 mm). Keep margin under 65 mm.
   max_object_width_mm: 65.0
   min_container_clearance_mm: 10.0   # box taller than object by this (closed tops)
   min_container_xy_margin_mm: 10.0   # container footprint bigger than object
@@ -116,10 +123,10 @@ scene:
   ee_table_margin_mm: 20.0           # hand past table footprint → safety-abort
 
   # Keep in sync with OBJECTS in scripts/launch_p1_collect.sh.
+  # No can/cup/beer/bottle (excluded above); fruit-sized only.
   object_categories:
   - apple
   - avocado
-  - can
   - egg
   - kiwi
   - lemon
@@ -158,17 +165,28 @@ state_machine_params:
 
   # --- stage 1: intercept → close (stage 2 go-down unused) ---
   # Hand faster than objects up to ~1 m/s (meet-time + DiffIK chase). Aim cap
-  # 400 ms so a 50 cm/s throw is led ~20 cm when far. Tip 160: longer tip
-  # over-leads so Z never settles inside grasp_xyz_ok (seed-341 near-hit).
+  # 400 ms so a 50 cm/s throw is led ~20 cm when far. Tip 175 = measured DiffIK
+  # lag while riding the object (hand−command 160/175/179 ms at 10/20/30 cm/s,
+  # AB_recordings_v2). 130 left the hand 4–6 mm behind and it never settled.
   max_aim_ahead_ms: 400
   # Aim farther for tip lag (not a wait). Measure: tools/diag/calibrate_servo_lag.py
-  tip_lag_pad_ms: 160
+  tip_lag_pad_ms: 175
   hand_speed_max_cm_s: 250.0
   aim_refine_iters: 3
-  # One gate: |dx|,|dy|,|dz| (mm). Pass → close. Z must be tight for physics
-  # grasp: closing 17–20 mm high on cans glances the rim then slips on lift
-  # (fast-smoke can13/can15). 12 mm still allows DiffIK lag.
+  # Chase near-box: |dx|,|dy|,|dz| (mm). Inside → settle aim (object + 1 tick).
+  # Close only when XY also ≤ close_xy_ok (B5: mean |d| ≤ 2 mm).
+  # Z tight for physics grasp (17–20 mm high on cans glances then slips).
   grasp_xyz_ok_mm: [10.0, 10.0, 12.0]
+  close_xy_ok_mm: 2.0
+  # Off (tested 2026-10-27, B1 smoke at 20–30 cm/s): ride correction k=1 turned
+  # never-closed throws into 5–8 mm closes; a 5 mm z gate + 2-tick settle did not
+  # help. Kept as knobs: ride_correction_gain (0), close_z_ok_mm (= chase-box z).
+  ride_correction_gain: 0.0
+  # Fix1: close_xy_ok stays 2 mm, but require N ticks in a row inside that box.
+  # With N=1 the hand closed on first entry (~1.6 mm short on the DiffIK
+  # approach). N=15 ≈ 0.5 s at 30 Hz lets the hand finish settling (~0.3 mm)
+  # before CLOSE. Does not change tip_lag / close_xy_ok / speed gate.
+  close_settle_ticks: 15
 
   # --- stage 3: close ---
   # Dwell after close (not finger travel = robot.gripper_close_time_ms).
@@ -226,8 +244,17 @@ claim_timing:
   enforce_apply_at: false
   # Pack conditioning from noisy_gt filter instead of clean GT (optional).
   use_noisy_gt: false
-  # During CLOSE: require |v_hand−v_obj| ≲ 3.1 cm/s or ride object XY.
-  close_speed_guard: false
+  # B3: expert enters CLOSE only when |v_hand−v_obj|_xy × t_close ≤ 2.5 mm
+  # (at t_close=180 ms → max_dv ≈ 1.39 cm/s) and XY ≤ close_xy_ok.
+  close_speed_guard: true
+  # B1 oracle: frame-delay buffer for expert (Δ = obs age, not enforce_apply_at).
+  obs_delay_buffer: false
+  # B1: Δ_meas = Δ_true + η, η ~ N(0, 5 ms), redrawn once per replan cycle.
+  delta_meas_noise_ms: 5.0
+  delta_meas_replan_ms: 330.0
+  # Pre-shape: w_pre = w_obj + 2×s along finger axis; s in mm; clamp at open gap.
+  pre_shape_slack_mm: 5.0
+  pre_shape_max_open_mm: 80.0
 
 # Grasp height: expert aims object centre; policy pack p̂z from wrist depth.
 # Wrist depth only trusted while hand–top gap ≥ 7 cm (D405 bad closer in).
@@ -241,6 +268,9 @@ claim_height:
   latch_lo_mm: 70.0            # lock when gap < 7 cm (stop trusting new depth)
   latch_hi_mm: 200.0           # collect continuously while gap ≥ 20 cm
   depth_percentile: 90.0       # wrist depth: high percentile of object pixels
+  # Added onto the wrist z_top. 0: the point-cloud top (grasp_height.z_top_from_wrist_cloud)
+  # reads −0.6 mm on still objects (A4); the old window estimator needed +6.7.
+  depth_z_bias_mm: 0.0
   # Gate: wrist z_top RMSE vs GT must stay ≤ this (sim check / diag).
   depth_rmse_max_mm: 10.0
 

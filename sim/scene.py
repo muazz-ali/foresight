@@ -621,6 +621,10 @@ class Phase0Scene:
         self._obj_vel_obs = np.zeros(3, dtype=np.float64)
         self._prev_obj_pos: np.ndarray | None = None
         self._coast_pos: np.ndarray | None = None  # physics grasp: scripted path position
+        # Scripted path orientation (spawn quat). Pinned with _coast_pos: reading the
+        # PhysX quat back let table contact tip eggs/lemons while z stayed at
+        # table + half-height (top 2–9 mm low at 10–30 cm/s, A4).
+        self._coast_quat: np.ndarray | None = None
         self._obj_kinematic = True
         self._phys_free = False  # physics grasp: True once PhysX owns the object
         self.off_table = False  # object left the table footprint this episode
@@ -1139,6 +1143,7 @@ class Phase0Scene:
         self._phys_free = False
         self._obj_velocity = np.zeros(3, dtype=np.float64)
         self._coast_pos = None if self._weld else pos.copy()
+        self._coast_quat = None if self._weld else np.asarray(quat, dtype=np.float64).copy()
         self.off_table = False
         self.abort_reason = None
 
@@ -1235,6 +1240,47 @@ class Phase0Scene:
             tcp_pos[0].detach().cpu().numpy().astype(np.float64),
             tcp_quat[0].detach().cpu().numpy().astype(np.float64),
         )
+
+    def get_hand_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        """``panda_hand`` body pose in world: (position, quaternion wxyz).
+
+        Use with ``sim.pinch_point.pinch_world_from_hand`` for the geometric
+        pad midpoint (not the configured TCP).
+        """
+        pos = self.robot.data.body_pos_w[0, self._ee_idx].detach().cpu().numpy()
+        quat = self.robot.data.body_quat_w[0, self._ee_idx].detach().cpu().numpy()
+        return (
+            np.asarray(pos, dtype=np.float64),
+            np.asarray(quat, dtype=np.float64),
+        )
+
+    def get_pinch_point(self) -> np.ndarray:
+        """World-frame geometric pinch (pad midpoint) from hand pose + URDF Z.
+
+        ``panda_leftfinger`` / ``panda_rightfinger`` are finger-*joint* origins
+        (Z=58.4 mm), not the pads — do not midpoint those. Prefer true
+        fingertip bodies when present; else ``pinch_world_from_hand`` (Z=103.4 mm).
+        """
+        from sim.pinch_point import pinch_from_finger_bodies, pinch_world_from_hand
+
+        names = list(self.robot.data.body_names)
+        # Pad tips only (not finger-link origins — those sit 45 mm short of the pads).
+        pair = ("panda_leftfingertip", "panda_rightfingertip")
+        if pair[0] in names and pair[1] in names:
+            i0 = names.index(pair[0])
+            i1 = names.index(pair[1])
+            p0 = self.robot.data.body_pos_w[0, i0].detach().cpu().numpy()
+            p1 = self.robot.data.body_pos_w[0, i1].detach().cpu().numpy()
+            return pinch_from_finger_bodies(p0, p1)
+        hand_pos, hand_quat = self.get_hand_pose()
+        return pinch_world_from_hand(hand_pos, hand_quat)
+
+    def get_tcp_minus_pinch_hand_m(self) -> np.ndarray:
+        """Configured TCP − geometric pinch, expressed in the hand frame (m)."""
+        from sim.pinch_point import tcp_minus_pinch_in_hand_m
+
+        tcp = self._tcp_offset[0].detach().cpu().numpy().astype(np.float64)
+        return tcp_minus_pinch_in_hand_m(tcp)
 
     def get_object_state(self) -> ObjectState:
         """True object position + velocity right now, in the shared ObjectState message.
@@ -1408,6 +1454,17 @@ class Phase0Scene:
         v[0, 0:3] = torch.tensor(vel, device=self.robot.device)
         self.object.write_root_velocity_to_sim(v)
 
+    def _pin_quat(self) -> np.ndarray | None:
+        """Spawn quat while the fingers are open; None (= PhysX quat) once they close.
+
+        Closing pads on a body whose pose *and* tilt are forced every substep
+        press into it; freed after finger travel it jumped ~6 mm (upright eggs).
+        Letting contacts turn it during the close keeps that slide ~1 mm.
+        """
+        if self._coast_quat is None or float(self._last_gripper_open) < 0.5:
+            return None
+        return self._coast_quat
+
     def _write_kinematic_object(self) -> None:
         """Slide the object one PHYSICS step along its path (the on-table motion for G0).
 
@@ -1419,6 +1476,8 @@ class Phase0Scene:
         pos = self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
         quat = self.object.data.root_quat_w[0].detach().cpu().numpy().astype(np.float64)
         if not self._weld and self._coast_pos is not None:
+            if self._pin_quat() is not None:
+                quat = self._pin_quat()  # slide flat: no PhysX tipping (see __init__)
             # Dynamic body: advance OUR copy of the path, not the read-back pose.
             # PhysX table friction pulls a teleported resting body back ~20% of
             # each step (tools/diag/check_coast_speed.py), which used to add up
@@ -1482,6 +1541,29 @@ class Phase0Scene:
             self._free_object(match_ee=True)
         return True
 
+    def _pads_on_object(self, margin_m: float = 0.001) -> bool:
+        """Closing fingers have reached the object's width along the finger axis.
+
+        From here PhysX must own the object: squeezing a body we still teleport
+        every substep shoved the arm ~3 cm up/sideways and the pads shut on air
+        (B1: every first grasp with a pre-shaped 180 ms close). Before contact the
+        scripted coast stays, so a moving object does not drag on the table.
+        """
+        if self._object_size is None or float(self._last_gripper_open) >= 0.5:
+            return False
+        from scipy.spatial.transform import Rotation
+
+        from sim.obs_delay import finger_axis_width_m
+
+        _, q_ee = self.get_ee_pose()
+        R = Rotation.from_quat([q_ee[1], q_ee[2], q_ee[3], q_ee[0]]).as_matrix()
+        fy = R[:2, 1]  # finger-open axis = hand Y, projected on the table
+        yaw_hand = float(np.arctan2(-fy[0], fy[1]))
+        q_o = self._coast_quat if self._coast_quat is not None else np.array([1.0, 0.0, 0.0, 0.0])
+        yaw_obj = float(Rotation.from_quat([q_o[1], q_o[2], q_o[3], q_o[0]]).as_euler("xyz")[2])
+        w = finger_axis_width_m(self._object_size, grasp_yaw_rad=yaw_hand - yaw_obj)
+        return self.get_finger_gap_m() <= w + float(margin_m)
+
     def _step_physics_object(self, release: bool) -> None:
         """Physics-grasp object update, before ``sim.step``.
 
@@ -1490,7 +1572,7 @@ class Phase0Scene:
         """
         if self._phys_free:
             return
-        if release:
+        if release or self._pads_on_object():
             # Grasp free: match hand velocity so fingers can close without a 50 cm/s shear.
             self._free_object(match_ee=True)
             return
@@ -1765,7 +1847,10 @@ class Phase0Scene:
             # alternate frames at 25 Hz). Put it back on the scripted path so logs,
             # images and the next substep all see exactly speed * time.
             if not self._weld and self._obj_kinematic and not self._phys_free and self._coast_pos is not None:
-                self._write_object_pose(self._coast_pos, self.object.data.root_quat_w[0].detach().cpu().numpy().astype(np.float64), np.zeros(3))
+                q = self._pin_quat()
+                if q is None:
+                    q = self.object.data.root_quat_w[0].detach().cpu().numpy().astype(np.float64)
+                self._write_object_pose(self._coast_pos, q, np.zeros(3))
                 self.object.write_data_to_sim()
                 self.object.update(self.physics_dt)
             # n == 1: add the full dt at once (legacy, identical float sums).

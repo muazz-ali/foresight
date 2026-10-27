@@ -21,6 +21,7 @@ from interfaces.state import oracle_from_gt
 from sim.motion import kinematic_advance
 from sim.state_machine import (
     STAGE_APPROACH,
+    STAGE_CARRY,
     STAGE_CLOSE,
     STAGE_DESCEND,
     STAGE_DONE,
@@ -47,8 +48,14 @@ def load_cfg() -> dict:
 
 @pytest.fixture
 def cfg() -> dict:
-    """Shipped yaml (house throw + GT weld grasp)."""
-    return load_cfg()
+    """Shipped yaml (house throw + GT weld grasp).
+
+    Gate unit tests fire CLOSE in one tick; Fix1's multi-tick dwell is covered
+    by ``test_close_settle_ticks_require_hold_inside_2mm``.
+    """
+    c = load_cfg()
+    c.setdefault("state_machine_params", {})["close_settle_ticks"] = 1
+    return c
 
 
 @pytest.fixture
@@ -60,6 +67,12 @@ def sm(cfg) -> PickPlaceStateMachine:
 
 def _state(pos, vel, t=0.0):
     return oracle_from_gt(np.asarray(pos, dtype=np.float64), np.asarray(vel, dtype=np.float64), t)
+
+
+def _riding(sm, ee, vel):
+    """Hand was one tick behind on the same track → |v_hand − v_obj| = 0 (B3 gate)."""
+    sm._prev_ee = np.asarray(ee, dtype=np.float64) - np.asarray(vel, dtype=np.float64) * sm.dt
+    return ee
 
 
 # --------------------------------------------------------------- interception
@@ -129,7 +142,7 @@ def test_close_gate_requires_hand_at_object_centre(sm):
 
 
 def test_z_gate_honors_yaml_not_z_slack_half(sm):
-    """Close Z tol is grasp_xyz_ok[2] (20 mm), not claim z_slack/2 (2.5 mm).
+    """Close Z tol is grasp_xyz_ok[2] (12 mm), not claim z_slack/2 (2.5 mm).
 
     Why: a 30 cm/s smoke near-hit (8.8 mm above centre) never closed when the
     gate was clamped to 2.5 mm, then the object hit the pedestal.
@@ -138,19 +151,59 @@ def test_z_gate_honors_yaml_not_z_slack_half(sm):
     obj = np.array([0.55, 0.0, 0.036])
     vel = np.zeros(3)
     zg = sm._update_z_grasp(obj.copy(), obj)
-    assert sm.grasp_xyz_ok[2] == pytest.approx(0.020, abs=1e-9)
-    # 8 mm above centre: inside yaml box → CLOSE.
-    near = np.array([obj[0], obj[1], zg + 0.008])
+    assert sm.grasp_xyz_ok[2] == pytest.approx(0.012, abs=1e-9)
+    # 8 mm above centre: inside yaml box + XY settled → CLOSE.
+    near = _riding(sm, np.array([obj[0], obj[1], zg + 0.008]), vel)
     assert sm.step(_state(obj, vel), near, sm._down_quat).stage == STAGE_CLOSE
-    # 21 mm above: outside yaml box → stay intercept.
+    # 13 mm above: outside yaml Z box → stay intercept.
     sm.stage = STAGE_APPROACH
     sm.timer_s = 0.0
-    far = np.array([obj[0], obj[1], zg + 0.021])
+    far = _riding(sm, np.array([obj[0], obj[1], zg + 0.013]), vel)
     assert sm.step(_state(obj, vel), far, sm._down_quat).stage == STAGE_APPROACH
 
 
+def test_close_requires_xy_settle_2mm(sm):
+    """B5: near the chase box is not enough — |dx|,|dy| must be ≤ close_xy_ok."""
+    sm.stage = STAGE_APPROACH
+    obj = np.array([0.55, 0.0, 0.036])
+    vel = np.zeros(3)
+    zg = sm._update_z_grasp(obj.copy(), obj)
+    # 5 mm off in X: inside grasp_xyz_ok (10 mm) but outside close_xy_ok (2 mm).
+    almost = _riding(sm, np.array([obj[0] + 0.005, obj[1], zg]), vel)
+    assert sm.step(_state(obj, vel), almost, sm._down_quat).stage == STAGE_APPROACH
+    # 1 mm off: settled → CLOSE.
+    sm.stage = STAGE_APPROACH
+    sm.timer_s = 0.0
+    tight = _riding(sm, np.array([obj[0] + 0.001, obj[1], zg]), vel)
+    assert sm.step(_state(obj, vel), tight, sm._down_quat).stage == STAGE_CLOSE
+
+
+def test_close_settle_ticks_require_hold_inside_2mm():
+    """Fix1: close_xy_ok stays 2 mm, but CLOSE waits N ticks in a row inside it.
+
+    Why: with N=1 the hand shut on first entry (~1.6 mm short on the DiffIK
+    approach). Production yaml uses N=15 so the hand finishes settling first.
+    """
+    cfg = load_cfg()
+    cfg.setdefault("state_machine_params", {})["close_settle_ticks"] = 3
+    sm = PickPlaceStateMachine(cfg, dt=float(cfg["sim"]["dt"]))
+    sm.set_box_poses(CARRY, drop_pos=DROP)
+    sm.stage = STAGE_APPROACH
+    obj = np.array([0.55, 0.0, 0.036])
+    vel = np.zeros(3)
+    zg = sm._update_z_grasp(obj.copy(), obj)
+    ee = _riding(sm, np.array([obj[0] + 0.001, obj[1], zg]), vel)
+    # First two in-gate ticks: still intercept.
+    assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_APPROACH
+    ee = _riding(sm, ee, vel)
+    assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_APPROACH
+    # Third consecutive: CLOSE.
+    ee = _riding(sm, ee, vel)
+    assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_CLOSE
+
+
 def test_close_rides_object_xy(sm):
-    """During CLOSE the hand tracks the moving object (tau lead), not a freeze."""
+    """During CLOSE the hand rides with τ lead (speed match once settled)."""
     sm.stage = STAGE_CLOSE
     sm.z_grasp = 0.036
     sm.timer_s = 0.0
@@ -164,8 +217,8 @@ def test_close_rides_object_xy(sm):
     # Physics: coast until fingers shut; free only after finger_close_s.
     assert sm.physics_grasp
     assert not cmd.attach_object and cmd.kinematic_object
-    # Aim ahead of the object by ~tau * speed (lag pad), not stuck at ee XY.
-    assert cmd.position[0] > obj[0] + 0.05
+    expect_x = float(obj[0] + vel[0] * sm.tau)
+    assert cmd.position[0] == pytest.approx(expect_x, abs=1e-6)
     assert cmd.position[2] == pytest.approx(0.036, abs=1e-6)
     # After finger travel, free to PhysX (attach).
     sm.stage = STAGE_CLOSE
@@ -233,10 +286,29 @@ def test_chase_gate_is_measured_against_the_object_not_the_aim(sm):
     obj = np.array([0.55, 0.0, 0.03])
     vel = np.array([0.80, 0.0, 0.0])
     zg = sm._update_z_grasp(obj.copy(), obj)
-    ee = np.array([obj[0], obj[1], zg])
+    ee = _riding(sm, np.array([obj[0], obj[1], zg]), vel)
     cmd = sm.step(_state(obj, vel), ee, sm._down_quat)
     assert cmd.stage == STAGE_CLOSE
     assert sm.grasp_err_xy is not None and sm.grasp_err_xy < 1e-6
+
+
+def test_close_waits_for_speed_match(sm):
+    """B3: on the object but slower than it → keep riding; matched → CLOSE."""
+    assert sm.close_speed_gate  # claim_timing.close_speed_guard: true
+    sm.stage = STAGE_APPROACH
+    obj = np.array([0.55, 0.0, 0.03])
+    vel = np.array([0.30, 0.0, 0.0])
+    zg = sm._update_z_grasp(obj.copy(), obj)
+    ee = np.array([obj[0], obj[1], zg])
+    # First tick: no hand velocity yet → no close.
+    sm._prev_ee = None
+    assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_APPROACH
+    # Hand at 25 cm/s under a 30 cm/s object: Δv·80 ms = 4 mm > 2.5 mm → wait.
+    sm._prev_ee = ee - np.array([0.25, 0.0, 0.0]) * sm.dt
+    assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_APPROACH
+    # Hand at 29 cm/s: 0.8 mm → close.
+    sm._prev_ee = ee - np.array([0.29, 0.0, 0.0]) * sm.dt
+    assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_CLOSE
 
 
 def test_grasp_xyz_ok_is_a_box(sm):
@@ -604,3 +676,23 @@ def test_release_drag_rule_needs_the_hand_to_move():
     sweeping_hand = np.array([[0.49 - 0.015 * i, -0.207, 0.09 + 0.005 * i] for i in range(7)])
     dragged = np.array([[0.49 - 0.015 * i, -0.207, 0.035] for i in range(7)])
     assert release_disturbed(stage, dragged, sweeping_hand)
+
+
+def test_slip_check_uses_hand_at_observation_time(sm):
+    """B1: a held object seen Δ late trails the live hand; that is not a slip."""
+    sm.stage = STAGE_CARRY
+    sm.lift_z = 0.15
+    vel = np.array([0.0, 0.40, 0.0])  # carrying at 40 cm/s
+    delta = 0.30
+    k = int(round(delta / sm.dt))
+    ees = [np.array([0.5, 0.0 + 0.40 * sm.dt * i, 0.15]) for i in range(k + 5)]
+    cmd = None
+    for i, ee in enumerate(ees):
+        # Delayed frame: object sat in the hand k ticks ago (12 cm behind now).
+        obj = ees[max(i - k, 0)]
+        cmd = sm.step(_state(obj, vel), ee, sm._down_quat, delta_meas_s=delta)
+    assert cmd.stage == STAGE_CARRY
+    # A real slip (object left behind 15 cm from where the hand was) still triggers.
+    far = ees[-1 - k] + np.array([0.0, -0.15, -0.10])
+    cmd = sm.step(_state(far, np.zeros(3)), ees[-1] + [0, 0.40 * sm.dt, 0], sm._down_quat, delta_meas_s=delta)
+    assert cmd.stage != STAGE_CARRY
