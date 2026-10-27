@@ -86,5 +86,7 @@ Fix 2 / tip lag.
 
 ## Commit
 
-See `git log -1 --format=%H` after commit (hash stamped below once
-committed).
+`0db0c8fb34786087bdf2278bc7090f91aefef684`
+
+Tracked copy of this report: `eval/FIX1_STATIC_OFFSET_REPORT.md`
+(data/ is gitignored).
