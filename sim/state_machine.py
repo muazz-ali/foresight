@@ -186,6 +186,23 @@ class PickPlaceStateMachine:
         self.grasp_xyz_ok = np.asarray(ok, dtype=np.float64).reshape(3)
         self.grasp_xy_tol = float(max(self.grasp_xyz_ok[0], self.grasp_xyz_ok[1]))
         self.grasp_z_tol = float(self.grasp_xyz_ok[2])
+        # B5: CLOSE only when |dx|,|dy| ≤ this (default 2 mm). Chase uses grasp_xyz_ok.
+        self.close_xy_ok = float(self._p.get("close_xy_ok", 0.002))
+        # Ride correction gain: inside the chase box aim += k·(object_now − hand).
+        # The fixed tip-lag lead leaves a speed/heading-dependent residual (2–4 mm
+        # at 30 cm/s on diagonal throws) that sat just outside close_xy_ok, so the
+        # hand never closed (B1 smoke). 0 = off (old behaviour).
+        self.ride_k = float(self._p.get("ride_correction_gain", 0.0))
+        # CLOSE also needs |dz| ≤ close_z_ok (default = chase-box z, old behaviour)
+        # and the close gate to hold for close_settle_ticks ticks in a row, so a
+        # hand sweeping through the 2 mm box does not close mid-pass.
+        self.close_z_ok = float(self._p.get("close_z_ok", self.grasp_z_tol))
+        self.close_settle_ticks = int(self._p.get("close_settle_ticks", 1))
+        self._settle_count = 0
+        # B3: CLOSE only when |v_hand − v_obj|_xy × t_close ≤ 2.5 mm as well
+        # (claim_timing.close_speed_guard). The hand keeps riding until it matches.
+        ct = cfg.get("claim_timing") if isinstance(cfg.get("claim_timing"), dict) else {}
+        self.close_speed_gate = bool(ct.get("close_speed_guard", False))
         # Carry / lower / lift *arrival* height — looser than the grasp close gate.
         # Held hands settle ~12–15 mm above the drop command; 15 mm made lowers stall.
         self.place_z_tol = self._f("place_z_tol", 0.03)
@@ -210,11 +227,23 @@ class PickPlaceStateMachine:
         self.close_at_object_center = bool(ch.get("close_at_object_center", True))
         self.pack_z_from_depth = bool(ch.get("pack_z_from_depth", True))
         self.depth_rmse_max_m = float(ch.get("depth_rmse_max_m", 0.01))
+        # A4: add onto wrist z_top (yaml depth_z_bias_mm → depth_z_bias_m).
+        self.depth_z_bias_m = float(ch.get("depth_z_bias_m", 0.0))
         if float(self._z_latch.insert_m) <= 0.015:
             self._z_latch.insert_m = float(self._obj_half_h)
         # Fallback if live cam pose is missing (hand cam above TCP).
-        tcp = robot.get("tcp_offset") or [0.0, 0.0, 0.107]
-        self._wrist_cam_above_tcp_m = float(tcp[2]) if len(tcp) >= 3 else 0.107
+        tcp = robot.get("tcp_offset") or [0.0, 0.0, 0.1034]
+        self._wrist_cam_above_tcp_m = float(tcp[2]) if len(tcp) >= 3 else 0.1034
+        # Wrist point cloud (A4): intrinsics + mount + TCP from the yaml.
+        from interfaces.grasp_height import wrist_intrinsics
+
+        wc = cfg.get("wrist_camera") or {}
+        self._wrist_K = wrist_intrinsics(cfg)
+        self._tcp_offset_m = np.asarray(tcp, dtype=np.float64).reshape(3)
+        self._wrist_pos_m = np.asarray(wc.get("pos", [0.065, 0.0, 0.0]), dtype=np.float64)
+        self._wrist_quat = np.asarray(
+            wc.get("quat_wxyz", [0.0, 0.7071068, 0.7071068, 0.0]), dtype=np.float64
+        )
         self.p_hat_z: float | None = None  # pack height (depth or centre)
         # Wrist depth close gate (m). 0 = off (use GT / latched z_grasp). Needs a depth reading.
         self.close_depth_m = self._f("close_depth_m", 0.0)
@@ -238,13 +267,40 @@ class PickPlaceStateMachine:
         self.physics_grasp = not bool(scene.get("use_weld_grasp", False))
         # Finger travel time (robot). Physics close waits this long before freeing
         # the object to PhysX so the pads are already shut (else ≥50 cm/s slips).
-        self.finger_close_s = float(robot.get("gripper_close_time_s", 0.08))
+        self.finger_close_s = float(robot.get("gripper_close_time_s", 0.180))
+        # Pad-contact time for the predictive close gate (cmd + travel, no force).
+        from sim.gripper_actuator import nominal_t_contact_s
+
+        ga = robot.get("gripper_actuator") if isinstance(robot.get("gripper_actuator"), dict) else {}
+        # Prefer explicit ms/s keys; else actuator nominal (≈130 ms).
+        if "t_contact_s" in ga:
+            self.t_contact_s = float(ga["t_contact_s"])
+        elif "t_contact_ms" in ga:
+            self.t_contact_s = float(ga["t_contact_ms"]) * 1e-3
+        else:
+            kwargs = {}
+            if "v_finger_mm_s" in ga:
+                kwargs["v_finger_m_s"] = float(ga["v_finger_mm_s"]) * 1e-3
+            if "t_cmd_ms" in ga:
+                kwargs["t_cmd_s"] = float(ga["t_cmd_ms"]) * 1e-3
+            self.t_contact_s = float(nominal_t_contact_s(**kwargs))
         if self.physics_grasp:
             # Fingers need the longer dwell before lift starts.
             self.close_gripper_s = self._f("physics_close_s")
             # Dwell must cover finger travel + a squeeze beat.
             if self.close_gripper_s < self.finger_close_s + 0.15:
                 self.close_gripper_s = self.finger_close_s + 0.15
+
+        # B1: count every GT fallback (z_top / XY / vel / Δ). Must stay 0 for a valid run.
+        self.gt_fallback = {"z_top": 0, "object_xy": 0, "velocity": 0, "delta": 0}
+        # When True, delayed GT top is the oracle z channel (not a fallback).
+        self.oracle_z_top: bool = False
+        # Ride |Δv| samples while chasing (C30 pre-check).
+        self.ride_dv_cms: list[float] = []
+        # Pre-shape open fraction (1 = fully open). Set per episode from w_pre.
+        self.pre_shape_open: float = 1.0
+        self.w_pre_clamped: bool = False
+        self.w_pre_m: float | None = None
 
         # Placeholders. The episode loop calls set_box_poses() each episode with
         # the real box location.
@@ -393,6 +449,24 @@ class PickPlaceStateMachine:
         self.grasp_err_xy: float | None = None
         self.grasp_err_z: float | None = None
         self.grasp_speed: float | None = None
+        self._prev_ee: np.ndarray | None = None  # last tick's hand (B3 speed gate)
+        self._settle_count = 0  # consecutive ticks inside the close gate
+        # Hand poses, one per tick (newest last): the slip check compares a delayed
+        # object frame with the hand at that frame's time, not the live hand.
+        self._ee_hist: list[np.ndarray] = []
+        self.gt_fallback = {"z_top": 0, "object_xy": 0, "velocity": 0, "delta": 0}
+        self.ride_dv_cms = []
+        # Per-close diagnostics for B1 JSONL.
+        self.close_xy_err_m: float | None = None
+        self.close_z_err_m: float | None = None
+        self.dv_at_close_m_s: float | None = None
+        self.t_lag_meas_s: float | None = None
+
+    def set_pre_shape(self, open_frac: float, *, w_pre_m: float | None = None, clamped: bool = False) -> None:
+        """Set approach gripper opening (0=shut, 1=full). Call once per episode from w_pre."""
+        self.pre_shape_open = float(np.clip(open_frac, 0.0, 1.0))
+        self.w_pre_m = None if w_pre_m is None else float(w_pre_m)
+        self.w_pre_clamped = bool(clamped)
 
     def grasp_report(self) -> dict:
         """Per-episode grasp quality. ``None`` until CLOSE fires.
@@ -405,6 +479,17 @@ class PickPlaceStateMachine:
             "grasp_speed_m_s": self.grasp_speed,
             "z_grasp": self.z_grasp,
             "retries": int(self.retries),
+            "gt_fallback": dict(self.gt_fallback),
+            "gt_fallback_count": int(sum(self.gt_fallback.values())),
+            "ride_dv_cms_median": (
+                float(np.median(self.ride_dv_cms)) if self.ride_dv_cms else None
+            ),
+            "w_pre_m": self.w_pre_m,
+            "w_pre_clamped": bool(self.w_pre_clamped),
+            "close_xy_err_m": self.close_xy_err_m,
+            "close_z_err_m": self.close_z_err_m,
+            "dv_at_close_m_s": self.dv_at_close_m_s,
+            "t_lag_meas_s": self.t_lag_meas_s,
         }
 
     # -------------------------------------------------------------- helpers
@@ -504,18 +589,28 @@ class PickPlaceStateMachine:
             fuse_z_top,
             z_top_from_gt_center,
             z_top_from_static_depth,
-            z_top_from_wrist_depth,
+            z_top_from_wrist_cloud,
         )
 
         ee_z = float(ee[2])
         wrist_z = float("nan")
         if wrist_depth is not None and ee_quat is not None:
-            wrist_z = z_top_from_wrist_depth(
+            # Whole-image lift around the object XY (not a fixed finger window):
+            # sees the object from the start of the approach (A4).
+            f_px, cx, cy = self._wrist_K
+            wrist_z = z_top_from_wrist_cloud(
                 wrist_depth,
                 ee,
                 ee_quat,
-                cam_z=wrist_cam_z,
-                cam_above_tcp_m=float(self._wrist_cam_above_tcp_m),
+                obj[:2],
+                f_px=f_px,
+                cx=cx,
+                cy=cy,
+                z_table=float(self._z_latch.z_table),
+                tcp_offset_m=self._tcp_offset_m,
+                wrist_pos_m=self._wrist_pos_m,
+                wrist_quat_wxyz=self._wrist_quat,
+                z_bias_m=float(self.depth_z_bias_m),
             )
             if not self._plausible_z_top(wrist_z, ee_z):
                 wrist_z = float("nan")
@@ -557,6 +652,8 @@ class PickPlaceStateMachine:
         """Refresh expert aim Z and pack p̂z; return the aim height.
 
         * Expert aim (``z_grasp``): object centre when ``close_at_object_center``.
+          DiffIK TCP = pad pinch (``tcp_offset`` Z = 103.4 mm), so commanding
+          ``z_grasp`` puts the pinch on the object centre — not the old 107 mm TCP.
         * Pack (``p_hat_z``): wrist-depth latch when ``pack_z_from_depth`` (gap
           ≥ 7 cm collect / lock below) so training sees estimated height, not GT.
         """
@@ -567,11 +664,18 @@ class PickPlaceStateMachine:
         )
         if np.isfinite(z_top):
             depth_zg = self._z_latch.update(z_top=z_top, ee_z=ee_z)
-        else:
-            # No good depth this frame: keep latch ticking with GT top so lock
-            # still has samples if the hand never saw a clean wrist crop.
+        elif bool(getattr(self, "oracle_z_top", False)):
+            # B1 oracle: delayed GT centre+half-height is the intended z_top
+            # channel (same as delayed XY/vel), not a sensor fallback.
             from interfaces.grasp_height import z_top_from_gt_center
 
+            gt_top = z_top_from_gt_center(center, half_height_m=float(self._obj_half_h))
+            depth_zg = self._z_latch.update(z_top=gt_top, ee_z=ee_z)
+        else:
+            # No good depth: GT top keeps the latch alive — counts as fallback.
+            from interfaces.grasp_height import z_top_from_gt_center
+
+            self.gt_fallback["z_top"] = int(self.gt_fallback.get("z_top", 0)) + 1
             gt_top = z_top_from_gt_center(center, half_height_m=float(self._obj_half_h))
             depth_zg = self._z_latch.update(z_top=gt_top, ee_z=ee_z)
 
@@ -656,6 +760,7 @@ class PickPlaceStateMachine:
         give up and go home so the run still finishes.
         """
         self.retries += 1
+        self._settle_count = 0
         self.timer_s = 0.0
         if self.retries > self.max_retries:
             logger.info("    %s; out of retries (%d), going home", why, self.max_retries)
@@ -675,13 +780,17 @@ class PickPlaceStateMachine:
         static_depth_img: np.ndarray | None = None,
         static_cam_z: float | None = None,
         wrist_cam_z: float | None = None,
+        *,
+        delta_meas_s: float | None = None,
+        forecast_off: bool = False,
     ) -> ExpertCommand:
         """Advance one control step. Returns the EE command for this tick.
 
-        Input is the TRUE object state from the sim (not a camera guess). Each
-        stage block below sets the hand target and decides when to move on.
-        ``wrist_depth_m``: nearest depth (logs). ``wrist_depth_img`` /
-        ``static_depth_img``: depth maps. ``wrist_cam_z``: live cam world Z.
+        ``state`` must be the delayed observation pack for B1 (GT at t−Δ), not
+        live GT. Live proprio (``ee_pos`` / ``ee_quat``) is fine.
+
+        ``delta_meas_s``: when set, intercept lead is Δ_meas + tip_lag (+ dt when
+        far). ``forecast_off``: aim at the delayed position p (negative control).
         """
         ee = np.asarray(ee_pos, dtype=np.float64).reshape(3)
         ee_q = np.asarray(ee_quat, dtype=np.float64).reshape(4)
@@ -689,10 +798,25 @@ class PickPlaceStateMachine:
         vel = np.asarray(state.velocity, dtype=np.float64).reshape(3)
         speed = float(np.linalg.norm(vel))
         prev_stage = self.stage
+        # Hand velocity from the previous tick's pose (B3 close gate).
+        v_hand = None if self._prev_ee is None else (ee - self._prev_ee) / max(self.dt, 1e-6)
+        self._prev_ee = ee.copy()
+        self._ee_hist.append(ee.copy())
+        del self._ee_hist[:-90]  # keep 3 s at 30 Hz (Δ ≤ 300 ms needs 10)
+        # Hand when the observed frame was taken (Δ_meas ago; live when no delay).
+        k_obs = 0 if delta_meas_s is None else int(round(float(delta_meas_s) / self.dt))
+        ee_obs = self._ee_hist[-1 - min(k_obs, len(self._ee_hist) - 1)]
 
-        # Defaults each tick: fingers open, object slides on the table, not held,
-        # not frozen. Stages below override only what they need.
-        grip, kin, attach, freeze = 1.0, True, False, False
+        # B1: τ_k = Δ_meas + tip_lag + dt (dt = one ZOH step, same as legacy tau
+        # when Δ=0 so the calibrated 175 ms pad still lands the hand on the object).
+        if delta_meas_s is not None:
+            base_tau = float(delta_meas_s) + float(self.robot_approach_pad_s) + float(self.dt)
+        else:
+            base_tau = float(self.tau)
+
+        # Defaults each tick: pre-shape open (not fully open), object slides,
+        # not held, not frozen. Stages below override only what they need.
+        grip, kin, attach, freeze = float(self.pre_shape_open), True, False, False
         target = ee.copy()  # default = stay put
         quat = self._down_quat.copy()
         if self.grasp_yaw_mode == "along" and self.stage in (STAGE_APPROACH, STAGE_DESCEND, STAGE_CLOSE, STAGE_LIFT):
@@ -737,17 +861,76 @@ class PickPlaceStateMachine:
                     static_cam_z=static_cam_z,
                     wrist_cam_z=wrist_cam_z,
                 )
-                lead_s = self._intercept_lead_s(ee, obj, vel, goal_z=target_z)
-                aim = self._clip_aim_xy(self._forecast(obj, vel, lead_s))
+                # Delayed obs is at t−Δ. Gate/settle against where the object is
+                # *now* (p + v·Δ_meas). Aim still leads by tip_lag on top of that.
+                # forecast_off: gate against delayed p so the negative control misses.
+                if bool(forecast_off) or delta_meas_s is None:
+                    obj_now = obj
+                else:
+                    obj_now = self._forecast(obj, vel, float(delta_meas_s))
+                near_ok, err_xy, err_z = self._grasp_gate_ok(
+                    ee, obj_now, wrist_depth_m, goal_z=target_z
+                )
+                # Inside the chase box: ride with base_tau. Far: full intercept
+                # on top of that lead. forecast_off → aim at delayed p (B1 neg).
+                if bool(forecast_off):
+                    lead_s = 0.0
+                elif near_ok:
+                    lead_s = float(base_tau)
+                else:
+                    lead_s = self._intercept_lead_s(ee, obj, vel, goal_z=target_z)
+                    if delta_meas_s is not None:
+                        # Intercept solve already includes tip pad; add measured Δ.
+                        lead_s = float(lead_s) + float(delta_meas_s)
+                aim = np.array(self._forecast(obj, vel, lead_s), dtype=np.float64)
+                if near_ok and not bool(forecast_off) and self.ride_k > 0.0:
+                    aim[:2] = aim[:2] + self.ride_k * (obj_now[:2] - ee[:2])
+                aim = self._clip_aim_xy(aim)
                 target = np.array([aim[0], aim[1], target_z], dtype=np.float64)
 
-                gate_ok, err_xy, err_z = self._grasp_gate_ok(
-                    ee, obj, wrist_depth_m, goal_z=target_z
-                )
-                if gate_ok:
+                err_dx = abs(float(ee[0] - obj_now[0]))
+                err_dy = abs(float(ee[1] - obj_now[1]))
+                # C30 pre-check: score |Δv| only in the tight ride (≤ 3× close_xy),
+                # not while still catching up inside the larger chase box.
+                if (
+                    near_ok
+                    and v_hand is not None
+                    and err_dx <= 3.0 * float(self.close_xy_ok)
+                    and err_dy <= 3.0 * float(self.close_xy_ok)
+                ):
+                    self.ride_dv_cms.append(
+                        100.0 * float(np.linalg.norm(v_hand[:2] - vel[:2]))
+                    )
+                # Predictive close: |e + Δv·t_contact| ≤ 2 mm and |Δv| ≤ 1.39 cm/s.
+                # e = hand − object (+ = hand ahead). Need a hand-speed sample
+                # when the speed gate is on (first tick after reset has none).
+                settled = near_ok and err_z <= float(self.close_z_ok)
+                if settled and v_hand is not None:
+                    from control.close_guard import predictive_close_check
+
+                    pred = predictive_close_check(
+                        ee[:2],
+                        obj_now[:2],
+                        v_hand[:2],
+                        vel[:2],
+                        t_contact_s=float(self.t_contact_s),
+                        xy_ok_m=float(self.close_xy_ok),
+                        close_time_s=float(self.finger_close_s),
+                    )
+                    settled = bool(pred.ok) if self.close_speed_gate else bool(pred.ok_xy)
+                elif settled and self.close_speed_gate:
+                    settled = False
+                elif settled:
+                    settled = (
+                        err_dx <= float(self.close_xy_ok)
+                        and err_dy <= float(self.close_xy_ok)
+                    )
+                self._settle_count = self._settle_count + 1 if settled else 0
+                settled = self._settle_count >= max(1, self.close_settle_ticks)
+                if settled:
                     logger.info(
                         "    grasp gate: XY %.1f cm, Z %.1f cm, speed %.0f cm/s, "
-                        "lead %.0f ms",
+                        "settle lead %.0f ms",
                         100.0 * err_xy,
                         100.0 * err_z,
                         100.0 * speed,
@@ -757,9 +940,30 @@ class PickPlaceStateMachine:
                     self.grasp_err_z = err_z
                     self.grasp_speed = speed
                     self.grasp_xy = obj[:2].copy()
+                    self.close_xy_err_m = float(err_xy)
+                    self.close_z_err_m = float(err_z)
+                    if v_hand is not None:
+                        self.dv_at_close_m_s = float(np.linalg.norm(v_hand[:2] - vel[:2]))
+                    # Tip lag ≈ hand trail / speed along motion (when moving).
+                    if speed > 0.02 and v_hand is not None:
+                        # Along-track lag: (obj − hand) · v_hat / |v|
+                        vhat = vel[:2] / max(speed, 1e-6)
+                        trail = float(np.dot((obj[:2] - ee[:2]), vhat))
+                        self.t_lag_meas_s = trail / speed
                     self.lift_z = float(ee[2]) + self.lift_height
                     self.stage = STAGE_CLOSE
                     self.timer_s = 0.0
+                    # Same-tick CLOSE: elif below will not run this frame, so shut
+                    # the command now (else the log still shows pre-shape open).
+                    grip = 0.0
+                    close_lead = 0.0 if bool(forecast_off) else float(base_tau)
+                    aim = self._clip_aim_xy(self._forecast(obj, vel, close_lead))
+                    z_close = float(self.z_grasp) if self.z_grasp is not None else float(obj[2])
+                    target = np.array([aim[0], aim[1], z_close], dtype=np.float64)
+                    if self.physics_grasp:
+                        attach, kin = False, True
+                    else:
+                        attach, kin = True, False
                 elif self.timer_s > self.grasp_stage_timeout_s:
                     self._restart_approach("could not reach grasp gate")
 
@@ -767,9 +971,11 @@ class PickPlaceStateMachine:
         # weld mode glues the object to the hand; physics mode frees it to PhysX
         # and the fingers squeeze it. Same flag, the scene decides (sim/scene.py).
         elif self.stage == STAGE_CLOSE:
-            # Ride XY with tau so ≥50 cm/s throws stay in the fingers while they shut.
+            # Ride with base_tau (same as settle): the command does not jump at
+            # the transition, so the hand keeps ~v_obj while the fingers shut.
             grip = 0.0
-            aim = self._clip_aim_xy(self._forecast(obj, vel, self.tau))
+            close_lead = 0.0 if bool(forecast_off) else float(base_tau)
+            aim = self._clip_aim_xy(self._forecast(obj, vel, close_lead))
             z_close = float(self.z_grasp) if self.z_grasp is not None else float(obj[2])
             target = np.array([aim[0], aim[1], z_close], dtype=np.float64)
             if self.physics_grasp and self.timer_s < self.finger_close_s:
@@ -785,10 +991,12 @@ class PickPlaceStateMachine:
         # Physics grasp can lose the object. Held but far from the hand → try again
         # only while the object is still in the catch box. Near the base / past the
         # aim walls, a re-chase caused ee-off-table (seeds 1502/1504/1505).
+        # Delayed obs: a held object trails the live hand by v_hand·Δ (10–25 cm at
+        # Δ = 300 ms while carrying), so compare with the hand at the frame's time.
         elif self.stage in (STAGE_LIFT, STAGE_CARRY, STAGE_LOWER) and (
-            float(np.linalg.norm(obj - ee)) > self.slip_dist_m
+            float(np.linalg.norm(obj - ee_obs)) > self.slip_dist_m
         ):
-            gap_cm = 100.0 * float(np.linalg.norm(obj - ee))
+            gap_cm = 100.0 * float(np.linalg.norm(obj - ee_obs))
             near_keepout = False
             if self._aim_xy is not None:
                 (ax0, ax1), (ay0, ay1) = self._aim_xy

@@ -53,7 +53,9 @@ wrist_camera:
 # =============================================================================
 robot:
   name: franka
-  tcp_offset_mm: [0.0, 0.0, 107.0]   # DiffIK default from panda_hand
+  # Pad midpoint (URDF pinch Z=103.4 mm), not the old DiffIK TCP 107 mm.
+  # Aim / ee_pos / closed_above all use this frame so Z targets the pinch.
+  tcp_offset_mm: [0.0, 0.0, 103.4]
   gripper_open_mm: 40.0
   gripper_close_mm: 0.0
   init_pose_mm: [450.0, 0.0, 400.0, 0.0, 1.0, 0.0, 0.0]  # xyz + quat wxyz
@@ -182,11 +184,9 @@ state_machine_params:
   # never-closed throws into 5–8 mm closes; a 5 mm z gate + 2-tick settle did not
   # help. Kept as knobs: ride_correction_gain (0), close_z_ok_mm (= chase-box z).
   ride_correction_gain: 0.0
-  # Fix1: close_xy_ok stays 2 mm, but require N ticks in a row inside that box.
-  # With N=1 the hand closed on first entry (~1.6 mm short on the DiffIK
-  # approach). N=15 ≈ 0.5 s at 30 Hz lets the hand finish settling (~0.3 mm)
-  # before CLOSE. Does not change tip_lag / close_xy_ok / speed gate.
-  close_settle_ticks: 15
+  # Predictive close (Fix1 closeout): |e + Δv·t_contact| ≤ close_xy_ok and
+  # |Δv| ≤ 1.39 cm/s. t_contact ≈ 130 ms from the actuator model. Keep ticks=1.
+  close_settle_ticks: 1
 
   # --- stage 3: close ---
   # Dwell after close (not finger travel = robot.gripper_close_time_ms).

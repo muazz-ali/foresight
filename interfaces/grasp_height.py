@@ -31,9 +31,18 @@ DEFAULT_CLEAR_M = 0.005  # c: 5 mm above table
 DEFAULT_Z_SLACK_M = 0.005  # s_z: 5 mm vertical slack
 DEFAULT_LATCH_LO_M = 0.10  # lock when hand–top gap drops below this
 DEFAULT_LATCH_HI_M = 0.20  # collect while gap is at or above this
-DEFAULT_DEPTH_PERCENTILE = 90.0  # high percentile, not max (outliers)
+DEFAULT_DEPTH_PERCENTILE = 90.0  # high → near-side depth via 100−p (outliers)
 # Cap how many approach samples we keep (~2 s at 30 Hz) so old heights fade.
 DEFAULT_MAX_SAMPLES = 60
+# Franka defaults: TCP from panda_hand; wrist cam on the hand (phase0_cfg.yaml).
+# Pad midpoint (pinch) in panda_hand — matches robot.tcp_offset_mm after Fix1.
+DEFAULT_TCP_OFFSET_M = np.array([0.0, 0.0, 0.1034], dtype=np.float64)
+DEFAULT_WRIST_POS_M = np.array([0.065, 0.0, 0.0], dtype=np.float64)
+DEFAULT_WRIST_QUAT_WXYZ = np.array([0.0, 0.7071068, 0.7071068, 0.0], dtype=np.float64)
+# Skip depths closer than this (fingers). Reject the frame if the near cluster
+# is too mixed (table+object) — A4: latch σ ≤ 2 mm needs this gate.
+DEFAULT_FINGER_MAX_M = 0.05
+DEFAULT_MAX_SPREAD_M = 0.010
 
 
 def z_grasp_m(
@@ -56,30 +65,81 @@ def z_top_from_gt_center(
     return float(z_center) + float(half_height_m)
 
 
+def quat_wxyz_to_rotmat(q: np.ndarray) -> np.ndarray:
+    """Unit quaternion (w,x,y,z) → 3×3 rotation matrix."""
+    w, x, y, z = np.asarray(q, dtype=np.float64).reshape(4)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def wrist_cam_pose_from_ee(
+    ee_pos: np.ndarray,
+    ee_quat_wxyz: np.ndarray,
+    *,
+    tcp_offset_m: np.ndarray | None = None,
+    wrist_pos_m: np.ndarray | None = None,
+    wrist_quat_wxyz: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """World (cam_pos, look_unit) of the wrist cam from TCP pose + known offsets.
+
+    TCP = panda_hand ⊕ tcp_offset. Cam = panda_hand ⊕ wrist_pos (OpenGL −Z look
+    after wrist_quat). Use this when ``Camera.data.pos_w`` is stale (common).
+    """
+    tcp = np.asarray(
+        DEFAULT_TCP_OFFSET_M if tcp_offset_m is None else tcp_offset_m, dtype=np.float64
+    ).reshape(3)
+    wpos = np.asarray(
+        DEFAULT_WRIST_POS_M if wrist_pos_m is None else wrist_pos_m, dtype=np.float64
+    ).reshape(3)
+    wq = np.asarray(
+        DEFAULT_WRIST_QUAT_WXYZ if wrist_quat_wxyz is None else wrist_quat_wxyz,
+        dtype=np.float64,
+    ).reshape(4)
+    ee = np.asarray(ee_pos, dtype=np.float64).reshape(3)
+    R = quat_wxyz_to_rotmat(ee_quat_wxyz)
+    # ee_quat ≈ hand quat when tcp quat is identity (our DiffIK default).
+    hand_pos = ee - R @ tcp
+    cam_pos = hand_pos + R @ wpos
+    look = -(R @ quat_wxyz_to_rotmat(wq))[:, 2]
+    n = float(np.linalg.norm(look))
+    if n > 1e-9:
+        look = look / n
+    return cam_pos, look
+
+
 def z_top_from_wrist_depth(
     depth: np.ndarray | None,
     ee_pos: np.ndarray,
     ee_quat_wxyz: np.ndarray,
     *,
     cam_z: float | None = None,
-    cam_above_tcp_m: float = 0.107,
+    cam_above_tcp_m: float = 0.1034,
     percentile: float = DEFAULT_DEPTH_PERCENTILE,
     rows: tuple[float, float] = (0.55, 0.95),
     cols: tuple[float, float] = (0.30, 0.70),
+    finger_max_m: float = DEFAULT_FINGER_MAX_M,
+    max_spread_m: float = DEFAULT_MAX_SPREAD_M,
+    tcp_offset_m: np.ndarray | None = None,
+    wrist_pos_m: np.ndarray | None = None,
+    z_bias_m: float = 0.0,
 ) -> float:
     """Object top Z from wrist depth image (metres, world frame).
 
-    Takes a high percentile of valid depths in the finger window (not the single
-    minimum/maximum — those are noisy). Depth is distance along the camera look.
+    Near-side percentile in the finger/object window. Prefer live ``cam_z``;
+    else lift from TCP⊕hand⊕wrist offsets (not bare ``ee_z`` — that was ~12 cm
+    low). Reject the frame when the near-depth cluster is mixed (table+object):
+    ``std(depths ≤ depth_top+2 cm) > max_spread_m`` → NaN so the latch skips it.
+    ``z_bias_m`` (claim_height.depth_z_bias) is added last — A4 fruit latch was
+    ~6.7 mm low; set the yaml knob from that report, do not invent per-frame.
 
-    Prefer real ``cam_z`` from ``scene.get_wrist_cam_pose()``. Fallback:
-    ``ee_z + cam_above_tcp_m`` (Franka hand cam is above the TCP). Using plain
-    ``ee_z − depth`` was ~12 cm too low.
-
-    ``ee_quat_wxyz`` reserved for a full cam-ray lift later.
     Returns NaN if there is no usable depth.
     """
-    del ee_quat_wxyz  # full optical-axis lift later; Z-down approx is enough now
     if depth is None:
         return float("nan")
     d = np.asarray(depth, dtype=np.float64)
@@ -92,18 +152,127 @@ def z_top_from_wrist_depth(
         int(h * rows[0]) : int(h * rows[1]),
         int(w * cols[0]) : int(w * cols[1]),
     ]
-    ok = crop[np.isfinite(crop) & (crop > 0.05) & (crop < 2.0)]  # D405 useful band
+    # D405 band; drop finger-close hits so the near percentile is the object top.
+    ok = crop[
+        np.isfinite(crop)
+        & (crop > float(finger_max_m))
+        & (crop < 2.0)
+    ]
     if ok.size < 8:
         return float("nan")
-    # Nearer = smaller depth. High percentile of *near* side ≈ top surface toward cam.
-    # Use low percentile of depth (closer points) as the top facing the wrist.
+    # Nearer = smaller depth. yaml percentile 90 → use 10th percentile of depth.
     depth_top = float(np.percentile(ok, 100.0 - float(percentile)))
-    ee = np.asarray(ee_pos, dtype=np.float64).reshape(3)
+    near = ok[ok <= depth_top + 0.02]
+    if (
+        float(max_spread_m) > 0.0
+        and near.size >= 8
+        and float(np.std(near)) > float(max_spread_m)
+    ):
+        return float("nan")
+
     if cam_z is not None and np.isfinite(float(cam_z)):
         cz = float(cam_z)
+        look_z = -1.0
     else:
-        cz = float(ee[2]) + float(cam_above_tcp_m)
-    return float(cz - depth_top)
+        # Geometric cam from EE (fixes stale Camera.data.pos_w in logs).
+        tcp = (
+            np.asarray(tcp_offset_m, dtype=np.float64).reshape(3)
+            if tcp_offset_m is not None
+            else DEFAULT_TCP_OFFSET_M.copy()
+        )
+        # Legacy kw: only Z of tcp when caller still passes cam_above_tcp_m alone.
+        if tcp_offset_m is None and abs(float(cam_above_tcp_m) - 0.107) > 1e-9:
+            tcp = np.array([0.0, 0.0, float(cam_above_tcp_m)], dtype=np.float64)
+        cam_pos, look = wrist_cam_pose_from_ee(
+            ee_pos,
+            ee_quat_wxyz,
+            tcp_offset_m=tcp,
+            wrist_pos_m=wrist_pos_m,
+        )
+        cz = float(cam_pos[2])
+        look_z = float(look[2])
+    # OpenGL look ≈ −Z when hanging down: z_top = cam_z − depth.
+    if look_z < -0.5:
+        z_top = float(cz - depth_top)
+    else:
+        z_top = float(cz + depth_top * look_z)
+    return z_top + float(z_bias_m)
+
+
+def wrist_intrinsics(cfg: dict) -> tuple[float, float, float]:
+    """(f_px, cx, cy) of the wrist camera from ``wrist_camera`` (square pixels)."""
+    wc = cfg.get("wrist_camera") or {}
+    w, h = int(wc.get("width", 480)), int(wc.get("height", 360))
+    f_px = float(wc.get("focal_length", 2.3)) / float(wc.get("horizontal_aperture", 4.6)) * w
+    return f_px, w / 2.0, h / 2.0
+
+
+def z_top_from_wrist_cloud(
+    depth: np.ndarray | None,
+    ee_pos: np.ndarray,
+    ee_quat_wxyz: np.ndarray,
+    obj_xy: np.ndarray,
+    *,
+    f_px: float,
+    cx: float,
+    cy: float,
+    z_table: float = 0.0,
+    tcp_offset_m: np.ndarray | None = None,
+    wrist_pos_m: np.ndarray | None = None,
+    wrist_quat_wxyz: np.ndarray | None = None,
+    radius_m: float = 0.04,
+    percentile: float = 99.0,
+    min_points: int = 20,
+    stride: int = 2,
+    z_bias_m: float = 0.0,
+    top_frac: float = 0.05,
+    use_top_median: bool = True,
+) -> float:
+    """Object top Z (world, m) from the whole wrist depth image. NaN if not seen.
+
+    Every depth pixel is lifted to a world point with the full camera pose
+    (hand pose ⊕ wrist mount, OpenGL axes; Isaac depth = distance to the image
+    plane). Points within ``radius_m`` of the object XY (from the static camera
+    / filter), above the table and below the fingertips are the object; its top
+    is the **median of the top 5% of Z** (robust to one-pixel spikes). Pass
+    ``use_top_median=False`` to fall back to a raw high percentile.
+    """
+    if depth is None:
+        return float("nan")
+    d = np.asarray(depth, dtype=np.float64)
+    if d.ndim == 3:
+        d = d[..., 0]
+    d = d[::stride, ::stride]
+    vv, uu = np.mgrid[0 : d.shape[0], 0 : d.shape[1]]
+    uu, vv = uu * stride, vv * stride
+    tcp = DEFAULT_TCP_OFFSET_M if tcp_offset_m is None else np.asarray(tcp_offset_m, np.float64)
+    wpos = DEFAULT_WRIST_POS_M if wrist_pos_m is None else np.asarray(wrist_pos_m, np.float64)
+    wq = DEFAULT_WRIST_QUAT_WXYZ if wrist_quat_wxyz is None else np.asarray(wrist_quat_wxyz, np.float64)
+    ee = np.asarray(ee_pos, dtype=np.float64).reshape(3)
+    R = quat_wxyz_to_rotmat(ee_quat_wxyz)
+    cam = ee - R @ tcp.reshape(3) + R @ wpos.reshape(3)
+    R_wc = R @ quat_wxyz_to_rotmat(wq)
+    ok = np.isfinite(d) & (d > DEFAULT_FINGER_MAX_M) & (d < 2.0)
+    d, uu, vv = d[ok], uu[ok], vv[ok]
+    pc = np.stack([(uu - cx) / f_px * d, -(vv - cy) / f_px * d, -d], axis=-1)
+    pw = pc @ R_wc.T + cam
+    xy = np.asarray(obj_xy, dtype=np.float64).reshape(-1)[:2]
+    sel = (
+        (np.linalg.norm(pw[:, :2] - xy, axis=1) < float(radius_m))
+        & (pw[:, 2] > float(z_table) + 0.005)  # not the table
+        & (pw[:, 2] < float(ee[2]) - 0.01)  # not the fingers / hand
+    )
+    if int(sel.sum()) < int(min_points):
+        return float("nan")
+    zs = pw[sel, 2]
+    if bool(use_top_median):
+        # Median of the tallest top_frac points — less spike-prone than p99.
+        k = max(1, int(np.ceil(float(top_frac) * float(zs.size))))
+        top = np.partition(zs, -k)[-k:]
+        z_top = float(np.median(top))
+    else:
+        z_top = float(np.percentile(zs, float(percentile)))
+    return z_top + float(z_bias_m)
 
 
 def z_top_from_static_depth(

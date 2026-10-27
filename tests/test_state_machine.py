@@ -48,14 +48,8 @@ def load_cfg() -> dict:
 
 @pytest.fixture
 def cfg() -> dict:
-    """Shipped yaml (house throw + GT weld grasp).
-
-    Gate unit tests fire CLOSE in one tick; Fix1's multi-tick dwell is covered
-    by ``test_close_settle_ticks_require_hold_inside_2mm``.
-    """
-    c = load_cfg()
-    c.setdefault("state_machine_params", {})["close_settle_ticks"] = 1
-    return c
+    """Shipped yaml (house throw + GT weld grasp)."""
+    return load_cfg()
 
 
 @pytest.fixture
@@ -178,26 +172,23 @@ def test_close_requires_xy_settle_2mm(sm):
     assert sm.step(_state(obj, vel), tight, sm._down_quat).stage == STAGE_CLOSE
 
 
-def test_close_settle_ticks_require_hold_inside_2mm():
-    """Fix1: close_xy_ok stays 2 mm, but CLOSE waits N ticks in a row inside it.
+def test_predictive_close_waits_when_approach_would_overshoot(sm):
+    """|e|≤2 mm is not enough if e+Δv·t_contact still lands outside the box.
 
-    Why: with N=1 the hand shut on first entry (~1.6 mm short on the DiffIK
-    approach). Production yaml uses N=15 so the hand finishes settling first.
+    Hand 1 mm short but still charging at +5 cm/s → predicted gap at
+    t_contact≈130 ms is past the object → stay in intercept.
     """
-    cfg = load_cfg()
-    cfg.setdefault("state_machine_params", {})["close_settle_ticks"] = 3
-    sm = PickPlaceStateMachine(cfg, dt=float(cfg["sim"]["dt"]))
-    sm.set_box_poses(CARRY, drop_pos=DROP)
     sm.stage = STAGE_APPROACH
     obj = np.array([0.55, 0.0, 0.036])
     vel = np.zeros(3)
     zg = sm._update_z_grasp(obj.copy(), obj)
-    ee = _riding(sm, np.array([obj[0] + 0.001, obj[1], zg]), vel)
-    # First two in-gate ticks: still intercept.
+    # Hand behind object, approaching fast (not speed-matched).
+    ee = np.array([obj[0] - 0.001, obj[1], zg])
+    sm._prev_ee = ee - np.array([0.05, 0.0, 0.0]) * sm.dt  # v_hand ≈ +5 cm/s
     assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_APPROACH
-    ee = _riding(sm, ee, vel)
-    assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_APPROACH
-    # Third consecutive: CLOSE.
+    # Same pose, matched speed → e_pred ≈ e → CLOSE.
+    sm.stage = STAGE_APPROACH
+    sm.timer_s = 0.0
     ee = _riding(sm, ee, vel)
     assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_CLOSE
 

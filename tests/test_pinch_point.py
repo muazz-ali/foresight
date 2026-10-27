@@ -26,9 +26,15 @@ def test_pinch_in_hand_is_pad_midpoint_from_urdf():
 
 
 def test_tcp_107mm_minus_pinch_is_plus_3p6mm_along_hand_z():
-    """Default yaml TCP 107 mm sits 3.6 mm past the pad midpoint along hand Z."""
+    """Legacy DiffIK TCP 107 mm sat 3.6 mm past the pad midpoint along hand Z."""
     d = tcp_minus_pinch_in_hand_m([0.0, 0.0, 0.107])
     np.testing.assert_allclose(d, [0.0, 0.0, 0.0036], atol=1e-12)
+
+
+def test_tcp_103p4mm_matches_pinch():
+    """Production tcp_offset = pad midpoint → tcp − pinch = 0."""
+    d = tcp_minus_pinch_in_hand_m([0.0, 0.0, 0.1034])
+    np.testing.assert_allclose(d, [0.0, 0.0, 0.0], atol=1e-12)
 
 
 def test_pinch_from_finger_bodies_is_midpoint():
