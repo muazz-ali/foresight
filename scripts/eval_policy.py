@@ -730,7 +730,13 @@ def run_episode_policy(
     # Our own plan queue (replaces LeRobot's ACTION queue so we can delay and
     # re-time chunks). With no overlays it plays exactly like select_action.
     n_exec = int(policy.config.n_action_steps)
+    if action_buf is not None and int(policy.config.chunk_size) < lat_steps + n_exec:
+        logging.warning(
+            "action buffer: chunk_size %d < latency %d + replan %d steps; the buffer runs dry "
+            "between plans, so the policy replans more often (or holds if latency >= chunk)",
+            int(policy.config.chunk_size), lat_steps, n_exec)
     plan: deque = deque()  # buffer off: actions in play order
+    steps_since_plan = n_exec  # buffer on: replan on the first step, then every n_exec steps
     obs_hist: deque = deque(maxlen=lat_steps + 1)  # oldest = obs L seconds ago
     noise_gen = torch.Generator(device=device).manual_seed(int(seed))
     noise_shape = (1, int(policy.config.chunk_size), int(policy.config.max_action_dim))
@@ -797,7 +803,12 @@ def run_episode_policy(
         else:
             sanity["_pack_delta"] = None
         # Empty plan means the net runs this step.
-        will_replan = (len(action_buf) == 0) if action_buf is not None else (len(plan) == 0)
+        if action_buf is not None:
+            # Buffer holds the whole chunk; keep the usual cadence (every n_exec steps).
+            will_replan = len(action_buf) == 0 or steps_since_plan >= n_exec
+        else:
+            will_replan = len(plan) == 0
+        steps_since_plan = 1 if will_replan else steps_since_plan + 1
         imgs = scene.get_images()
         oracle_now = scene.get_object_state()
         # Filter arm: feed this frame to the camera filter so it can give us
@@ -852,7 +863,10 @@ def run_episode_policy(
             noise = torch.randn(noise_shape, generator=noise_gen, device=device)
             with torch.inference_mode():
                 chunk = policy.predict_action_chunk(batch_used, noise=noise)
-            chunk = chunk[0, :n_exec].detach().cpu().numpy().astype(np.float64)
+            # Buffer on: keep the whole chunk, so slots past the latency are still there
+            # to run until the next replan (else L >= n_exec·dt leaves nothing due).
+            n_keep = int(chunk.shape[1]) if action_buf is not None else n_exec
+            chunk = chunk[0, :n_keep].detach().cpu().numpy().astype(np.float64)
             # Delta checkpoints predict moves from the hand in the planning obs.
             from policy.transforms import action_from_model
 
@@ -871,8 +885,10 @@ def run_episode_policy(
                 )
                 chunk = actions_from_forecast_rel(chunk, forecasts)
             if action_buf is not None:
-                # Action i was meant for obs time + i*dt. Slots already past are dropped.
-                action_buf.push_chunk(chunk, t0=now_k - lat_steps * dt, dt=dt, now=now_k - 1e-6)
+                # Action i was meant for obs time + i*dt. Slots already past are dropped
+                # (the one due this tick is kept); the chunk is tagged with its obs time.
+                t_obs = now_k - lat_steps * dt
+                action_buf.push_chunk(chunk, t0=t_obs, dt=dt, now=now_k - 1e-6, obs_t=t_obs)
             else:
                 plan.extend(chunk)  # play from the first action, however stale
         if action_buf is not None:

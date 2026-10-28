@@ -32,7 +32,7 @@ import numpy as np
 
 FORESIGHT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CFG = FORESIGHT_ROOT / "sim" / "phase0_cfg.yaml"
-DEFAULT_OUT = FORESIGHT_ROOT / "data" / "smoke"
+DEFAULT_OUT = FORESIGHT_ROOT / "data" / "smoke.2"
 
 G0_SPEEDS_M_S = (0.0, 0.10, 0.15, 0.20)  # plan G0 bins: 0-20 cm/s. Same bins G1 uses.
 # 20 tries per speed is a scout size. Fine for G0 smoke, too small to settle a close call.
@@ -511,7 +511,7 @@ def main() -> None:
         log_event(log, f"Expert intercept-servo. Step time {expert.dt:.3f} s. Look-ahead {expert.lookahead_s:.2f} s.")
         log_event(
             log,
-            f"Robot approach pad {expert.robot_approach_pad_s:.3f} s (tau {expert.tau:.3f} s), "
+            f"Robot approach pad {expert.robot_approach_pad_s:.3f} s, "
             f"hand speed cap {expert.ee_speed_max:.2f} m/s.",
         )
         log_how_to_read(

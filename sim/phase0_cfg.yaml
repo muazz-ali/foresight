@@ -60,6 +60,16 @@ robot:
   gripper_close_mm: 0.0
   init_pose_mm: [450.0, 0.0, 400.0, 0.0, 1.0, 0.0, 0.0]  # xyz + quat wxyz
   max_reach_dist_mm: 850.0
+  # DiffIK velocity feedforward: v_cmd = v̂_obj + K·(p* − p_hand),
+  # IK setpoint = p* + v̂_obj/K. Full lead every tick (near-field blend
+  # removed — it made the hand hunt on a smooth aim).
+  # K = 1/τ; τ≈190 ms from open-loop tip lag. 0 = off (absolute pose only).
+  # Re-tune via tools/diag/probe_diffik_tracking.py.
+  diffik_ff_gain: 5.26
+  # Arm joint PD (HIGH_PD defaults: stiffness 400, damping 80). Damping 160
+  # made s1003 trail worse; hunt was FF near-blend, not underdamped joints.
+  arm_joint_stiffness: 400.0
+  arm_joint_damping: 80.0
   # Finger travel time (SPEC-DERIVED from Franka Hand: 50 mm/s, 5 mm travel,
   # 30 ms cmd + 50 ms force → 180 ms nominal). Re-check on the real Hand.
   # Expert dwell = hold_closed_* below. Do NOT use the old sim value of 80 ms.
@@ -111,8 +121,13 @@ scene:
   - cup
   - can      # tip/yaw out of scope; upright cans still hard for physics
   - potato   # tipped wedges wedge in the 80 mm gripper
-  # Drop wide meshes (Franka open ≈ 80 mm). Keep margin under 65 mm.
-  max_object_width_mm: 65.0
+  # Drop wide meshes (Franka open ≈ 80 mm). Gate on collision XY ≤ 70 mm.
+  # Ride-contact: ~70 mm apples leave ~0 mm/side after pads — expect marginal
+  # scrape; do not tighten further (empties the apple catalog). Fix = Z floor
+  # below + exclude empty cats, not a harder width gate.
+  max_object_width_mm: 70.0
+  # Expert aim Z never below table + this (stops tip-through-table dives).
+  min_aim_z_above_table_mm: 15.0
   min_container_clearance_mm: 10.0   # box taller than object by this (closed tops)
   min_container_xy_margin_mm: 10.0   # container footprint bigger than object
   # Fingers open along world Y: container Y side ≥ object width + this
@@ -167,12 +182,12 @@ state_machine_params:
 
   # --- stage 1: intercept → close (stage 2 go-down unused) ---
   # Hand faster than objects up to ~1 m/s (meet-time + DiffIK chase). Aim cap
-  # 400 ms so a 50 cm/s throw is led ~20 cm when far. Tip 175 = measured DiffIK
-  # lag while riding the object (hand−command 160/175/179 ms at 10/20/30 cm/s,
-  # AB_recordings_v2). 130 left the hand 4–6 mm behind and it never settled.
+  # 400 ms so a 50 cm/s throw is led ~20 cm when far. DiffIK FF owns tip lag;
+  # tip_lag_pad stays 0 (do not double-lead). Chase leftover → raise
+  # robot.diffik_ff_gain's τ, not this pad.
   max_aim_ahead_ms: 400
-  # Aim farther for tip lag (not a wait). Measure: tools/diag/calibrate_servo_lag.py
-  tip_lag_pad_ms: 175
+  # Aim farther for tip lag (not a wait). Measure: tools/diag/probe_diffik_tracking.py.
+  tip_lag_pad_ms: 0
   hand_speed_max_cm_s: 250.0
   aim_refine_iters: 3
   # Chase near-box: |dx|,|dy|,|dz| (mm). Inside → settle aim (object + 1 tick).
@@ -180,10 +195,22 @@ state_machine_params:
   # Z tight for physics grasp (17–20 mm high on cans glances then slips).
   grasp_xyz_ok_mm: [10.0, 10.0, 12.0]
   close_xy_ok_mm: 2.0
-  # Off (tested 2026-10-27, B1 smoke at 20–30 cm/s): ride correction k=1 turned
-  # never-closed throws into 5–8 mm closes; a 5 mm z gate + 2-tick settle did not
-  # help. Kept as knobs: ride_correction_gain (0), close_z_ok_mm (= chase-box z).
-  ride_correction_gain: 0.0
+  # Soft ride pull toward object_now while outside the 2 mm close box.
+  # Inside the box the expert holds hand XY (FF coasts) so |Δv| can settle.
+  # 0.35 left s1001 parked at |dx|≈2.13 mm; 0.55 closes that last mm.
+  ride_correction_gain: 0.55
+  # Turn the hand about Z so the pads close ACROSS the object's path (fingers
+  # either side of it). "fixed" kept fingers along world Y: +Y diagonal throws
+  # ran the egg into a pad (5 mm clearance) and the contact kicked the ride
+  # 5–10 cm/s per tick (C1_grid_v2 C30 s1003/05/07/08). E6: 55 → 78 % at 30 cm/s.
+  grasp_yaw_mode: along
+  # Reach stop: the arm cannot work inside this radius around the robot base
+  # (XY, grasp height). If the object's straight path enters it within
+  # reach_stop_mm and the hand has not started closing, stop the chase and go
+  # home (no elbow jam). 200 mm: smooth-ride C30 grasps still succeed down to
+  # ~27 cm with the hand at 23 cm; 270 mm (elbow line) cancelled 4/10 of them.
+  reach_zone_radius_mm: 200.0
+  reach_stop_mm: 100.0
   # Predictive close (Fix1 closeout): |e + Δv·t_contact| ≤ close_xy_ok and
   # |Δv| ≤ 1.39 cm/s. t_contact ≈ 130 ms from the actuator model. Keep ticks=1.
   close_settle_ticks: 1
@@ -247,6 +274,7 @@ claim_timing:
   # B3: expert enters CLOSE only when |v_hand−v_obj|_xy × t_close ≤ 2.5 mm
   # (at t_close=180 ms → max_dv ≈ 1.39 cm/s) and XY ≤ close_xy_ok.
   close_speed_guard: true
+  close_speed_slack_mm: 2.5
   # B1 oracle: frame-delay buffer for expert (Δ = obs age, not enforce_apply_at).
   obs_delay_buffer: false
   # B1: Δ_meas = Δ_true + η, η ~ N(0, 5 ms), redrawn once per replan cycle.

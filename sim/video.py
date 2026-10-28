@@ -120,23 +120,6 @@ def _state_lines(episode: dict[str, Any], t: int) -> list[str]:
     return lines
 
 
-def _policy_input_lines(episode: dict[str, Any], t: int) -> list[str]:
-    """What the policy was fed at step ``t`` (eval logs): text, 4 numbers, gripper."""
-    lines = list(episode.get("overlay_info") or [])
-    if "conditioning" in episode and len(episode["conditioning"]) > t:
-        c = np.asarray(episode["conditioning"][t], dtype=np.float64)
-        lines.append(
-            f"Fed p-hat mm: {1000 * c[0]:.0f} {1000 * c[1]:.0f}   v-hat cm/s: {100 * c[2]:.1f} {100 * c[3]:.1f}"
-        )
-    if "gripper" in episode and len(episode["gripper"]) > t:
-        cmd = "OPEN" if float(episode["gripper"][t]) > 0.5 else "CLOSE"
-        gap = ""
-        if "finger_gap" in episode and len(episode["finger_gap"]) > t:
-            gap = f"   finger gap {1000 * float(episode['finger_gap'][t]):.0f} mm"
-        lines.append(f"Gripper cmd: {cmd}{gap}")
-    return lines
-
-
 def _gate_lines(
     episode: dict[str, Any], t: int, gates: dict[str, float]
 ) -> list[str]:
@@ -248,7 +231,6 @@ def stitch_episode_frames(
             frame = _overlay_text(
                 frame, _gate_lines(episode, t, gate_vals), anchor="top_left", color=_YELLOW_BGR
             )
-            frame = _overlay_text(frame, _policy_input_lines(episode, t), anchor="bottom_left")
         frames.append(frame)
     return frames
 

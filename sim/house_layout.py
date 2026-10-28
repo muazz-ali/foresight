@@ -769,7 +769,7 @@ def look_at_quat_wxyz(from_pos, to_pos=(0.0, 0.0, 0.0)) -> list[float]:
 
 def sample_light(
     rng: np.random.Generator,
-    camera_pos=(1.2, 0.0, 0.80),
+    camera_pos=(1.2, 0.0, 0.70),
     *,
     lighting: dict | None = None,
 ) -> dict:

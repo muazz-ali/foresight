@@ -190,22 +190,16 @@ def _filter_holdable_containers(
 
 
 def usd_bbox_size(usd_path: Path) -> np.ndarray:
-    """Box size (m) around a mesh. We need it to set the object on the table at the right height.
+    """Collision AABB size (m) for w_pre / sit height / width gate.
 
-    Raises on any problem. A wrong size would bury or float the object.
+    Prefer CollisionAPI prims (pads touch the collider, not the render mesh).
+    Falls back to visual if the USD has no collider. Raises on any problem —
+    a wrong size would bury/float the object or mis-size the pre-shape.
     """
     try:
-        from pxr import Usd, UsdGeom
+        from sim.usd_bbox import usd_collision_size
 
-        stage = Usd.Stage.Open(str(usd_path))
-        if stage is None:
-            raise RuntimeError(f"USD bbox failed: cannot open {usd_path}")
-        prim = stage.GetDefaultPrim()
-        if not prim:
-            raise RuntimeError(f"USD bbox failed: no default prim in {usd_path}")
-        cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
-        bbox = cache.ComputeWorldBound(prim).ComputeAlignedBox()
-        size = np.array(bbox.GetSize(), dtype=np.float64)
+        size = usd_collision_size(usd_path)
         if not np.all(np.isfinite(size)) or np.any(size <= 0):
             raise RuntimeError(f"USD bbox failed: invalid size {size} for {usd_path}")
         return size
@@ -352,6 +346,17 @@ class Phase0Scene:
         robot_cfg.prim_path = "/World/Robot"
         # Base sits at the table-edge anchor (house is moved so that anchor = origin).
         robot_cfg.init_state.pos = (0.0, 0.0, 0.0)
+        # Optional PD override (s1003: hand hunted on a smooth aim → more damping).
+        robot_yaml = cfg.get("robot") if isinstance(cfg.get("robot"), dict) else {}
+        stiff = robot_yaml.get("arm_joint_stiffness")
+        damp = robot_yaml.get("arm_joint_damping")
+        if stiff is not None or damp is not None:
+            for name in ("panda_shoulder", "panda_forearm"):
+                act = robot_cfg.actuators[name]
+                if stiff is not None:
+                    act.stiffness = float(stiff)
+                if damp is not None:
+                    act.damping = float(damp)
         self.robot = Articulation(robot_cfg)
 
         self._object_dir = Path(_require(cfg, "paths", "object_dir"))
@@ -399,6 +404,9 @@ class Phase0Scene:
         self._active_usd: Path | None = None
         self._object_size: np.ndarray | None = None
         self._object_half_height = self._object_radius
+        # Collision AABB centre in USD root frame (m). Spawn root = aim − this
+        # so the collider centre sits on the expert aim point.
+        self._object_centre_offset = np.zeros(3, dtype=np.float64)
         # Per-episode sit height (tipped cans use diameter/2, not upright height/2).
         self._episode_object_half_height = float(self._object_half_height)
         self.abort_reason: str | None = None  # set mid-episode by safety checks
@@ -428,7 +436,12 @@ class Phase0Scene:
                 object_usd,
                 object_dir=self._object_dir,
             )
-            self._object_size = usd_bbox_size(self._active_usd)
+            from sim.usd_bbox import usd_visual_collision_boxes
+
+            boxes = usd_visual_collision_boxes(self._active_usd)
+            self._object_size = np.asarray(boxes["size"], dtype=np.float64)
+            # Spawn so the collision centre sits on the aim point (not USD origin).
+            self._object_centre_offset = np.asarray(boxes["centre"], dtype=np.float64)
             # Override path may bypass the catalog filter — re-check.
             from sim.asset_filters import object_fits_gripper
             from sim.state_machine_logs import fmt_size_cm
@@ -441,9 +454,10 @@ class Phase0Scene:
             self._object_half_height = half_height_from_size(self._object_size)
 
             logger.info(
-                "Object mesh: %s   size %s   sits %.1f cm on the table",
+                "Object mesh: %s   collision size %s (%s)   sits %.1f cm on the table",
                 self._active_usd.stem if self._active_usd is not None else "unknown",
                 fmt_size_cm(self._object_size),
+                boxes["used"],
                 100.0 * float(self._object_half_height),
             )
 
@@ -609,6 +623,10 @@ class Phase0Scene:
             command_type="pose", use_relative_mode=False, ik_method="dls"
         )
         self.ik = DifferentialIKController(ik_cfg, num_envs=1, device=self.robot.device)
+        # Velocity feedforward gain K (1/s). 0 = absolute pose only.
+        # See set_ee_target: v_cmd = v + K·(p* − p), IK aims at p + v_cmd/K.
+        robot_cfg = cfg.get("robot") or {}
+        self._diffik_ff_k = float(robot_cfg.get("diffik_ff_gain", 0.0))
 
         # Three object velocities on purpose:
         #   _obj_velocity  — live speed that drives the coast
@@ -1050,8 +1068,15 @@ class Phase0Scene:
             sit_h = float(self._object_half_height)
         # Episode sit height (coast keeps this Z). Upright mesh uses mesh half-height.
         self._episode_object_half_height = float(sit_h)
+        # Root pose so collision centre is at (xy, table+sit_h).
+        off = np.asarray(self._object_centre_offset, dtype=np.float64).reshape(3)
         pos = np.array(
-            [pos0[0], pos0[1], self._table_z + sit_h], dtype=np.float64
+            [
+                float(pos0[0]) - float(off[0]),
+                float(pos0[1]) - float(off[1]),
+                float(self._table_z) + float(sit_h) - float(off[2]),
+            ],
+            dtype=np.float64,
         )
         # Far-rim spawn is the play +X edge; mesh half-width can hang past the
         # table (egg seed-50194: center 0.78 → PhysX walked it to 0.82 off-table
@@ -1282,19 +1307,28 @@ class Phase0Scene:
         tcp = self._tcp_offset[0].detach().cpu().numpy().astype(np.float64)
         return tcp_minus_pinch_in_hand_m(tcp)
 
-    def get_object_state(self) -> ObjectState:
-        """True object position + velocity right now, in the shared ObjectState message.
+    def _object_centre_world(self, root_pos: np.ndarray) -> np.ndarray:
+        """Collision-centre world pose from USD root (constant local offset)."""
+        return np.asarray(root_pos, dtype=np.float64).reshape(3) + np.asarray(
+            self._object_centre_offset, dtype=np.float64
+        ).reshape(3)
 
-        This is the "oracle" (ground truth). Same message the filter will fill later.
+    def get_object_state(self) -> ObjectState:
+        """True object **collision centre** + velocity, as ObjectState.
+
+        Expert / w_pre / z_grasp aim at the collider centre, not the USD origin
+        (audit: some meshes have origin≠centre by >1 mm).
         After place the object is pinned, so we report zero speed.
         """
         if self._was_frozen and self._freeze_pose is not None and not self._attached:
-            pos = self._freeze_pose[0].copy()
+            pos = self._object_centre_world(self._freeze_pose[0])
             vel = np.zeros(3, dtype=np.float64)
         else:
-            pos = self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
+            root = self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
+            pos = self._object_centre_world(root)
             # Post-step pose FD. With kinematic_enabled, this should match the
-            # scripted coast command (constant velocity).
+            # scripted coast command (constant velocity). Offset is constant →
+            # centre velocity = root velocity.
             vel = self._obj_vel_obs.copy()
         return oracle_from_gt(pos, vel, timestamp=self._sim_time, valid=True)
 
@@ -1489,8 +1523,12 @@ class Phase0Scene:
             self._obj_velocity,
             self.physics_dt,
         )
-        # Keep it flat on the table: motion is XY only.
-        new_pos[2] = self._table_z + float(self._episode_object_half_height)
+        # Keep it flat on the table: motion is XY only. Root Z accounts for
+        # collision-centre offset so the collider bottom stays on the table.
+        off_z = float(self._object_centre_offset[2])
+        new_pos[2] = (
+            self._table_z + float(self._episode_object_half_height) - off_z
+        )
         self._obj_velocity = new_vel
         if not self._weld:
             self._coast_pos = new_pos.copy()
@@ -1506,6 +1544,14 @@ class Phase0Scene:
             .numpy()
             .astype(np.float64)
         )
+
+    def get_ee_lin_vel(self) -> np.ndarray:
+        """World-frame EE-link linear velocity (m/s).
+
+        Close-gate ``v_hand`` source (not finite-diff of EE pose). Same vector
+        grasp-free uses to match object speed on contact.
+        """
+        return self._ee_lin_vel_w()
 
     def _free_object(self, *, match_ee: bool = False) -> None:
         """Hand the object to PhysX (physics grasp / fell off the table).
@@ -1670,27 +1716,50 @@ class Phase0Scene:
         pos_w: np.ndarray,
         quat_wxyz: np.ndarray,
         gripper_open: float,
+        vel_w: np.ndarray | None = None,
     ) -> None:
         """Tell the arm where to put the fingertip point, and how open the gripper is.
 
         Runs IK (turns a hand target into joint angles). Sets targets only;
         the move happens on the next ``step``.
+
+        Optional ``vel_w`` (m/s, world): velocity feedforward when
+        ``robot.diffik_ff_gain`` K > 0. Plain form::
+
+            v_cmd = v_target + K · (p_target − p_hand)
+            p_ik  = p_hand + v_cmd / K   # = p_target + v_target / K
+
+        ``vel_w`` must be v̂_obj (forecast/coast object velocity), never FD of
+        consecutive aims. Zeros for a fixed pose. ``vel_w=None`` or K=0 →
+        absolute-pose DiffIK.
         """
         device = self.robot.device
         root_pos = self.robot.data.root_pos_w
         root_quat = self.robot.data.root_quat_w
-        des_pos_w = torch.tensor(pos_w, device=device, dtype=torch.float32).view(1, 3)
-        des_quat_w = torch.tensor(quat_wxyz, device=device, dtype=torch.float32).view(1, 4)
-        des_pos_b, des_quat_b = subtract_frame_transforms(
-            root_pos, root_quat, des_pos_w, des_quat_w
-        )
-        self.ik.set_command(torch.cat([des_pos_b, des_quat_b], dim=-1))
 
         body_pos = self.robot.data.body_pos_w[:, self._ee_idx]
         body_quat = self.robot.data.body_quat_w[:, self._ee_idx]
         tcp_pos_w, tcp_quat_w = combine_frame_transforms(
             body_pos, body_quat, self._tcp_offset, self._tcp_offset_quat
         )
+
+        p_target = np.asarray(pos_w, dtype=np.float64).reshape(3)
+        p_ik = p_target
+        k_ff = float(self._diffik_ff_k)
+        if k_ff > 0.0 and vel_w is not None:
+            # Full v̂_obj lead every tick: p_ik = p* + v̂_obj/K.
+            # A near-field blend that zeroed the lead when |aim−hand| was small
+            # made the hand trail and hunt on s1003 (aim stayed smooth).
+            v_hat = np.asarray(vel_w, dtype=np.float64).reshape(3)
+            tau = 1.0 / k_ff
+            p_ik = p_target + v_hat * tau
+        des_pos_w = torch.tensor(p_ik, device=device, dtype=torch.float32).view(1, 3)
+        des_quat_w = torch.tensor(quat_wxyz, device=device, dtype=torch.float32).view(1, 4)
+        des_pos_b, des_quat_b = subtract_frame_transforms(
+            root_pos, root_quat, des_pos_w, des_quat_w
+        )
+        self.ik.set_command(torch.cat([des_pos_b, des_quat_b], dim=-1))
+
         tcp_pos_b, tcp_quat_b = subtract_frame_transforms(
             root_pos, root_quat, tcp_pos_w, tcp_quat_w
         )

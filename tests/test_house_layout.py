@@ -25,7 +25,7 @@ from sim.house_layout import (
 SCENE_DIR = Path("/home/gpuadmin/Desktop/muazzam/scenes")
 # One camera, foresight yaml style: {name, position, rotation_deg}.
 CAMERAS = [
-    {"name": "static_cam", "position": [1.2, 0.0, 0.80], "rotation_deg": [0.0, 48.0, 90.0]}
+    {"name": "static_cam", "position": [1.2, 0.0, 0.70], "rotation_deg": [0.0, 45.0, 90.0]}
 ]
 
 _has_pxr = True

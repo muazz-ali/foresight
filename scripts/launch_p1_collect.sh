@@ -37,8 +37,8 @@ fi
 CHUNK="${CHUNK:-25}"
 
 # Keep in sync with scene.object_categories / container_categories in phase0_cfg.yaml
-# (exclude tomato/beer/bottle/cup/potato/plate/tray — see phase0_cfg exclude_usd_*).
-OBJECTS=(apple avocado can egg kiwi lemon lime onion orange peach tangerine)
+# (exclude can/beer/bottle/cup/tomato/potato/plate/tray — see phase0_cfg exclude_usd_*).
+OBJECTS=(apple avocado egg kiwi lemon lime onion orange peach tangerine)
 CONTAINERS=(bowl box)
 SEED_BASE="${SEED_BASE:-1000}"
 CFG="${CFG:-$ROOT/sim/phase0_cfg.yaml}"

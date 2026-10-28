@@ -64,6 +64,8 @@ def overlay_reflex(
         "attach_object": attach,
         "kinematic_object": kin,
     }
+    # DiffIK FF needs v̂_obj (coast / forecast object speed), not the reflex
+    # PD mix ``out.vel_cmd``. Leave ``cmd.velocity`` unchanged.
     if hasattr(cmd, "__dataclass_fields__"):
         from dataclasses import replace
 

@@ -20,6 +20,7 @@ import pytest
 from interfaces.state import oracle_from_gt
 from sim.motion import kinematic_advance
 from sim.state_machine import (
+    AIM_BRANCHES,
     STAGE_APPROACH,
     STAGE_CARRY,
     STAGE_CLOSE,
@@ -72,7 +73,7 @@ def _riding(sm, ee, vel):
 # --------------------------------------------------------------- interception
 
 
-def test_lead_collapses_to_tau_when_on_top(sm):
+def test_lead_collapses_to_pad_when_on_top(sm):
     """Riding the object → horizon is pure lag compensation, not 0.25 s ahead.
 
     This is the v1 bug: a fixed 0.25 s lead parks the hand ``0.25 * v`` in front
@@ -83,11 +84,158 @@ def test_lead_collapses_to_tau_when_on_top(sm):
         vel = np.array([speed, 0.0, 0.0])
         ee_on_top = obj.copy()
         lead = sm._intercept_lead_s(ee_on_top, obj, vel)
-        assert lead == pytest.approx(sm.tau, abs=1e-6), f"speed {speed}"
+        assert lead == pytest.approx(sm.robot_approach_pad_s, abs=1e-6), f"speed {speed}"
+
+
+def test_delayed_ride_aims_at_p_now_not_base_tau(sm):
+    """Under Δ: ride aim = p_now = p_delayed + v·Δ; no leftover +dt lead.
+
+    Why: base_tau = Δ+tip_lag+dt left a v·dt ≈ 10 mm park line outside the
+    10 mm ride box at 30 cm/s. DiffIK FF carries v̂_obj while aim sits on now.
+    """
+    sm.stage = STAGE_APPROACH
+    sm.z_grasp = 0.036
+    sm.set_aim_xy_bounds([[0.20, 0.90], [-0.40, 0.40]])
+    delta = 0.30
+    vel = np.array([0.30, 0.0, 0.0])
+    # Delayed obs: object was here Δ ago; true now is + v·Δ.
+    p_delayed = np.array([0.50, 0.0, 0.036])
+    p_now = p_delayed + vel * delta
+    ee = p_now.copy()  # already riding on now
+    ee[2] = sm.z_grasp
+    sm._prev_ee = ee - vel * sm.dt  # matched speed for gate
+    cmd = sm.step(
+        _state(p_delayed, vel),
+        ee,
+        sm._down_quat,
+        delta_meas_s=delta,
+        delta_true_s=delta,
+        ee_vel=vel,
+    )
+    assert cmd.stage in (STAGE_APPROACH, STAGE_CLOSE)
+    # Inside 2 mm hold snaps aim to ee; DiffIK FF still carries v̂_obj.
+    assert cmd.position[0] == pytest.approx(float(ee[0]), abs=3e-3)
+    assert cmd.velocity is not None
+    assert cmd.velocity[0] == pytest.approx(0.30, abs=1e-9)  # DiffIK FF = v̂_obj
+
+
+def test_delayed_ride_settle_is_p_now(sm):
+    """Delayed ride aim = p_now: no forecast(delayed, Δ+dt), no hand-written +dt."""
+    sm.stage = STAGE_APPROACH
+    sm.z_grasp = 0.036
+    sm.ride_k = 0.0  # isolate the settle lead
+    sm.set_aim_xy_bounds([[0.20, 0.90], [-0.40, 0.40]])
+    delta = 0.30
+    vel = np.array([0.30, 0.0, 0.0])
+    p_delayed = np.array([0.50, 0.0, 0.036])
+    p_now = p_delayed + vel * delta
+    # Outside 2 mm hold, inside chase box.
+    ee = p_now + np.array([-0.005, 0.0, 0.0])
+    ee[2] = sm.z_grasp
+    sm._prev_ee = ee - vel * sm.dt
+    cmd = sm.step(
+        _state(p_delayed, vel),
+        ee,
+        sm._down_quat,
+        delta_meas_s=delta,
+        delta_true_s=delta,
+        ee_vel=vel,
+    )
+    assert cmd.position[0] == pytest.approx(float(p_now[0]), abs=1e-6)
+
+
+def test_zero_delay_ride_settle_is_p_now(sm):
+    """Δ≈0 near_ok settle matches delayed: aim = p_now, no +dt.
+
+    Why: with DiffIK FF a +v·dt settle parks the hand ahead of the 2 mm box.
+    """
+    sm.stage = STAGE_APPROACH
+    sm.z_grasp = 0.036
+    sm.ride_k = 0.0  # isolate the settle lead
+    sm.set_aim_xy_bounds([[0.20, 0.90], [-0.40, 0.40]])
+    vel = np.array([0.30, 0.0, 0.0])
+    obj = np.array([0.55, 0.0, 0.036])
+    # Sit in the chase box but outside the 2 mm hold so aim is not snapped to ee.
+    ee = obj + np.array([-0.005, 0.0, 0.0])
+    ee[2] = sm.z_grasp
+    sm._prev_ee = ee - vel * sm.dt
+    cmd = sm.step(
+        _state(obj, vel),
+        ee,
+        sm._down_quat,
+        delta_meas_s=0.0,
+        delta_true_s=0.0,
+        ee_vel=vel,
+    )
+    assert cmd.position[0] == pytest.approx(float(obj[0]), abs=1e-6)
+
+
+def test_delayed_chase_travel_from_p_now_no_double_delta(sm):
+    """Far chase under Δ: travel solved from p_now; aim ≠ p + v·(Δ+dt) leftover."""
+    sm.stage = STAGE_APPROACH
+    sm.set_aim_xy_bounds([[0.20, 1.20], [-0.40, 0.40]])
+    delta = 0.30
+    vel = np.array([0.30, 0.0, 0.0])
+    p_delayed = np.array([0.70, 0.0, 0.03])
+    p_now = p_delayed + vel * delta
+    ee = np.array([0.40, 0.0, 0.40])  # far behind
+    cmd = sm.step(
+        _state(p_delayed, vel),
+        ee,
+        sm._down_quat,
+        delta_meas_s=delta,
+        delta_true_s=delta,
+    )
+    # Aim should be ahead of p_now by travel·v, not stuck at v·dt past p_now.
+    # Full double-count lead would put aim near p_delayed + v*(Δ + travel + tau).
+    assert cmd.position[0] > float(p_now[0]) - 1e-6
+    leftover_dt = float(p_now[0] + vel[0] * sm.dt)
+    # Must not be the old park line (p_now + v·dt) when still far — travel binds.
+    assert abs(float(cmd.position[0]) - leftover_dt) > 0.02
+
+
+def _far_chase_cmd(sm, delta):
+    """One far-chase step with the object's true *now* fixed at x = 0.79."""
+    sm.reset()
+    sm.stage = STAGE_APPROACH
+    sm.set_aim_xy_bounds([[0.20, 1.20], [-0.40, 0.40]])
+    vel = np.array([0.30, 0.0, 0.0])
+    p_now = np.array([0.79, 0.0, 0.03])
+    p_obs = p_now - vel * delta
+    ee = np.array([0.40, 0.0, 0.40])  # far behind
+    cmd = sm.step(
+        _state(p_obs, vel),
+        ee,
+        sm._down_quat,
+        delta_meas_s=delta,
+        delta_true_s=delta,
+    )
+    return cmd, sm.aim_branch
+
+
+def test_far_chase_same_formula_for_zero_and_delayed(sm):
+    """Δ=0 and Δ>0 far chase both aim at p_now + v·(travel + pad).
+
+    Why: a Δ=0-only +dt lead made Δ=0 cells run different code from Δ>0.
+    """
+    cmd0, br0 = _far_chase_cmd(sm, 0.0)
+    cmd3, br3 = _far_chase_cmd(sm, 0.30)
+    assert br0 == br3 == "far_chase"
+    assert cmd0.position[:2] == pytest.approx(cmd3.position[:2], abs=1e-9)
+
+
+def test_aim_branch_flag_per_tick(sm):
+    """Expert reports which aim branch ran; 'none' when no chase aim is built."""
+    sm.stage = STAGE_RESET
+    sm.step(_state([0.55, 0.0, 0.03], [0.0, 0.0, 0.0]), np.array([0.4, 0.0, 0.4]), sm._down_quat)
+    assert sm.aim_branch == "none"
+    assert sm.aim_branch in AIM_BRANCHES
+    _, br = _far_chase_cmd(sm, 0.10)
+    assert br == "far_chase"
 
 
 def test_lead_is_capped_at_lookahead_when_far(sm):
-    """Far away → the yaml look-ahead cap binds (plus tau).
+    """Far away → the yaml look-ahead cap binds (plus approach pad, no +dt).
 
     Hand at 2.5 m/s needs >1.0 m of travel before the 400 ms cap binds.
     """
@@ -96,7 +244,7 @@ def test_lead_is_capped_at_lookahead_when_far(sm):
     assert sm.lookahead_s == pytest.approx(0.40, abs=1e-9)
     for speed in (0.20, 0.40, 0.80):
         lead = sm._intercept_lead_s(ee, obj, np.array([0.0, speed, 0.0]))
-        assert lead == pytest.approx(sm.lookahead_s + sm.tau, abs=1e-6)
+        assert lead == pytest.approx(sm.lookahead_s + sm.robot_approach_pad_s, abs=1e-6)
 
 
 def test_approach_aims_ahead_of_a_moving_object(sm):
@@ -194,7 +342,7 @@ def test_predictive_close_waits_when_approach_would_overshoot(sm):
 
 
 def test_close_rides_object_xy(sm):
-    """During CLOSE the hand rides with τ lead (speed match once settled)."""
+    """During CLOSE hold hand XY; DiffIK FF coasts with v̂_obj (no τ snap)."""
     sm.stage = STAGE_CLOSE
     sm.z_grasp = 0.036
     sm.timer_s = 0.0
@@ -208,8 +356,8 @@ def test_close_rides_object_xy(sm):
     # Physics: coast until fingers shut; free only after finger_close_s.
     assert sm.physics_grasp
     assert not cmd.attach_object and cmd.kinematic_object
-    expect_x = float(obj[0] + vel[0] * sm.tau)
-    assert cmd.position[0] == pytest.approx(expect_x, abs=1e-6)
+    # Hold ee XY — forecast(tau) snap jerked s1003 off-center.
+    assert cmd.position[0] == pytest.approx(float(ee[0]), abs=1e-6)
     assert cmd.position[2] == pytest.approx(0.036, abs=1e-6)
     # After finger travel, free to PhysX (attach).
     sm.stage = STAGE_CLOSE
@@ -390,30 +538,31 @@ def test_timeouts_are_per_stage_not_the_episode_window(sm):
 
 
 class FakeArm:
-    """First-order TCP tracker with a speed cap. Surrogate for IK + joint PD.
+    """First-order TCP tracker with velocity feedforward and a speed cap.
 
-    Commands take effect one step late, matching the real loop: ``collect.py``
-    reads the pose, calls the expert, writes the target, *then* steps physics.
-    That is why the expert's ``tau`` is ``robot_approach_pad_s + dt`` and not
-    just the tip pad — drop the delay here and the surrogate flatters the expert
-    by exactly ``v * dt`` (1.6 cm at 40 cm/s, more than ``grasp_xyz_ok`` XY).
+    Mirrors the scene's DiffIK FF (``sim/scene.py`` ``set_ee_target``):
+    ``v_cmd = v̂ + (p* − p)/τ`` with ``τ = 1/robot.diffik_ff_gain``. A command
+    acts during the very next step (collect: read pose → expert → set target →
+    step), so there is no extra hold-back tick. The old surrogate held each
+    command one more tick and the expert's hand-written ``+dt`` leads were
+    tuned to cancel it.
     """
 
     def __init__(self, pos, *, tau: float, speed_max: float, dt: float):
         self.pos = np.asarray(pos, dtype=np.float64).copy()
+        self.vel = np.zeros(3, dtype=np.float64)
         self.tau = float(tau)
         self.speed_max = float(speed_max)
         self.dt = float(dt)
-        self._pending = self.pos.copy()
 
-    def follow(self, cmd: np.ndarray) -> np.ndarray:
-        step = (self._pending - self.pos) * (self.dt / self.tau)
-        n = float(np.linalg.norm(step))
-        cap = self.speed_max * self.dt
-        if n > cap:
-            step *= cap / n
-        self.pos = self.pos + step
-        self._pending = np.asarray(cmd, dtype=np.float64).copy()
+    def follow(self, cmd: np.ndarray, cmd_vel: np.ndarray | None = None) -> np.ndarray:
+        v_ff = np.zeros(3) if cmd_vel is None else np.asarray(cmd_vel, dtype=np.float64)
+        v = v_ff + (np.asarray(cmd, dtype=np.float64) - self.pos) / self.tau
+        n = float(np.linalg.norm(v))
+        if n > self.speed_max:
+            v *= self.speed_max / n
+        self.vel = v
+        self.pos = self.pos + v * self.dt
         return self.pos.copy()
 
 
@@ -441,18 +590,26 @@ def run_fake_episode(
         rng, ((b[0][0], b[0][1]), (b[1][0], b[1][1])), speed=speed
     )
     obj = np.array([p0[0], p0[1], 0.03])
+    # Throw heads into the arm's dead zone at the base → a reach stop is correct.
+    enters_zone = bool(np.isfinite(sm._path_to_reach_zone_m(obj, vel)))
 
+    k_ff = float(cfg["robot"]["diffik_ff_gain"])
     arm = FakeArm(
         cfg["robot"]["init_pose"][:3],
-        tau=float(tau_true if tau_true is not None else sm.robot_approach_pad_s),
+        tau=float(tau_true if tau_true is not None else 1.0 / k_ff),
         speed_max=float(speed_max_true if speed_max_true is not None else sm.ee_speed_max),
         dt=dt,
     )
     ee = arm.pos.copy()
     max_stage, z_max, attached = 0, float(obj[2]), False
     for i in range(int(max_s / dt)):
-        cmd = sm.step(_state(obj, np.zeros(3) if attached else vel, i * dt), ee, sm._down_quat)
-        ee = arm.follow(cmd.position)
+        cmd = sm.step(
+            _state(obj, np.zeros(3) if attached else vel, i * dt),
+            ee,
+            sm._down_quat,
+            ee_vel=arm.vel.copy(),
+        )
+        ee = arm.follow(cmd.position, cmd.velocity)
         attached = bool(cmd.attach_object)
         if attached:
             obj = ee.copy()  # scene welds the object to the TCP
@@ -471,22 +628,31 @@ def run_fake_episode(
         "done": max_stage >= STAGE_DONE,
         "grasp_err_xy": sm.grasp_err_xy,
         "retries": sm.retries,
+        "reach_stopped": bool(sm.reach_stopped),
+        "enters_zone": enters_zone,
     }
+
+
+def _check_runs(runs: list[dict]) -> None:
+    """Reachable throws must finish; zone-bound ones may only reach-stop."""
+    for r in runs:
+        brief = {k: r[k] for k in ("max_stage", "retries", "grasp_err_xy", "reach_stopped", "enters_zone")}
+        if not r["enters_zone"]:
+            assert r["done"], brief
+            assert not r["reach_stopped"], brief
+        else:
+            assert r["done"] or r["reach_stopped"], brief
+        if r["done"]:
+            assert r["z_max"] >= 0.12, "object never lifted"
 
 
 @pytest.mark.parametrize("speed", [0.0, 0.20, 0.40, 0.50, 1.00])
 def test_closed_loop_completes_at_speed(cfg, speed):
-    """0 / 20 / 40 / 50 / 100 cm/s must finish from every seed with shipped knobs.
+    """0 / 20 / 40 / 50 / 100 cm/s: every reachable throw finishes (10 seeds).
 
     Hand speed 2.5 m/s + 400 ms aim cap are sized so FakeArm finishes 1 m/s.
     """
-    runs = [run_fake_episode(cfg, speed, seed=s) for s in range(10)]
-    done = sum(r["done"] for r in runs)
-    assert done == len(runs), [
-        {k: r[k] for k in ("max_stage", "retries", "grasp_err_xy")} for r in runs
-    ]
-    for r in runs:
-        assert r["z_max"] >= 0.12, "object never lifted"
+    _check_runs([run_fake_episode(cfg, speed, seed=s) for s in range(10)])
 
 
 def test_grasp_error_stays_honest_at_speed(cfg):
@@ -500,10 +666,9 @@ def test_grasp_error_stays_honest_at_speed(cfg):
 
 
 def test_80cms_throw_completes_with_stock_arm(cfg):
-    """Straight-coast throws (no wall reverse): stock lag can still finish at 80 cm/s."""
+    """Straight-coast throws (no wall reverse): stock lag still finishes 80 cm/s."""
     runs = [run_fake_episode(cfg, 0.80, seed=s) for s in range(10)]
-    done = sum(r["done"] for r in runs)
-    assert done >= 8, [r["max_stage"] for r in runs]
+    _check_runs(runs)
     for r in runs:
         if r["grasp_err_xy"] is not None:
             assert r["grasp_err_xy"] <= 0.03, r

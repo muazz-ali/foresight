@@ -42,6 +42,13 @@ BINS = np.array([16, 8, 6])
 OBJ_SHARE = 0.5  # keep a pixel when the object owns at least this share of its colour
 OBJ_DISK = 1.0  # learn the object's colours inside this × its half-width
 REST_WEIGHT = 10.0  # a colour is "object" only if this many times commoner on it than elsewhere
+# Shadows only darken: an object colour also counts up to this many value bins
+# darker (hue/saturation unchanged). A5: the hand's shadow dimmed the lemon, the
+# dark half dropped out of the blob and the centre slid up to 10 mm.
+SHADOW_V_BINS = 2
+# ...but only for saturated colours (S ≥ 128), where hue still names the object.
+# A darker pale egg looks like its own shadow on a brown table (A5 egg +17 mm).
+SHADOW_MIN_S_BIN = 4
 MAX_AREA_GROWTH = 3.0  # × first-frame area
 SIZE_OK = (0.3, 6.0)  # start blob area must be this many × the expected disk area
 
@@ -84,7 +91,18 @@ class BlobTracker:
         rest = np.bincount(b[d2 > (2.5 * r_px) ** 2], minlength=n).astype(np.float64)
         # Scale the rest to the object's pixel count: small object, big table.
         rest *= obj.sum() / max(rest.sum(), 1.0) * REST_WEIGHT
-        self._lut = obj / np.maximum(obj + rest, 1e-9)
+        lut = obj / np.maximum(obj + rest, 1e-9)
+        # Shadow: a saturated colour that is clearly object (share ≥ OBJ_SHARE) also
+        # counts up to SHADOW_V_BINS darker — only where the rest of the frame
+        # never showed that darker colour (else it is table/robot, not shade).
+        L, R = lut.reshape(tuple(BINS)), rest.reshape(tuple(BINS))
+        out = L.copy()
+        s0 = SHADOW_MIN_S_BIN
+        for k in range(1, SHADOW_V_BINS + 1):
+            src = L[:, s0:, k:]
+            ok = (src >= OBJ_SHARE) & (R[:, s0:, :-k] <= 0.0)
+            out[:, s0:, :-k] = np.where(ok, np.maximum(out[:, s0:, :-k], src), out[:, s0:, :-k])
+        self._lut = out.reshape(-1)
 
     def _mask(self, rgb: np.ndarray, mode: str) -> np.ndarray:
         """Black/white picture: 1 where a pixel looks like the object, 0 elsewhere."""

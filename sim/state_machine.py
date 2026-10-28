@@ -57,6 +57,10 @@ STAGE_OPEN = 7
 STAGE_HOME = 8
 STAGE_DONE = 9
 
+# Which chase-aim formula ran this tick. Index = int code logged per tick
+# (h5 ``aim_branch``). "none" = no chase aim computed (other stages / bail-outs).
+AIM_BRANCHES = ("none", "far_chase", "settle", "forecast_off")
+
 # "engaged" = we started chasing (stage 1). "lift" = object is up (4).
 # "placed" = fingers opened over the box (7). "done" = back home (9).
 STAGE_SCHEMA = StageSchema(
@@ -123,6 +127,10 @@ class ExpertCommand:
 
     The three object flags tell the scene who moves the object this step:
     the table slide (kinematic), the hand (attach), or nobody (freeze).
+
+    ``velocity`` is v̂_obj for DiffIK feedforward: the same object coast
+    velocity ``_forecast`` uses (not FD of consecutive aims). Zeros when the
+    aim is a fixed pose (home / open / done).
     """
 
     position: np.ndarray  # (3,)
@@ -132,6 +140,7 @@ class ExpertCommand:
     kinematic_object: bool  # True while we slide the object on the table
     attach_object: bool  # True while the object is held (snapped to the hand)
     freeze_object: bool = False  # pause object pose (open / home / done)
+    velocity: np.ndarray | None = None  # (3,) m/s = v̂_obj; None → zeros at scene
 
 class PickPlaceStateMachine:
     """The scripted teacher. Reads true object state, walks the 9 stages, returns hand orders.
@@ -157,6 +166,9 @@ class PickPlaceStateMachine:
         # so the finger pads line up with the object's motion during approach/close/lift.
         self.grasp_yaw_mode = str(self._p.get("grasp_yaw_mode", "fixed"))
         self._grasp_quat: np.ndarray | None = None
+        # Reach stop (0 = off): see _path_to_reach_zone_m.
+        self.reach_zone_r = float(self._p.get("reach_zone_radius", 0.0))
+        self.reach_stop_m = float(self._p.get("reach_stop", 0.0))
 
         # --- timings -----------------------------------------------------
         self.settle_s = self._f("settle_s")
@@ -199,10 +211,17 @@ class PickPlaceStateMachine:
         self.close_z_ok = float(self._p.get("close_z_ok", self.grasp_z_tol))
         self.close_settle_ticks = int(self._p.get("close_settle_ticks", 1))
         self._settle_count = 0
-        # B3: CLOSE only when |v_hand − v_obj|_xy × t_close ≤ 2.5 mm as well
+        # B3: CLOSE only when |v_hand − v_obj|_xy × t_close ≤ slack as well
         # (claim_timing.close_speed_guard). The hand keeps riding until it matches.
         ct = cfg.get("claim_timing") if isinstance(cfg.get("claim_timing"), dict) else {}
         self.close_speed_gate = bool(ct.get("close_speed_guard", False))
+        # Slack over finger_close_s → |Δv| lim. Cfg mm wins; else plan 2.5 mm.
+        if "close_speed_slack_m" in ct:
+            self.close_speed_slack_m = float(ct["close_speed_slack_m"])
+        elif "close_speed_slack_mm" in ct:
+            self.close_speed_slack_m = float(ct["close_speed_slack_mm"]) * 1e-3
+        else:
+            self.close_speed_slack_m = 0.0025
         # Carry / lower / lift *arrival* height — looser than the grasp close gate.
         # Held hands settle ~12–15 mm above the drop command; 15 mm made lowers stall.
         self.place_z_tol = self._f("place_z_tol", 0.03)
@@ -213,6 +232,13 @@ class PickPlaceStateMachine:
         # --- heights ------------------------------------------------------
         self.lift_height = self._f("lift_height")
         self.drop_z_gap = self._f("drop_z_gap")
+        # Floor for chase/close aim Z (ride-contact: avocado/peach tip through table).
+        if "min_aim_z_above_table_m" in scene:
+            self.min_aim_z_above_table = float(scene["min_aim_z_above_table_m"])
+        else:
+            self.min_aim_z_above_table = float(
+                scene.get("min_aim_z_above_table_mm", 15.0)
+            ) * 1e-3
         # Claim p̂z / z_grasp (collect ≥20 cm, lock median <10 cm). See grasp_height.
         from interfaces.grasp_height import ZLatch
 
@@ -326,11 +352,6 @@ class PickPlaceStateMachine:
             raise KeyError(f"state_machine_params.{key}")
         return float(default)
 
-    @property
-    def tau(self) -> float:
-        """Effective command-to-motion lag (approach pad + one zero-order-hold step)."""
-        return self.robot_approach_pad_s + self.dt
-
     # --------------------------------------------------------------- public
     def set_box_poses(
         self,
@@ -403,6 +424,48 @@ class PickPlaceStateMachine:
         x, y = float(obj[0]), float(obj[1])
         return not (ax0 <= x <= ax1 and ay0 <= y <= ay1)
 
+    def _path_to_reach_zone_m(self, obj: np.ndarray, vel: np.ndarray) -> float:
+        """Distance the object travels (straight line, XY) before it enters the
+        unreachable circle of radius ``reach_zone_r`` around the robot base
+        (world origin). inf if the path misses it or the check is off."""
+        r = float(self.reach_zone_r)
+        v = np.asarray(vel, dtype=np.float64).reshape(-1)[:2]
+        s = float(np.linalg.norm(v))
+        if r <= 0.0 or s < 1e-6:
+            return float("inf")
+        p = np.asarray(obj, dtype=np.float64).reshape(-1)[:2]
+        u = v / s
+        b = float(p @ u)
+        c = float(p @ p) - r * r
+        if c <= 0.0:
+            return 0.0  # already inside
+        disc = b * b - c
+        if b >= 0.0 or disc < 0.0:
+            return float("inf")  # moving away, or passes outside the circle
+        return float(-b - np.sqrt(disc))
+
+    def _reach_stop_now(
+        self,
+        ee: np.ndarray,
+        obj: np.ndarray,
+        vel: np.ndarray,
+        delta_meas_s: float | None,
+    ) -> bool:
+        """Stop the chase: object within ``reach_stop_m`` of the unreachable zone.
+
+        A hand already riding the object (inside the XY chase box) is about to
+        close, so it may continue until the object is actually in the zone
+        (C30 s1017 was cancelled 2 mm from a good close).
+        """
+        p = obj if delta_meas_s is None else self._forecast(obj, vel, float(delta_meas_s))
+        d = self._path_to_reach_zone_m(p, vel)
+        if d >= self.reach_stop_m:
+            return False
+        riding = abs(float(ee[0] - p[0])) <= float(self.grasp_xyz_ok[0]) and abs(
+            float(ee[1] - p[1])
+        ) <= float(self.grasp_xyz_ok[1])
+        return (not riding) or d <= 0.0
+
     def _clip_aim_xy(self, aim: np.ndarray) -> np.ndarray:
         """Keep aim XY on the table when bounds are set."""
         out = np.asarray(aim, dtype=np.float64).reshape(3).copy()
@@ -441,7 +504,9 @@ class PickPlaceStateMachine:
         self.lift_z: float | None = None
         self.grasp_xy: np.ndarray | None = None
         self._home_anchor: np.ndarray | None = None  # hand pose when go-home began
+        self._home_crossing = False  # go-home leg 3 started (latched; see _home_target)
         self._open_anchor: np.ndarray | None = None  # hand pose when open began
+        self._lift_anchor: np.ndarray | None = None  # hand pose when lift began
         self._z_latch.reset()
         self.z_grasp: float | None = None  # expert aim height
         self.p_hat_z: float | None = None  # policy pack height
@@ -461,6 +526,9 @@ class PickPlaceStateMachine:
         self.close_z_err_m: float | None = None
         self.dv_at_close_m_s: float | None = None
         self.t_lag_meas_s: float | None = None
+        # Chase stopped by the reach rule → B1 judge labels it F1 "unreachable".
+        self.reach_stopped = False
+        self.aim_branch = "none"  # last tick's chase-aim branch (AIM_BRANCHES)
 
     def set_pre_shape(self, open_frac: float, *, w_pre_m: float | None = None, clamped: bool = False) -> None:
         """Set approach gripper opening (0=shut, 1=full). Call once per episode from w_pre."""
@@ -490,6 +558,7 @@ class PickPlaceStateMachine:
             "close_z_err_m": self.close_z_err_m,
             "dv_at_close_m_s": self.dv_at_close_m_s,
             "t_lag_meas_s": self.t_lag_meas_s,
+            "unreachable": bool(self.reach_stopped),
         }
 
     # -------------------------------------------------------------- helpers
@@ -504,25 +573,19 @@ class PickPlaceStateMachine:
         p, _ = kinematic_forecast(pos, vel, float(horizon_s), self.dt)
         return p
 
-    def _intercept_lead_s(
+    def _intercept_travel_s(
         self,
         ee: np.ndarray,
         obj: np.ndarray,
         vel: np.ndarray,
         goal_z: float | None = None,
     ) -> float:
-        """Lookahead horizon: hand travel time, fixed-point solved, capped at ``lookahead_s``.
+        """Hand travel time to the coasting object, capped at ``lookahead_s``.
 
-        Travel time is measured to where the object *will be*, without ``tau``:
-
-        ``tau`` is a command offset, not distance the hand has to cover — in
-        steady state the hand sits on the object while the command runs ahead.
-        Folding ``tau`` into the distance would leave a floor of ``v * tau`` and
-        the horizon would never collapse.
-
-        Far from the object the 0.25 s cap binds → aim a full look-ahead ahead.
-        On top of the object travel time → 0 → the lead collapses to ``tau`` and
-        the hand rides the object instead of running ahead of it.
+        Fixed-point: guess time → where object will be → recompute time.
+        No ``tau`` / Δ pad here — callers add tip_lag only when needed.
+        Pass ``obj`` = object-*now* (already unwrapped by Δ) so Δ is not
+        double-counted on top of travel time.
         """
         gz = float(obj[2] if goal_z is None else goal_z)
         t_travel = 0.0
@@ -530,7 +593,25 @@ class PickPlaceStateMachine:
             aim = self._forecast(obj, vel, min(t_travel, self.lookahead_s))
             goal = np.array([aim[0], aim[1], gz], dtype=np.float64)
             t_travel = float(np.linalg.norm(ee - goal)) / max(self.ee_speed_max, 1e-6)
-        return min(t_travel, self.lookahead_s) + self.tau
+        return min(t_travel, self.lookahead_s)
+
+    def _intercept_lead_s(
+        self,
+        ee: np.ndarray,
+        obj: np.ndarray,
+        vel: np.ndarray,
+        goal_z: float | None = None,
+    ) -> float:
+        """Far-chase lead from *now*: travel time + ``robot_approach_pad_s``.
+
+        Same for every Δ (pass ``obj`` = object-now). No extra ``dt``: the old
+        Δ=0-only ``+dt`` aimed one tick further ahead than the delayed path.
+        Far → look-ahead cap + pad. On top of the object → collapses to the pad
+        so the hand rides instead of running a fixed 0.25 s ahead.
+        """
+        return self._intercept_travel_s(ee, obj, vel, goal_z=goal_z) + float(
+            self.robot_approach_pad_s
+        )
 
     def _grasp_gate_ok(
         self,
@@ -743,10 +824,15 @@ class PickPlaceStateMachine:
         clear_z = max(float(home[2]), float(self.carry_pose[2]), self._retract_z())
         err_xy = float(np.linalg.norm(ee[:2] - home[:2]))
         # Two-leg trip: first straight up, then across. Only go across once high enough.
+        # Latched: starting across dips the hand a few cm, which used to drop it back
+        # under the bar → "climb in place" → stop → cross again (7–13 flips, C30 s1000/s1001).
+        if self._home_crossing:
+            return home
         if err_xy >= self.servo_xy_tol and float(ee[2]) < clear_z - self.home_z_tol:
             t = ee.copy()
             t[2] = clear_z
             return t
+        self._home_crossing = True
         return home
 
     def _in_container(self, obj: np.ndarray) -> bool:
@@ -782,15 +868,22 @@ class PickPlaceStateMachine:
         wrist_cam_z: float | None = None,
         *,
         delta_meas_s: float | None = None,
+        delta_true_s: float | None = None,
         forecast_off: bool = False,
+        ee_vel: np.ndarray | None = None,
     ) -> ExpertCommand:
         """Advance one control step. Returns the EE command for this tick.
 
-        ``state`` must be the delayed observation pack for B1 (GT at t−Δ), not
-        live GT. Live proprio (``ee_pos`` / ``ee_quat``) is fine.
+        ``state`` must be the delayed observation pack for B1 (GT at t-Δ), not
+        live GT. Live proprio (``ee_pos`` / ``ee_quat`` / ``ee_vel``) is fine.
 
-        ``delta_meas_s``: when set, intercept lead is Δ_meas + tip_lag (+ dt when
-        far). ``forecast_off``: aim at the delayed position p (negative control).
+        ``delta_meas_s``: age used to build p_now = p_delayed + v·Δ for chase
+        travel (do not add Δ again on top of travel). 
+        Ride aim = p_now. ``delta_true_s``: true age of ``state`` — gate/settle against
+        p + v·Δ_true (not noisy Δ_meas; η was kicking good close ticks out of
+        the 2 mm box). ``forecast_off``: aim at the delayed position p.
+        ``ee_vel``: Isaac EE-link world velocity for the close-speed gate
+        (preferred). Falls back to FD of ``ee_pos`` only when omitted (unit tests).
         """
         ee = np.asarray(ee_pos, dtype=np.float64).reshape(3)
         ee_q = np.asarray(ee_quat, dtype=np.float64).reshape(4)
@@ -798,21 +891,18 @@ class PickPlaceStateMachine:
         vel = np.asarray(state.velocity, dtype=np.float64).reshape(3)
         speed = float(np.linalg.norm(vel))
         prev_stage = self.stage
-        # Hand velocity from the previous tick's pose (B3 close gate).
-        v_hand = None if self._prev_ee is None else (ee - self._prev_ee) / max(self.dt, 1e-6)
+        # Close-gate hand speed: Isaac EE link vel when given; else FD (tests).
+        if ee_vel is not None:
+            v_hand = np.asarray(ee_vel, dtype=np.float64).reshape(3)
+        else:
+            v_hand = None if self._prev_ee is None else (ee - self._prev_ee) / max(self.dt, 1e-6)
         self._prev_ee = ee.copy()
+        self.aim_branch = "none"  # set below only if a chase aim is computed
         self._ee_hist.append(ee.copy())
         del self._ee_hist[:-90]  # keep 3 s at 30 Hz (Δ ≤ 300 ms needs 10)
         # Hand when the observed frame was taken (Δ_meas ago; live when no delay).
         k_obs = 0 if delta_meas_s is None else int(round(float(delta_meas_s) / self.dt))
         ee_obs = self._ee_hist[-1 - min(k_obs, len(self._ee_hist) - 1)]
-
-        # B1: τ_k = Δ_meas + tip_lag + dt (dt = one ZOH step, same as legacy tau
-        # when Δ=0 so the calibrated 175 ms pad still lands the hand on the object).
-        if delta_meas_s is not None:
-            base_tau = float(delta_meas_s) + float(self.robot_approach_pad_s) + float(self.dt)
-        else:
-            base_tau = float(self.tau)
 
         # Defaults each tick: pre-shape open (not fully open), object slides,
         # not held, not frozen. Stages below override only what they need.
@@ -851,6 +941,21 @@ class PickPlaceStateMachine:
                 self.stage = STAGE_HOME
                 self.timer_s = 0.0
                 target = self._home_target(ee)
+            elif self.reach_stop_m > 0.0 and self._reach_stop_now(ee, obj, vel, delta_meas_s):
+                # Not closing yet and the object is about to enter the zone the
+                # arm cannot work in: stop now instead of jamming the elbow.
+                logger.info(
+                    "    object %.0f cm from the unreachable zone (r < %.0f cm) at "
+                    "(%.3f, %.3f); going home",
+                    100.0 * self._path_to_reach_zone_m(obj, vel),
+                    100.0 * self.reach_zone_r,
+                    float(obj[0]),
+                    float(obj[1]),
+                )
+                self.reach_stopped = True
+                self.stage = STAGE_HOME
+                self.timer_s = 0.0
+                target = self._home_target(ee)
             else:
                 target_z = self._update_z_grasp(
                     ee,
@@ -861,30 +966,77 @@ class PickPlaceStateMachine:
                     static_cam_z=static_cam_z,
                     wrist_cam_z=wrist_cam_z,
                 )
-                # Delayed obs is at t−Δ. Gate/settle against where the object is
-                # *now* (p + v·Δ_meas). Aim still leads by tip_lag on top of that.
-                # forecast_off: gate against delayed p so the negative control misses.
-                if bool(forecast_off) or delta_meas_s is None:
+                # Never aim tips through the table (ride-contact avocado/peach dives).
+                z_floor = float(self._z_latch.z_table) + float(self.min_aim_z_above_table)
+                if target_z < z_floor:
+                    target_z = z_floor
+                # Delayed obs is at t−Δ. Gate/settle against true *now*
+                # (p + v·Δ_true when known). Fall back to Δ_meas.
+                # Chase travel uses p_now from Δ_meas (may include η).
+                # Sign: e = hand − object; along-track + = hand ahead of object.
+                if bool(forecast_off):
                     obj_now = obj
-                else:
+                elif delta_true_s is not None:
+                    obj_now = self._forecast(obj, vel, float(delta_true_s))
+                elif delta_meas_s is not None:
                     obj_now = self._forecast(obj, vel, float(delta_meas_s))
+                else:
+                    obj_now = obj
                 near_ok, err_xy, err_z = self._grasp_gate_ok(
                     ee, obj_now, wrist_depth_m, goal_z=target_z
                 )
-                # Inside the chase box: ride with base_tau. Far: full intercept
-                # on top of that lead. forecast_off → aim at delayed p (B1 neg).
+                # Age of the observation (0 when live). Only used for the lead
+                # log line — the aim below has no Δ fork: obj_now already
+                # unwraps Δ once, so Δ=0 and Δ>0 run the same formulas.
+                obs_age_s = (
+                    0.0
+                    if delta_meas_s is None
+                    else float(
+                        delta_true_s if delta_true_s is not None else delta_meas_s
+                    )
+                )
+                # Ride: reference is p_now (unwrap Δ once). Settle aim = p_now,
+                # no hand-written +dt: with DiffIK FF (v̂_obj) a +v·dt aim parks
+                # the hand v·dt/(1+ride_k) ahead — outside the 2 mm close box
+                # (C30 +3.5 mm ride lead). An older bare-p_now run trailed
+                # −5 mm (before FF); if it trails again, tune the FF τ, not a
+                # tick here. Far chase: p_now + v·(travel + pad). Do NOT add Δ
+                # again. forecast_off → delayed p.
+                # ``aim_branch`` is logged per tick (code-path flag, not a
+                # post-hoc label).
                 if bool(forecast_off):
+                    self.aim_branch = "forecast_off"
                     lead_s = 0.0
+                    aim = np.array(obj, dtype=np.float64).copy()
                 elif near_ok:
-                    lead_s = float(base_tau)
+                    self.aim_branch = "settle"
+                    lead_s = obs_age_s
+                    aim = np.array(obj_now, dtype=np.float64).copy()
                 else:
-                    lead_s = self._intercept_lead_s(ee, obj, vel, goal_z=target_z)
-                    if delta_meas_s is not None:
-                        # Intercept solve already includes tip pad; add measured Δ.
-                        lead_s = float(lead_s) + float(delta_meas_s)
-                aim = np.array(self._forecast(obj, vel, lead_s), dtype=np.float64)
-                if near_ok and not bool(forecast_off) and self.ride_k > 0.0:
-                    aim[:2] = aim[:2] + self.ride_k * (obj_now[:2] - ee[:2])
+                    self.aim_branch = "far_chase"
+                    lead_from_now = self._intercept_lead_s(
+                        ee, obj_now, vel, goal_z=target_z
+                    )
+                    aim = np.array(
+                        self._forecast(obj_now, vel, lead_from_now),
+                        dtype=np.float64,
+                    )
+                    lead_s = obs_age_s + float(lead_from_now)
+                if near_ok and not bool(forecast_off):
+                    # gap · û > 0 ⇒ object ahead of hand (hand behind).
+                    gap = obj_now[:2] - ee[:2]
+                    inside_close = (
+                        abs(float(gap[0])) <= float(self.close_xy_ok)
+                        and abs(float(gap[1])) <= float(self.close_xy_ok)
+                    )
+                    if inside_close:
+                        # Hold the current hand XY. DiffIK FF (v̂_obj) coasts
+                        # the hand with the object so |Δv| can fall while |e|
+                        # stays in the 2 mm box (s1003 was hunting through it).
+                        aim[:2] = ee[:2].copy()
+                    elif self.ride_k > 0.0:
+                        # Soft pull while still outside the close box.
+                        aim[:2] = aim[:2] + self.ride_k * gap
                 aim = self._clip_aim_xy(aim)
                 target = np.array([aim[0], aim[1], target_z], dtype=np.float64)
 
@@ -916,6 +1068,7 @@ class PickPlaceStateMachine:
                         t_contact_s=float(self.t_contact_s),
                         xy_ok_m=float(self.close_xy_ok),
                         close_time_s=float(self.finger_close_s),
+                        slack_m=float(self.close_speed_slack_m),
                     )
                     settled = bool(pred.ok) if self.close_speed_gate else bool(pred.ok_xy)
                 elif settled and self.close_speed_gate:
@@ -944,22 +1097,22 @@ class PickPlaceStateMachine:
                     self.close_z_err_m = float(err_z)
                     if v_hand is not None:
                         self.dv_at_close_m_s = float(np.linalg.norm(v_hand[:2] - vel[:2]))
-                    # Tip lag ≈ hand trail / speed along motion (when moving).
+                    # Tip lag ≈ how far the hand trails / speed (when moving).
+                    # Ahead sign: (hand − obj)·û > 0 ⇒ hand ahead; lag = −ahead.
                     if speed > 0.02 and v_hand is not None:
-                        # Along-track lag: (obj − hand) · v_hat / |v|
                         vhat = vel[:2] / max(speed, 1e-6)
-                        trail = float(np.dot((obj[:2] - ee[:2]), vhat))
-                        self.t_lag_meas_s = trail / speed
+                        ahead = float(np.dot((ee[:2] - obj_now[:2]), vhat))
+                        self.t_lag_meas_s = (-ahead) / speed
                     self.lift_z = float(ee[2]) + self.lift_height
                     self.stage = STAGE_CLOSE
                     self.timer_s = 0.0
                     # Same-tick CLOSE: elif below will not run this frame, so shut
                     # the command now (else the log still shows pre-shape open).
                     grip = 0.0
-                    close_lead = 0.0 if bool(forecast_off) else float(base_tau)
-                    aim = self._clip_aim_xy(self._forecast(obj, vel, close_lead))
+                    # Hold hand XY (FF coasts with v̂_obj). A base_tau forecast
+                    # snap here shoved s1003 ~2 mm off and the egg slipped.
                     z_close = float(self.z_grasp) if self.z_grasp is not None else float(obj[2])
-                    target = np.array([aim[0], aim[1], z_close], dtype=np.float64)
+                    target = np.array([ee[0], ee[1], z_close], dtype=np.float64)
                     if self.physics_grasp:
                         attach, kin = False, True
                     else:
@@ -971,13 +1124,11 @@ class PickPlaceStateMachine:
         # weld mode glues the object to the hand; physics mode frees it to PhysX
         # and the fingers squeeze it. Same flag, the scene decides (sim/scene.py).
         elif self.stage == STAGE_CLOSE:
-            # Ride with base_tau (same as settle): the command does not jump at
-            # the transition, so the hand keeps ~v_obj while the fingers shut.
+            # Hold hand XY; DiffIK FF keeps ~v_obj while the fingers shut.
+            # Do not snap to forecast(base_tau) — that jerked s1003 off-center.
             grip = 0.0
-            close_lead = 0.0 if bool(forecast_off) else float(base_tau)
-            aim = self._clip_aim_xy(self._forecast(obj, vel, close_lead))
             z_close = float(self.z_grasp) if self.z_grasp is not None else float(obj[2])
-            target = np.array([aim[0], aim[1], z_close], dtype=np.float64)
+            target = np.array([ee[0], ee[1], z_close], dtype=np.float64)
             if self.physics_grasp and self.timer_s < self.finger_close_s:
                 # Keep the scripted coast until pads are closed. Freeing on tick 0
                 # left a 50 cm/s shear and every close slipped at ~10 cm.
@@ -1019,9 +1170,15 @@ class PickPlaceStateMachine:
             grip, attach, kin = 0.0, True, False
             if self.lift_z is None:
                 self.lift_z = float(ee[2]) + self.lift_height
-            target = ee.copy()
-            if self.grasp_xy is not None:
-                target[0], target[1] = float(self.grasp_xy[0]), float(self.grasp_xy[1])
+            # Straight up from where the hand was when LIFT began. Snapping XY to
+            # grasp_xy (object at CLOSE) sheared s1003: free-on-contact left a ~9 mm
+            # pinch offset, then the hand yanked back to the old XY and the egg
+            # slipped. Tracking the live hand instead had no XY pull at all, so any
+            # sideways drift was accepted (15 mm, C30 s1001). Anchor = no jump, and
+            # still a restoring pull.
+            if self._lift_anchor is None:
+                self._lift_anchor = ee.copy()
+            target = self._lift_anchor.copy()
             target[2] = self.lift_z
             if float(ee[2]) >= self.lift_z - self.place_z_tol:
                 self.stage = STAGE_CARRY
@@ -1104,8 +1261,11 @@ class PickPlaceStateMachine:
         # Anchors live only while their stage runs (a retry can re-enter later).
         if self.stage != STAGE_OPEN:
             self._open_anchor = None
+        if self.stage != STAGE_LIFT:
+            self._lift_anchor = None
         if self.stage != STAGE_HOME:
             self._home_anchor = None
+            self._home_crossing = False
 
         # Log only on a stage change, so the human log reads like a short story.
         if self.stage != prev_stage:
@@ -1131,6 +1291,19 @@ class PickPlaceStateMachine:
                     100.0 * float(self.grasp_xyz_ok[2]),
                 )
 
+        # DiffIK FF: pass v̂_obj (observed/coast object velocity — same vector
+        # ``_forecast`` integrates). Never FD of aim. Fixed poses → v=0.
+        # Only while the object moves on its own (chase, and CLOSE until the
+        # attach). Once held, v̂_obj IS the hand velocity: feeding it forward
+        # made the arm aim 1/K ahead of its own motion — carry overshot to 31 cm
+        # and dove to 8 cm into the bowl (C30 s1000/s1001).
+        if self.stage in (STAGE_APPROACH, STAGE_DESCEND) or (
+            self.stage == STAGE_CLOSE and kin and not attach
+        ):
+            cmd_vel = vel.copy()  # v̂_obj
+        else:
+            cmd_vel = np.zeros(3, dtype=np.float64)
+
         # kinematic only when not holding: a held object follows the hand instead.
         return ExpertCommand(
             position=target,
@@ -1140,4 +1313,5 @@ class PickPlaceStateMachine:
             kinematic_object=bool(kin and not attach),
             attach_object=bool(attach),
             freeze_object=bool(freeze),
+            velocity=cmd_vel,
         )

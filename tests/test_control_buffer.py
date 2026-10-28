@@ -66,3 +66,25 @@ def test_bad_inputs():
     b.push_chunk(chunk(1, d=2), 0.0, 0.1)
     with pytest.raises(ValueError):
         b.push_chunk(chunk(1, d=3), 1.0, 0.1)
+
+
+def test_now_keeps_slot_due_this_tick():
+    # Chunk arrives between ticks: slot 0.229 is due at tick 0.233 and must survive the push.
+    b = ActionBuffer()
+    b.push_chunk(chunk(1, n=5), t0=0.229, dt=1 / 30, now=0.233)
+    assert b.t[0] == pytest.approx(0.229)
+    assert b.pop_due(0.233) is not None
+
+
+def test_older_frame_chunk_is_ignored():
+    b = ActionBuffer(max_age=1.0)
+    assert b.push_chunk(chunk(2, n=5), t0=0.30, dt=0.1, obs_t=0.20)
+    assert not b.push_chunk(chunk(1, n=5), t0=0.25, dt=0.1, obs_t=0.10)  # arrived late, older frame
+    assert b.pop_due(0.35)[0] == 2.0
+
+
+def test_clear_resets_frame_time():
+    b = ActionBuffer()
+    b.push_chunk(chunk(1), t0=0.0, dt=0.1, obs_t=5.0)
+    b.clear()
+    assert b.push_chunk(chunk(1), t0=0.0, dt=0.1, obs_t=0.0)

@@ -18,7 +18,7 @@ import numpy as np
 from interfaces.state import CONDITIONING_DIM, CONDITIONING_LAYOUT, conditioning_vector
 from policy.features import default_language
 from sim.state_machine_logs import log_episode_begin
-from sim.state_machine import STAGE_DONE, inference_window_steps
+from sim.state_machine import AIM_BRANCHES, STAGE_DONE, inference_window_steps
 
 if TYPE_CHECKING:
     from sim.scene import Phase0Scene
@@ -35,6 +35,7 @@ JSON_TRACE_KEYS = (
     "object_pos",
     "object_vel",
     "ee_pos",
+    "ee_pre",
     "action_pos",
     "gripper",
     "conditioning",
@@ -202,6 +203,9 @@ def run_episode(
     speed: float,
     save_images: bool = False,
     delta: float | None = None,
+    obs_delay_s: float | None = None,
+    forecast_off: bool = False,
+    depth_noise: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run one scripted episode. Returns (episode_arrays, meta).
 
@@ -209,10 +213,12 @@ def run_episode(
     expert's aiming ``lookahead_s``. Default is ``conditioning_delta_s`` when
     present, else ``lookahead_s`` (getattr race-safe).
 
-    Each step: read true state → expert gives hand orders → scene moves → log
-    the world AFTER the move. Stops at the "done" stage or the step cap.
-    ``seed`` fixes the episode so it can be replayed. This function does not
-    say if the run succeeded; the caller does that from the logged arrays.
+    B1 oracle: pass ``obs_delay_s`` (cell Δ). The expert then only sees GT at
+    t−Δ via ``ObsDelayBuffer``; motions still run the same tick. ``forecast_off``
+    aims at delayed p (negative control). ``depth_noise`` adds σ(Z)² + hand-eye.
+
+    Each step: read true state → (optional delay) → expert → scene → log.
+    Stops at the "done" stage or the step cap. Does not judge success.
     """
     if delta is None:
         delta = float(getattr(expert, "conditioning_delta_s", expert.lookahead_s))
@@ -292,6 +298,8 @@ def run_episode(
         "object_pos": [],
         "object_vel": [],
         "ee_pos": [],
+        "ee_pre": [],
+        "ee_vel": [],
         "ee_quat": [],
         "proprio": [],
         "action_pos": [],
@@ -306,6 +314,13 @@ def run_episode(
         "capture_t0": [],
         "applied_delta_s": [],
         "reported_delta_s": [],
+        # B1 obs-delay bookkeeping.
+        "t_capture_used": [],
+        "t_exec": [],
+        "delta_meas_s": [],
+        "delta_round_s": [],
+        # Expert code-path flag: index into AIM_BRANCHES (meta aim_branch_codes).
+        "aim_branch": [],
     }
     if save_images:
         log["static_cam_rgb"] = []
@@ -336,20 +351,32 @@ def run_episode(
 
     # Step 1: delay injection. When enabled, log t0 / applied / reported Δ and
     # (if enforce_apply_at) hold motions until apply_at = t0 + applied_Δ.
+    # B1 obs buffer: Δ ages the expert's observations; do NOT also enforce_apply.
     delay = None
     ct = scene.cfg.get("claim_timing", {}) if isinstance(scene.cfg, dict) else {}
     ct = ct if isinstance(ct, dict) else {}
-    if bool(ct.get("enabled", False)):
+    use_obs_delay = obs_delay_s is not None or bool(ct.get("obs_delay_buffer", False))
+    delta_true_s = float(obs_delay_s) if obs_delay_s is not None else float(
+        ct.get("eval_delta_s", 0.0) or 0.0
+    )
+    if bool(ct.get("enabled", False)) and not use_obs_delay:
         from control import DelayInjection
 
         delay = DelayInjection.from_cfg(scene.cfg, seed=int(seed))
-    enforce_apply = bool(delay is not None) and bool(ct.get("enforce_apply_at", True))
+    enforce_apply = (
+        bool(delay is not None)
+        and bool(ct.get("enforce_apply_at", True))
+        and not use_obs_delay
+    )
     use_noisy = bool(ct.get("use_noisy_gt", False))
     close_guard = bool(ct.get("close_speed_guard", False))
-    meta["claim_timing"] = bool(delay is not None)
+    meta["claim_timing"] = bool(delay is not None) or bool(use_obs_delay)
     meta["enforce_apply_at"] = bool(enforce_apply)
     meta["use_noisy_gt"] = bool(use_noisy)
     meta["close_speed_guard"] = bool(close_guard)
+    meta["obs_delay_buffer"] = bool(use_obs_delay)
+    meta["obs_delay_s"] = float(delta_true_s) if use_obs_delay else None
+    meta["forecast_off"] = bool(forecast_off)
 
     noisy_filt = None
     if use_noisy:
@@ -359,15 +386,74 @@ def run_episode(
 
     from sim.state_machine import STAGE_CLOSE
 
+    # B1 frame-delay buffer + Δ_meas sampler + optional depth noise / hand-eye.
+    obs_buf = None
+    delta_meas = None
+    hand_eye = np.zeros(3, dtype=np.float64)
+    depth_rng = np.random.default_rng(int(seed) + 17)
+    if use_obs_delay:
+        from sim.obs_delay import DeltaMeasSampler, ObsDelayBuffer, DelayedFrame, w_pre_m
+
+        obs_buf = ObsDelayBuffer(dt=float(scene.dt))
+        delta_meas = DeltaMeasSampler(
+            delta_true_s=float(delta_true_s),
+            noise_std_s=float(ct.get("delta_meas_noise_s", 0.005)),
+            replan_period_s=float(ct.get("delta_meas_replan_s", 0.33)),
+            seed=int(seed) + 3,
+        )
+        # Fixed 1 mm hand-eye offset, random direction, fixed for this episode.
+        direction = depth_rng.normal(size=3)
+        n = float(np.linalg.norm(direction))
+        hand_eye = (direction / max(n, 1e-9)) * 0.001
+        meta["hand_eye_m"] = hand_eye.tolist()
+        # Pre-shape from object width along finger axis at grasp yaw.
+        obj_size = getattr(scene, "_object_size", None)
+        if obj_size is not None:
+            if getattr(expert, "grasp_yaw_mode", "fixed") == "along":
+                # Hand yaw follows the throw, so open for the widest XY side.
+                s = np.asarray(obj_size, dtype=np.float64).reshape(3)
+                m = float(max(s[0], s[1]))
+                obj_size = np.array([m, m, float(s[2])])
+            wp, clamped, raw = w_pre_m(
+                obj_size,
+                grasp_yaw_rad=0.0,
+                slack_m=float(ct.get("pre_shape_slack_m", 0.005)),
+                max_open_m=float(ct.get("pre_shape_max_open_m", 0.080)),
+            )
+            open_gap = 2.0 * float(scene.cfg["robot"]["gripper_open"])
+            open_frac = float(np.clip(wp / max(open_gap, 1e-6), 0.0, 1.0))
+            if hasattr(expert, "set_pre_shape"):
+                expert.set_pre_shape(open_frac, w_pre_m=wp, clamped=clamped)
+            # Oracle B1: delayed GT top is the intended height channel.
+            expert.oracle_z_top = True
+            meta["w_pre_m"] = float(wp)
+            meta["w_pre_raw_m"] = float(raw)
+            meta["w_pre_clamped"] = bool(clamped)
+
     # Pending expert cmds waiting for apply_at; held = last released cmd.
     pending: list[tuple[float, Any, Any]] = []
     held_cmd = None
-    prev_ee = None
+    held_t0 = -np.inf  # camera time of the frame held_cmd was planned from
+
+    def _add_depth_noise(depth: np.ndarray | None) -> np.ndarray | None:
+        """σ(Z) = 10 mm × (Z/0.50 m)² plus fixed hand-eye on back-projected Z later."""
+        if depth is None or not depth_noise:
+            return depth
+        d = np.asarray(depth, dtype=np.float64).copy()
+        # Approximate Z ≈ depth for wrist (close enough for the σ law).
+        z = np.clip(d, 0.05, 2.0)
+        sig = 0.010 * (z / 0.50) ** 2
+        ok = np.isfinite(d) & (d > 0.05)
+        noise = depth_rng.normal(0.0, 1.0, size=d.shape) * sig
+        d = np.where(ok, d + noise, d)
+        return d.astype(np.float32) if depth.dtype == np.float32 else d
 
     # Main loop: expert looks → (optional delay) → scene acts → log.
     for t in range(n_steps):
-        state = scene.get_object_state()
+        live_state = scene.get_object_state()
         ee_pos, ee_quat = scene.get_ee_pose()
+        # Isaac EE-link velocity for the close-speed gate (not FD of ee_pos).
+        ee_vel = scene.get_ee_lin_vel()
         depth_m = scene.get_wrist_depth_m() if "wrist_cam" in scene.cameras else float("nan")
         depth_img = scene.get_wrist_depth() if "wrist_cam" in scene.cameras else None
         static_depth = scene.get_static_depth() if "static_cam" in scene.cameras else None
@@ -376,45 +462,104 @@ def run_episode(
             scene.get_wrist_cam_pose() if "wrist_cam" in scene.cameras else None
         )
         wrist_cam_z = float(wrist_pose[0][2]) if wrist_pose is not None else None
-        planned = expert.step(
-            state,
-            ee_pos,
-            ee_quat,
-            wrist_depth_m=depth_m,
-            wrist_depth_img=depth_img,
-            static_depth_img=static_depth,
-            static_cam_z=static_z,
-            wrist_cam_z=wrist_cam_z,
+        if depth_noise:
+            depth_img = _add_depth_noise(depth_img)
+            static_depth = _add_depth_noise(static_depth)
+
+        t0 = float(
+            getattr(
+                scene,
+                "last_capture_t0",
+                getattr(scene, "_sim_time", live_state.timestamp),
+            )
         )
+        now = float(getattr(scene, "_sim_time", t0))
+
+        # Expert observation: delayed pack (B1) or live GT (legacy).
+        t_capture_used = t0
+        delta_meas_s = float("nan")
+        delta_round = float("nan")
+        if obs_buf is not None and delta_meas is not None:
+            from sim.obs_delay import DelayedFrame
+
+            # Push live, then read aged frame. Hand-eye shifts delayed object XY/Z.
+            st_push = live_state
+            pos = live_state.position.copy() + hand_eye
+            from interfaces.state import oracle_from_gt
+
+            st_push = oracle_from_gt(
+                pos, live_state.velocity, live_state.timestamp, valid=live_state.valid
+            )
+            obs_buf.push(
+                DelayedFrame(
+                    t_capture=t0,
+                    state=st_push,
+                    wrist_depth_m=float(depth_m),
+                    wrist_depth_img=None if depth_img is None else np.asarray(depth_img).copy(),
+                    static_depth_img=(
+                        None if static_depth is None else np.asarray(static_depth).copy()
+                    ),
+                    static_cam_z=static_z,
+                    wrist_cam_z=wrist_cam_z,
+                )
+            )
+            delayed = obs_buf.get_delayed(now, float(delta_true_s))
+            state = delayed.state
+            depth_m = delayed.wrist_depth_m
+            depth_img = delayed.wrist_depth_img
+            static_depth = delayed.static_depth_img
+            static_z = delayed.static_cam_z
+            wrist_cam_z = delayed.wrist_cam_z
+            t_capture_used = float(delayed.t_capture)
+            delta_round = float(obs_buf.last_round_dt_s)
+            delta_meas_s = float(delta_meas.update(now))
+            planned = expert.step(
+                state,
+                ee_pos,
+                ee_quat,
+                wrist_depth_m=depth_m,
+                wrist_depth_img=depth_img,
+                static_depth_img=static_depth,
+                static_cam_z=static_z,
+                wrist_cam_z=wrist_cam_z,
+                delta_meas_s=delta_meas_s,
+                delta_true_s=float(delta_true_s),
+                forecast_off=bool(forecast_off),
+                ee_vel=ee_vel,
+            )
+        else:
+            state = live_state
+            planned = expert.step(
+                state,
+                ee_pos,
+                ee_quat,
+                wrist_depth_m=depth_m,
+                wrist_depth_img=depth_img,
+                static_depth_img=static_depth,
+                static_cam_z=static_z,
+                wrist_cam_z=wrist_cam_z,
+                ee_vel=ee_vel,
+            )
         if reflex is not None:
             from control import overlay_reflex
 
             planned, _ = overlay_reflex(planned, reflex, state, ee_pos)
 
-        # Optional close-speed: if hand and object slide apart, ride object XY.
-        if close_guard and int(planned.stage) == int(STAGE_CLOSE):
-            from control import close_speed_check
+        # B3 close-speed lives in the expert (PickPlaceStateMachine): CLOSE is
+        # entered only once hand and object speeds match. No override here —
+        # snapping the aim back onto the object made the lagging hand brake.
 
-            dt = float(scene.dt)
-            if prev_ee is None:
-                v_hand = np.asarray(state.velocity, dtype=np.float64)
-            else:
-                v_hand = (np.asarray(ee_pos, dtype=np.float64) - prev_ee) / max(dt, 1e-6)
-            chk = close_speed_check(v_hand, state.velocity)
-            if not chk.ok:
-                pos = np.asarray(planned.position, dtype=np.float64).copy()
-                pos[0:2] = np.asarray(state.position, dtype=np.float64)[0:2]
-                planned.position = pos
-
-        # Obs stamp for this plan: last camera capture (or current sim time).
-        t0 = float(
-            getattr(scene, "last_capture_t0", getattr(scene, "_sim_time", state.timestamp))
-        )
         pack_delta = float(delta)
         applied_s = float("nan")
         reported_s = float("nan")
         sample = None
-        if delay is not None:
+        if use_obs_delay:
+            # Pack / forecast use measured Δ; applied = true cell Δ (obs age).
+            applied_s = float(delta_true_s)
+            reported_s = float(delta_meas_s) if np.isfinite(delta_meas_s) else float(delta_true_s)
+            pack_delta = float(reported_s)
+            held_cmd = planned
+        elif delay is not None:
             sample = delay.sample(t0, mode="train")
             pack_delta = float(sample.reported_delta_s)
             applied_s = float(sample.applied_delta_s)
@@ -426,12 +571,14 @@ def run_episode(
         else:
             held_cmd = planned
 
-        now = float(getattr(scene, "_sim_time", t0))
         if enforce_apply and pending:
             still: list[tuple[float, Any, Any]] = []
             for apply_at, cmd_i, samp_i in pending:
                 if now + 1e-9 >= float(apply_at):
-                    held_cmd = cmd_i
+                    # Δ is drawn per cycle, so an older frame can come due after a
+                    # newer one already runs. Never step back to older information.
+                    if float(samp_i.t0) >= held_t0 - 1e-9:
+                        held_cmd, held_t0 = cmd_i, float(samp_i.t0)
                 else:
                     still.append((apply_at, cmd_i, samp_i))
             pending = still
@@ -439,13 +586,14 @@ def run_episode(
             held_cmd = planned
 
         cmd = held_cmd
-        scene.set_ee_target(cmd.position, cmd.quat_wxyz, cmd.gripper_open)
+        # Pass aim velocity for DiffIK feedforward (zeros when the command has none).
+        cmd_vel = getattr(cmd, "velocity", None)
+        scene.set_ee_target(cmd.position, cmd.quat_wxyz, cmd.gripper_open, vel_w=cmd_vel)
         scene.step(
             kinematic_object=cmd.kinematic_object,
             attach_object=cmd.attach_object,
             freeze_object=cmd.freeze_object,
         )
-        prev_ee = np.asarray(ee_pos, dtype=np.float64).copy()
 
         # Log post-step state (world after action).
         state2 = scene.get_object_state()
@@ -480,7 +628,12 @@ def run_episode(
         log["wrist_depth_m"].append(depth_m)
         log["object_pos"].append(state2.position.copy())
         log["object_vel"].append(state2.velocity.copy())
+        # ee_pos = post-step TCP (physics). ee_pre = pose the expert planned from
+        # this tick — pair with action_pos for link-3 (post−aim grows with v as
+        # DiffIK lag; hand_aim_probe: TCP−pinch≈0 so frame is aligned).
         log["ee_pos"].append(ee_pos2.copy())
+        log["ee_pre"].append(ee_pos.copy())
+        log["ee_vel"].append(scene.get_ee_lin_vel())
         log["ee_quat"].append(ee_quat2.copy())
         log["proprio"].append(scene.get_proprio())
         # Log the *planned* action (what the expert wanted), not the delayed hold.
@@ -493,6 +646,16 @@ def run_episode(
         log["capture_t0"].append(t0_log)
         log["applied_delta_s"].append(applied_s)
         log["reported_delta_s"].append(reported_s)
+        log["t_capture_used"].append(float(t_capture_used))
+        # Exec time = when the cmd was applied (pre-step ``now``), not post-step
+        # sim time — otherwise lag is always Δ + dt and the delay check fails.
+        log["t_exec"].append(float(now))
+        log["delta_meas_s"].append(float(delta_meas_s))
+        log["delta_round_s"].append(float(delta_round))
+        # Which chase-aim branch the expert ran for the *planned* cmd this tick.
+        log["aim_branch"].append(
+            AIM_BRANCHES.index(getattr(expert, "aim_branch", "none"))
+        )
         ctr = scene.get_container_pose()
         log["container_pos"].append(
             ctr[0].copy() if ctr is not None else np.full(3, np.nan)
@@ -538,6 +701,17 @@ def run_episode(
     meta["off_table"] = bool(scene.off_table)  # object left the table footprint (a real miss)
     meta["abort_reason"] = getattr(scene, "abort_reason", None)
     meta["delta"] = float(delta)
+    meta["aim_branch_codes"] = list(AIM_BRANCHES)
     if hasattr(expert, "grasp_report"):
         meta.update(expert.grasp_report())
+    if obs_buf is not None:
+        meta["live_gt_leaks"] = int(obs_buf.live_gt_leaks)
+        meta["delta_round_median_s"] = (
+            float(np.median(episode["delta_round_s"]))
+            if "delta_round_s" in episode and episode["delta_round_s"].size
+            else None
+        )
+        if "t_exec" in episode and "t_capture_used" in episode:
+            lag = episode["t_exec"] - episode["t_capture_used"]
+            meta["obs_lag_median_s"] = float(np.median(lag)) if lag.size else None
     return episode, meta

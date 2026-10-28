@@ -23,6 +23,9 @@ from perception.estimator import StaticCamEstimator
 from perception.kalman import CVKalman
 from perception.track import BlobTracker
 
+# Drawn shapes have no lit-face / silhouette offset, so the render calibration
+# (StaticCamEstimator.uv_bias_px, fit on Isaac frames) is zeroed here.
+SYNTH_UV_BIAS = (0.0, 0.0)
 CFG = load_yaml(Path(__file__).resolve().parents[1] / "sim" / "phase0_cfg.yaml")
 DT = 0.04
 JITTER = 0.0005  # m per frame
@@ -148,7 +151,7 @@ def test_kalman_holds_still_after_long_blind_spell():
 
 
 def test_estimator_redetects_after_hand_hides_object(cam):
-    est = StaticCamEstimator.from_cfg(CFG)
+    est = StaticCamEstimator.from_cfg(CFG, uv_bias_px=SYNTH_UV_BIAS)
     p0 = np.array([0.55, -0.10, 0.03])
     assert est.start(_frame(cam.project(p0)), p0)
     for k in range(5):
@@ -195,7 +198,7 @@ def test_estimator_tracks_lemon_on_wood(cam):
     # Yellow fruit on orange-brown wood, moving 20 cm/s; fresh table noise each frame.
     v = np.array([-0.20, 0.05, 0.0])
     p0 = np.array([0.66, -0.08, 0.03])
-    est = StaticCamEstimator.from_cfg(CFG)
+    est = StaticCamEstimator.from_cfg(CFG, uv_bias_px=SYNTH_UV_BIAS)
     assert est.start(_on_wood(cam.project(p0)), p0)
     fixes = 0
     for k in range(25):
@@ -223,7 +226,7 @@ def test_estimator_tracks_upright_bottle(cam):
         cv2.rectangle(img, (u - 5, int(top[1])), (u + 5, int(bot[1])), (60, 25, 15), -1)
         return img
 
-    est = StaticCamEstimator.from_cfg(CFG)
+    est = StaticCamEstimator.from_cfg(CFG, uv_bias_px=SYNTH_UV_BIAS)
     assert est.start(frame(p0, 0), p0)
     for k in range(20):
         p = p0 + v * k * DT
@@ -240,6 +243,44 @@ def test_estimator_tracks_upright_bottle(cam):
 
 def test_play_area_check_ignores_wall_pixels(cam):
     # House frames show walls above the horizon; re-detect must skip them, not crash.
-    est = StaticCamEstimator.from_cfg(CFG)
+    est = StaticCamEstimator.from_cfg(CFG, uv_bias_px=SYNTH_UV_BIAS)
     est.plane_z = 0.03
     assert est._in_play_area(np.array([240.0, 0.0])) is False
+
+
+# ---- shadow-tolerant histogram look (A5) ----
+
+
+def _hsv_frame(table_hsv, obj_hsv, centre=(60, 40), r=8, shade=None):
+    import cv2
+
+    img = np.zeros((80, 120, 3), np.uint8)
+    img[:] = table_hsv
+    yy, xx = np.mgrid[:80, :120]
+    disk = (xx - centre[0]) ** 2 + (yy - centre[1]) ** 2 <= r * r
+    img[disk] = obj_hsv
+    if shade is not None:  # darken the far half of the object (hand shadow)
+        half = disk & (yy > centre[1])
+        img[half, 2] = (img[half, 2] * shade).astype(np.uint8)
+    return cv2.cvtColor(img, cv2.COLOR_HSV2RGB)
+
+
+def test_hist_keeps_shaded_half_of_saturated_object():
+    from perception.track import BlobTracker
+
+    lemon, table = (25, 220, 200), (5, 200, 120)  # yellow on red
+    tr = BlobTracker()
+    assert tr.start(_hsv_frame(table, lemon), np.array([60.0, 40.0]), r_px=8.0)
+    m = tr._mask(_hsv_frame(table, lemon, shade=0.65), "hist")
+    yy, _ = np.nonzero(m)
+    assert abs(yy.mean() - 40.0) < 1.0  # both halves kept → centre stays put
+
+
+def test_hist_does_not_shade_pale_object():
+    from perception.track import BlobTracker
+
+    egg, table = (20, 90, 150), (10, 140, 70)  # pale beige on dark brown
+    tr = BlobTracker()
+    assert tr.start(_hsv_frame(table, egg), np.array([60.0, 40.0]), r_px=8.0)
+    shadow = _hsv_frame(table, (20, 90, 90))  # darker beige = what its shadow looks like
+    assert tr._mask(shadow, "hist").sum() == 0

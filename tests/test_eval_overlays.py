@@ -142,14 +142,28 @@ def test_latency_buffer_off_plays_stale_chunk_from_start():
 
 def test_latency_buffer_on_drops_past_slots():
     played, _, meta, _ = run(action_buffer_on=True, inject_latency_s=2 * DT)
-    # Plan from an obs 2 steps old: slots 0,1 are already past; play 2,3 then replan.
-    assert [tuple(map(int, p)) for p in played[:4]] == [(0, 2), (0, 3), (1, 2), (1, 3)]
+    # Plan from an obs 2 steps old: slots 0,1 are already past; play the time-aligned
+    # slots 2..5, replan every n_action_steps (4) as usual, again from slot 2.
+    assert [tuple(map(int, p)) for p in played[:8]] == [
+        (0, 2), (0, 3), (0, 4), (0, 5), (1, 2), (1, 3), (1, 4), (1, 5)]
     assert meta["overlays"]["latency_steps"] == 2
 
 
-def test_latency_longer_than_plan_holds_last_command():
+def test_latency_longer_than_replan_still_moves():
+    # Latency (5) > replan interval (4): the whole chunk (10) is buffered, so the
+    # time-aligned slots 5..8 run; the arm no longer freezes on the last command.
     played, _, meta, _ = run(action_buffer_on=True, inject_latency_s=5 * DT)
-    assert meta["n_hold_steps"] == 12  # every slot stale: hold, never jump
+    assert meta["n_hold_steps"] == 0
+    assert [tuple(map(int, p)) for p in played[:4]] == [(0, 5), (0, 6), (0, 7), (0, 8)]
+
+
+def test_latency_near_chunk_length_replans_every_step():
+    # Latency (9) + replan (4) > chunk (10): only the last slot is ever on time, the
+    # buffer empties every step, so the policy replans every step and plays that slot.
+    played, ep_, meta, _ = run(action_buffer_on=True, inject_latency_s=9 * DT)
+    assert meta["n_hold_steps"] == 0
+    assert [tuple(map(int, p)) for p in played[:3]] == [(0, 9), (1, 9), (2, 9)]
+    assert ep_["policy_replan"].tolist() == [1] * 12
 
 
 def test_noise_is_seeded_per_episode():

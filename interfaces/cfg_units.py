@@ -116,6 +116,11 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
         _take_pose_mm(robot, "init_pose_mm", "init_pose")
         _take(robot, "max_reach_dist_mm", "max_reach_dist", _MM)
         _take(robot, "gripper_close_time_ms", "gripper_close_time_s", _MS)
+        ga = robot.get("gripper_actuator")
+        if isinstance(ga, dict):
+            _take(ga, "v_finger_mm_s", "v_finger_m_s", _MM)
+            _take(ga, "t_cmd_ms", "t_cmd_s", _MS)
+            _take(ga, "t_force_ms", "t_force_s", _MS)
 
     scene = cfg.get("scene")
     if isinstance(scene, dict):
@@ -181,7 +186,7 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
             ("chase_stall_timeout_ms", "grasp_stage_timeout_s"),
         ):
             _take(sm, human, si, _MS)
-        # One chase/close gate: [dx, dy, dz] mm → metres.
+        # Chase near-box: [dx, dy, dz] mm → metres. Close XY is separate (B5).
         if "grasp_xyz_ok_mm" in sm:
             raw = list(sm.pop("grasp_xyz_ok_mm"))
             if len(raw) != 3:
@@ -207,6 +212,14 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
             ("home_z_ok_mm", "home_z_tol"),
             ("release_retreat_mm", "release_retreat_m"),
             ("release_step_mm", "release_step_m"),
+            # Approach hover above z_grasp (tip rolls): chase XY/yaw first, then dive.
+            ("grasp_hover_mm", "grasp_hover_m"),
+            # B5: |hand−obj| XY must be this tight before CLOSE (default 2 mm).
+            ("close_xy_ok_mm", "close_xy_ok"),
+            ("close_z_ok_mm", "close_z_ok"),
+            # Reach stop: unreachable circle around the base + stop distance.
+            ("reach_zone_radius_mm", "reach_zone_radius"),
+            ("reach_stop_mm", "reach_stop"),
         ):
             _take(sm, human, si, _MM)
         # speeds (cm/s → m/s)
@@ -228,6 +241,11 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
         _take(ct, "train_delta_min_ms", "train_delta_min_s", _MS)
         _take(ct, "train_delta_max_ms", "train_delta_max_s", _MS)
         _take(ct, "eval_delta_ms", "eval_delta_s", _MS)
+        _take(ct, "delta_meas_noise_ms", "delta_meas_noise_s", _MS)
+        _take(ct, "delta_meas_replan_ms", "delta_meas_replan_s", _MS)
+        _take(ct, "pre_shape_slack_mm", "pre_shape_slack_m", _MM)
+        _take(ct, "pre_shape_max_open_mm", "pre_shape_max_open_m", _MM)
+        _take(ct, "close_speed_slack_mm", "close_speed_slack_m", _MM)
 
     # Grasp-height / p̂z (claim Z update). Optional.
     ch = cfg.get("claim_height")
@@ -238,5 +256,7 @@ def normalize_cfg_units(cfg: dict[str, Any]) -> dict[str, Any]:
         _take(ch, "latch_lo_mm", "latch_lo_m", _MM)
         _take(ch, "latch_hi_mm", "latch_hi_m", _MM)
         _take(ch, "depth_rmse_max_mm", "depth_rmse_max_m", _MM)
+        # A4: add onto measured wrist z_top (fruit was ~6.7 mm low).
+        _take(ch, "depth_z_bias_mm", "depth_z_bias_m", _MM)
 
     return cfg

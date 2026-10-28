@@ -31,7 +31,7 @@ from sim.house_layout import _sample_throw_full  # noqa: E402
 
 def _check_seed(seed: int, scene_dir: Path) -> tuple[bool, str]:
     rng = np.random.default_rng(seed)
-    cams = [{"name": "static_cam", "position": [1.2, 0.0, 0.80]}]
+    cams = [{"name": "static_cam", "position": [1.2, 0.0, 0.70]}]
     # Match sim/scene.py: skip houses whose table is too small for play+bowl.
     house = None
     layout = None

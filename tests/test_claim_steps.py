@@ -197,7 +197,8 @@ def test_step5_buffer_drops_past_and_rebuilds_abs():
     )
     assert abs_chunk.shape == (10, 8)
     assert len(buf) < 10
-    assert buf.t[0] >= push_now - 1e-12
+    # Slots older than one step before push are gone; the slot due at push time is kept.
+    assert buf.t[0] > push_now - DT
     act = buf.pop_due(exec_now)
     assert act is not None
     phat = forecast_horizon(s, 0.10, dt=DT, n=10)[3]

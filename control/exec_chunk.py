@@ -29,7 +29,9 @@ def push_forecast_chunk(
     """Push relative chunk as world targets into ``buf``. Returns absolute chunk.
 
     ``apply_at`` is the sim time of slot 0 (usually ``t0 + applied_Δ``).
-    ``now`` drops any slot whose time has already passed.
+    ``now`` drops slots older than the one due this tick.
+    The chunk is tagged with the camera time ``state.timestamp``; if a plan from a
+    newer frame is already in ``buf``, this one is ignored.
     """
     rel = np.asarray(rel_actions, dtype=np.float64)
     forecasts = forecast_horizon(state, float(delta_s), dt=dt, n=len(rel))
@@ -39,5 +41,6 @@ def push_forecast_chunk(
         t0=float(apply_at),
         dt=float(dt),
         now=None if now is None else float(now),
+        obs_t=float(state.timestamp),
     )
     return abs_chunk
