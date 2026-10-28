@@ -2,12 +2,8 @@
 
 Run from the repo root:  pytest tests/test_state_machine.py -v
 
-The speed tests use ``FakeArm``, a first-order surrogate for the IK + joint-PD
-chain (``ee += (cmd - ee) * dt / tau`` with a TCP speed cap) plus the scene's
-own ``kinematic_advance`` for the object (straight coast, no bounce). It is
-not the real sim, but it has tracking lag — so a change that cannot pass here
-will not pass on GPU either. Treat it as the cheap pre-filter, never as gate
-evidence.
+Single-step and unit checks only. Closed-loop behavior (arm lag, reach,
+contact) is checked in Isaac (C30 / B1 grid), not with a surrogate arm.
 """
 
 from __future__ import annotations
@@ -18,7 +14,6 @@ import numpy as np
 import pytest
 
 from interfaces.state import oracle_from_gt
-from sim.motion import kinematic_advance
 from sim.state_machine import (
     AIM_BRANCHES,
     STAGE_APPROACH,
@@ -532,146 +527,6 @@ def test_stage_timeout_retries_then_gives_up(sm):
 def test_timeouts_are_per_stage_not_the_episode_window(sm):
     assert sm.stage_timeout_s < sm.inference_window_s
     assert sm.grasp_stage_timeout_s < sm.inference_window_s
-
-
-# --------------------------------------------------------- closed-loop check
-
-
-class FakeArm:
-    """First-order TCP tracker with velocity feedforward and a speed cap.
-
-    Mirrors the scene's DiffIK FF (``sim/scene.py`` ``set_ee_target``):
-    ``v_cmd = v̂ + (p* − p)/τ`` with ``τ = 1/robot.diffik_ff_gain``. A command
-    acts during the very next step (collect: read pose → expert → set target →
-    step), so there is no extra hold-back tick. The old surrogate held each
-    command one more tick and the expert's hand-written ``+dt`` leads were
-    tuned to cancel it.
-    """
-
-    def __init__(self, pos, *, tau: float, speed_max: float, dt: float):
-        self.pos = np.asarray(pos, dtype=np.float64).copy()
-        self.vel = np.zeros(3, dtype=np.float64)
-        self.tau = float(tau)
-        self.speed_max = float(speed_max)
-        self.dt = float(dt)
-
-    def follow(self, cmd: np.ndarray, cmd_vel: np.ndarray | None = None) -> np.ndarray:
-        v_ff = np.zeros(3) if cmd_vel is None else np.asarray(cmd_vel, dtype=np.float64)
-        v = v_ff + (np.asarray(cmd, dtype=np.float64) - self.pos) / self.tau
-        n = float(np.linalg.norm(v))
-        if n > self.speed_max:
-            v *= self.speed_max / n
-        self.vel = v
-        self.pos = self.pos + v * self.dt
-        return self.pos.copy()
-
-
-def run_fake_episode(
-    cfg: dict,
-    speed: float,
-    *,
-    seed: int = 0,
-    tau_true: float | None = None,
-    speed_max_true: float | None = None,
-    max_s: float = 10.0,
-) -> dict:
-    """Drive the expert against FakeArm + the scene's own object integrator."""
-    dt = float(cfg["sim"]["dt"])
-    sm = PickPlaceStateMachine(cfg, dt=dt)
-    sm.set_box_poses(CARRY, drop_pos=DROP)
-
-    rng = np.random.default_rng(seed)
-    # Aimed throw, same sampler as the scene (straight coast, no walls).
-    from sim.house_layout import sample_throw
-
-    b = cfg["scene"]["object_xy_bounds"]
-    # FakeArm has no table abort; leave aim bounds unset so lead can meet the throw.
-    p0, vel = sample_throw(
-        rng, ((b[0][0], b[0][1]), (b[1][0], b[1][1])), speed=speed
-    )
-    obj = np.array([p0[0], p0[1], 0.03])
-    # Throw heads into the arm's dead zone at the base → a reach stop is correct.
-    enters_zone = bool(np.isfinite(sm._path_to_reach_zone_m(obj, vel)))
-
-    k_ff = float(cfg["robot"]["diffik_ff_gain"])
-    arm = FakeArm(
-        cfg["robot"]["init_pose"][:3],
-        tau=float(tau_true if tau_true is not None else 1.0 / k_ff),
-        speed_max=float(speed_max_true if speed_max_true is not None else sm.ee_speed_max),
-        dt=dt,
-    )
-    ee = arm.pos.copy()
-    max_stage, z_max, attached = 0, float(obj[2]), False
-    for i in range(int(max_s / dt)):
-        cmd = sm.step(
-            _state(obj, np.zeros(3) if attached else vel, i * dt),
-            ee,
-            sm._down_quat,
-            ee_vel=arm.vel.copy(),
-        )
-        ee = arm.follow(cmd.position, cmd.velocity)
-        attached = bool(cmd.attach_object)
-        if attached:
-            obj = ee.copy()  # scene welds the object to the TCP
-        elif cmd.freeze_object:
-            pass
-        elif cmd.kinematic_object:
-            obj, vel = kinematic_advance(obj, vel, dt)
-            obj[2] = 0.03
-        max_stage = max(max_stage, cmd.stage)
-        z_max = max(z_max, float(obj[2]))
-        if cmd.stage >= STAGE_DONE:
-            break
-    return {
-        "max_stage": max_stage,
-        "z_max": z_max,
-        "done": max_stage >= STAGE_DONE,
-        "grasp_err_xy": sm.grasp_err_xy,
-        "retries": sm.retries,
-        "reach_stopped": bool(sm.reach_stopped),
-        "enters_zone": enters_zone,
-    }
-
-
-def _check_runs(runs: list[dict]) -> None:
-    """Reachable throws must finish; zone-bound ones may only reach-stop."""
-    for r in runs:
-        brief = {k: r[k] for k in ("max_stage", "retries", "grasp_err_xy", "reach_stopped", "enters_zone")}
-        if not r["enters_zone"]:
-            assert r["done"], brief
-            assert not r["reach_stopped"], brief
-        else:
-            assert r["done"] or r["reach_stopped"], brief
-        if r["done"]:
-            assert r["z_max"] >= 0.12, "object never lifted"
-
-
-@pytest.mark.parametrize("speed", [0.0, 0.20, 0.40, 0.50, 1.00])
-def test_closed_loop_completes_at_speed(cfg, speed):
-    """0 / 20 / 40 / 50 / 100 cm/s: every reachable throw finishes (10 seeds).
-
-    Hand speed 2.5 m/s + 400 ms aim cap are sized so FakeArm finishes 1 m/s.
-    """
-    _check_runs([run_fake_episode(cfg, speed, seed=s) for s in range(10)])
-
-
-def test_grasp_error_stays_honest_at_speed(cfg):
-    """The scene welds object XY to the hand, so the gate is the only guard."""
-    for speed in (0.20, 0.40):
-        for seed in range(5):
-            r = run_fake_episode(cfg, speed, seed=seed)
-            if r["grasp_err_xy"] is None:
-                continue
-            assert r["grasp_err_xy"] <= 0.03, (speed, seed, r)
-
-
-def test_80cms_throw_completes_with_stock_arm(cfg):
-    """Straight-coast throws (no wall reverse): stock lag still finishes 80 cm/s."""
-    runs = [run_fake_episode(cfg, 0.80, seed=s) for s in range(10)]
-    _check_runs(runs)
-    for r in runs:
-        if r["grasp_err_xy"] is not None:
-            assert r["grasp_err_xy"] <= 0.03, r
 
 
 def test_stage_schema_matches_the_constants():

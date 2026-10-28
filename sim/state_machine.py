@@ -334,7 +334,7 @@ class PickPlaceStateMachine:
         self._drop_pose: np.ndarray | None = None
         # Table XY for clipping intercept aims (set each episode from the scene).
         # Without this, a long lead at ≥50 cm/s pulls the hand off the table.
-        # Use the full table footprint — not the thin play band (that starved FakeArm).
+        # Use the full table footprint — not the thin play band.
         self._aim_xy: tuple[tuple[float, float], tuple[float, float]] | None = None
         # Looser box for "object escaped — stop chase". Aim is inset for hand
         # safety; escape must still allow the far-edge spawn rim (smoke lemon

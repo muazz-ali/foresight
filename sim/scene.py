@@ -36,7 +36,7 @@ from isaaclab.assets import Articulation, RigidObject, RigidObjectCfg
 from isaaclab.controllers import DifferentialIKController
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.sensors import Camera, CameraCfg
-from isaaclab.utils.math import combine_frame_transforms, subtract_frame_transforms
+from isaaclab.utils.math import combine_frame_transforms, quat_apply, subtract_frame_transforms
 from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
 
 from interfaces.state import ObjectState, oracle_from_gt
@@ -627,6 +627,16 @@ class Phase0Scene:
         # See set_ee_target: v_cmd = v + K·(p* − p), IK aims at p + v_cmd/K.
         robot_cfg = cfg.get("robot") or {}
         self._diffik_ff_k = float(robot_cfg.get("diffik_ff_gain", 0.0))
+        # Joint velocity feedforward (replaces the v/K position lead when on).
+        # The drive is τ = k(q* − q) + d(q̇* − q̇). With q̇* = 0 the damping brakes
+        # every moving joint → the hand trails by d/k = 200 ms. Here q̇* = J⁺·v̂
+        # and q* ramps by q̇*·dt_phys every substep (to the substep END: PhysX
+        # implicit drives solve for the end of the substep), so a held per-tick
+        # setpoint no longer costs half a control step either. Probe
+        # (scratch probe_lag_variants, Oct 28): 30 cm/s trail −7.9 → +0.2 mm.
+        self._joint_vel_ff = bool(robot_cfg.get("joint_velocity_ff", False))
+        self._ramp_q0: torch.Tensor | None = None  # arm q* at the start of the tick
+        self._ramp_qd: torch.Tensor | None = None  # arm q̇* for this tick
 
         # Three object velocities on purpose:
         #   _obj_velocity  — live speed that drives the coast
@@ -1134,6 +1144,8 @@ class Phase0Scene:
         home = self.robot.data.default_joint_pos.clone()
         self.robot.write_joint_state_to_sim(home, self.robot.data.default_joint_vel)
         self.robot.set_joint_position_target(home)
+        self.robot.set_joint_velocity_target(torch.zeros_like(home))
+        self._ramp_q0, self._ramp_qd = None, None
 
         root = torch.zeros((1, 13), device=self.robot.device, dtype=torch.float32)
         root[0, 0:3] = torch.tensor(pos, device=self.robot.device)
@@ -1746,7 +1758,9 @@ class Phase0Scene:
         p_target = np.asarray(pos_w, dtype=np.float64).reshape(3)
         p_ik = p_target
         k_ff = float(self._diffik_ff_k)
-        if k_ff > 0.0 and vel_w is not None:
+        if self._joint_vel_ff:
+            pass  # lead comes from q̇* + the substep ramp (below), not from v/K
+        elif k_ff > 0.0 and vel_w is not None:
             # Full v̂_obj lead every tick: p_ik = p* + v̂_obj/K.
             # A near-field blend that zeroed the lead when |aim−hand| was small
             # made the hand trail and hunt on s1003 (aim stayed smooth).
@@ -1776,10 +1790,38 @@ class Phase0Scene:
         for fi in self._finger_idx:
             target[0, fi] = finger
         self.robot.set_joint_position_target(target)
+        if self._joint_vel_ff:
+            v = np.zeros(3) if vel_w is None else np.asarray(vel_w, dtype=np.float64).reshape(3)
+            qd = self._tcp_joint_velocity(jacobian, v)
+            vt = torch.zeros_like(self.robot.data.joint_vel_target)
+            vt[:, self._arm_idx] = qd
+            self.robot.set_joint_velocity_target(vt)
+            self._ramp_q0, self._ramp_qd = new_joint_pos.clone(), qd
         self._last_gripper_open = g
         # Weld: teleport fingers. Physics grasp: PD target only, fingers stall on the object.
         if self._weld:
             self._snap_fingers(g)
+
+    def _tcp_joint_velocity(self, jacobian: torch.Tensor, v_w: np.ndarray) -> torch.Tensor:
+        """Arm q̇* that moves the TCP (pinch) at ``v_w`` with no rotation.
+
+        ``jacobian`` is the hand-body Jacobian (1, 6, 7). TCP linear rows =
+        J_lin − [r]× J_ang, r = hand→TCP in world. DLS pseudo-inverse, same
+        damping as the IK (λ = 0.01). Root frame = world (base at origin).
+        """
+        if not np.any(v_w):
+            return torch.zeros((1, len(self._arm_idx)), device=self.robot.device)
+        bq = self.robot.data.body_quat_w[:, self._ee_idx]
+        r = quat_apply(bq, self._tcp_offset)[0]
+        rx = torch.zeros((3, 3), device=self.robot.device, dtype=torch.float32)
+        rx[0, 1], rx[0, 2], rx[1, 2] = -r[2], r[1], -r[0]
+        rx[1, 0], rx[2, 0], rx[2, 1] = r[2], -r[1], r[0]
+        J = jacobian[0].clone()
+        J[:3, :] = J[:3, :] - rx @ J[3:, :]
+        x = torch.zeros(6, device=self.robot.device, dtype=torch.float32)
+        x[:3] = torch.tensor(v_w, device=self.robot.device, dtype=torch.float32)
+        A = J @ J.T + (0.01**2) * torch.eye(6, device=self.robot.device)
+        return (J.T @ torch.linalg.solve(A, x)).view(1, -1)
 
     def _step_weld_object(
         self, kinematic_object: bool, attach_object: bool, freeze_object: bool
@@ -1880,6 +1922,11 @@ class Phase0Scene:
         for k in range(n):
             if substep_cb is not None:
                 substep_cb(self, self._sim_time)
+            if self._ramp_q0 is not None:
+                # Arm q* for the END of this substep: q0 + q̇*·(k+1)·dt_phys.
+                tgt = self.robot.data.joint_pos_target.clone()
+                tgt[:, self._arm_idx] = self._ramp_q0 + self._ramp_qd * (k + 1) * self.physics_dt
+                self.robot.set_joint_position_target(tgt)
             if self._weld:
                 self._step_weld_object(kinematic_object, attach_object, freeze_object)
             else:
@@ -1924,6 +1971,11 @@ class Phase0Scene:
                 self.object.update(self.physics_dt)
             # n == 1: add the full dt at once (legacy, identical float sums).
             self._sim_time += self.dt if n == 1 else self.physics_dt
+        if self._ramp_q0 is not None:
+            # Ramp used up: hold its end point with no velocity target until the
+            # next set_ee_target (a step without a new command must not re-ramp).
+            self.robot.set_joint_velocity_target(torch.zeros_like(self.robot.data.joint_vel_target))
+            self._ramp_q0, self._ramp_qd = None, None
         if n > 1:
             self.sim.render()  # cameras see the end of the control step
             # Snap to the control grid so float sums never drift off k * dt.

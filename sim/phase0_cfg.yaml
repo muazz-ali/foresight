@@ -66,6 +66,11 @@ robot:
   # K = 1/τ; τ≈190 ms from open-loop tip lag. 0 = off (absolute pose only).
   # Re-tune via tools/diag/probe_diffik_tracking.py.
   diffik_ff_gain: 5.26
+  # Joint velocity feedforward (Oct 28). true → q̇* = J⁺·v̂ plus a per-substep
+  # q* ramp; diffik_ff_gain is then ignored. Drive is position-only otherwise,
+  # so damping brakes moving joints (lag d/k = 200 ms) and the per-tick hold
+  # costs dt/2 more. Pure tracking at 30 cm/s: −7.9 mm (false) → +0.2 mm (true).
+  joint_velocity_ff: true
   # Arm joint PD (HIGH_PD defaults: stiffness 400, damping 80). Damping 160
   # made s1003 trail worse; hunt was FF near-blend, not underdamped joints.
   arm_joint_stiffness: 400.0
