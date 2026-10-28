@@ -75,7 +75,7 @@ if [[ "$PHASE" == "all" || "$PHASE" == "smoke" || "$PHASE" == "full" ]]; then
   if [[ "$P" == "smoke" ]]; then
     OBJ_SHARDS=("egg:0:26")
   else
-    OBJ_SHARDS=("egg:0:26" "lemon:27:53" "onion:54:79")
+    OBJ_SHARDS=("egg:0:15" "kiwi:16:31" "lemon:32:47" "lime:48:63" "onion:64:79")
   fi
   for obj_s0_s1 in "${OBJ_SHARDS[@]}"; do
     IFS=: read -r obj s0 s1 <<<"$obj_s0_s1"

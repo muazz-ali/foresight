@@ -1029,12 +1029,10 @@ class PickPlaceStateMachine:
                         abs(float(gap[0])) <= float(self.close_xy_ok)
                         and abs(float(gap[1])) <= float(self.close_xy_ok)
                     )
-                    if inside_close:
-                        # Hold the current hand XY. DiffIK FF (v̂_obj) coasts
-                        # the hand with the object so |Δv| can fall while |e|
-                        # stays in the 2 mm box (s1003 was hunting through it).
-                        aim[:2] = ee[:2].copy()
-                    elif self.ride_k > 0.0:
+                    # Inside the close box: aim = object_now (no hold). The old
+                    # hold (aim = hand) froze the entry offset (C30 v5: egg
+                    # +2.4 mm); with joint velocity FF the hand no longer hunts.
+                    if not inside_close and self.ride_k > 0.0:
                         # Soft pull while still outside the close box.
                         aim[:2] = aim[:2] + self.ride_k * gap
                 aim = self._clip_aim_xy(aim)

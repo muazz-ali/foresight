@@ -96,7 +96,7 @@ def test_phase0_yaml_loads_to_expected_si():
         [0.01, 0.01, 0.012]
     )
     assert cfg["state_machine_params"]["close_xy_ok"] == pytest.approx(0.002)
-    assert abs(cfg["state_machine_params"]["ee_speed_max"] - 2.5) < 1e-12
+    assert abs(cfg["state_machine_params"]["ee_speed_max"] - 0.365) < 1e-12  # measured chase speed
     assert abs(cfg["state_machine_params"]["lookahead_s"] - 0.40) < 1e-12
     # tip_lag_pad_ms: 0 — DiffIK FF owns tip lag (do not double-lead).
     assert cfg["state_machine_params"]["robot_approach_pad_s"] == 0.0

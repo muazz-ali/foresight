@@ -164,6 +164,8 @@ def main() -> None:
                         "delta_ms": int(d_ms),
                         "success": bool(scored["success"]),
                         "failure_mode": scored["failure_mode"],
+                        "first_attempt": bool(scored.get("first_attempt", False)),
+                        "n_close_entries": int(scored.get("n_close_entries", 0)),
                         **meta,
                         **episode_for_json(ep),
                     }
@@ -183,6 +185,9 @@ def main() -> None:
                     "delta_nom_ms": int(d_ms),
                     "success": bool(scored["success"]),
                     "failure_mode": scored["failure_mode"],
+                    "first_attempt": bool(scored.get("first_attempt", False)),
+                    "n_close_entries": int(scored.get("n_close_entries", 0)),
+                    "spawn_redraws": int(meta.get("spawn_redraws", 0) or 0),
                     "sim_steps": int(meta.get("n_frames", 0) or 0),
                     "wall_time_s": float(time.time() - t0),
                     "seen": bool(is_seen(v_cms, d_ms)),

@@ -146,17 +146,21 @@ scene:
 
   # Keep in sync with OBJECTS in scripts/launch_p1_collect.sh.
   # No can/cup/beer/bottle (excluded above); fruit-sized only.
+  # Claim scope (Oct 29): low fruit only. Tall fruit (apple, avocado, orange,
+  # peach, tangerine; half-height ≥ ~35 mm) touch the gripper underside during
+  # the ride (hand pushed up 5–8 mm, trail −1…−4 mm; C30 v5). Out of scope for
+  # the timing claim — see foresight_plan.md "Claim scope".
   object_categories:
-  - apple
-  - avocado
   - egg
   - kiwi
   - lemon
   - lime
   - onion
-  - orange
-  - peach
-  - tangerine
+  # Spawn filter: re-draw a throw whose planned ride brings the wrist (joint 7)
+  # within this margin of its ±2.897 rad limit (sim/ride_ik_check.py; predictor
+  # error vs logged j7 ~0.3 rad sd). Re-draws are logged per episode.
+  spawn_j7_margin_rad: 0.3
+  spawn_max_redraws: 20
 
   # Held-out `unseen` / excluded cats only via --object-usd.
   container_categories:
@@ -193,7 +197,9 @@ state_machine_params:
   max_aim_ahead_ms: 400
   # Aim farther for tip lag (not a wait). Measure: tools/diag/probe_diffik_tracking.py.
   tip_lag_pad_ms: 0
-  hand_speed_max_cm_s: 250.0
+  # Chase planning speed = measured far-chase average (C30 v5, 50 eps:
+  # 0.365 m/s median, 0.353–0.424). 250 made the far-chase lead ~5× too short.
+  hand_speed_max_cm_s: 36.5
   aim_refine_iters: 3
   # Chase near-box: |dx|,|dy|,|dz| (mm). Inside → settle aim (object + 1 tick).
   # Close only when XY also ≤ close_xy_ok (B5: mean |d| ≤ 2 mm).
@@ -201,7 +207,7 @@ state_machine_params:
   grasp_xyz_ok_mm: [10.0, 10.0, 12.0]
   close_xy_ok_mm: 2.0
   # Soft ride pull toward object_now while outside the 2 mm close box.
-  # Inside the box the expert holds hand XY (FF coasts) so |Δv| can settle.
+  # Inside the box the aim is object_now (no pull, no hold).
   # 0.35 left s1001 parked at |dx|≈2.13 mm; 0.55 closes that last mm.
   ride_correction_gain: 0.55
   # Turn the hand about Z so the pads close ACROSS the object's path (fingers

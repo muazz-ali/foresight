@@ -16,6 +16,25 @@ The no-compensation and fixed look-ahead policies fall off.
 In the shift test, the hand follows a deliberate shift of p̂ with a ratio between 0.8 and 1.2.
 
 
+## Claim scope (2026-10-29)
+
+Objects: **egg, kiwi, lemon, lime, onion** (low fruit). Tall fruit (apple,
+avocado, orange, peach, tangerine; half-height ≥ ~35 mm) are **out of scope**
+for the timing claim: during the ride their top touches the gripper underside,
+pushing the hand up 5–8 mm and dragging it 1–4 mm behind (C30 v5,
+`data/eval/C1_c30_all_objects_v5_joint_vel_ff`; contact probe: +12 mm hand
+height removes it). Fixing that is grasp geometry, not timing.
+
+Throws: a spawn filter (`sim/ride_ik_check.py`, `scene.spawn_j7_margin_rad`)
+re-draws any throw whose planned ride brings the wrist (joint 7) within 0.3 rad
+of its limit; re-draws are logged per episode (`spawn_redraws`). Avocado seed
+1009 (C30 v5) is dropped with the tall fruit.
+
+Expert tracking accepted at ≤ ~1 mm (2 mm close gate, 5 mm pre-shape slack).
+Success = lifted + held (1 s from LIFT) + placed; close-time checks are
+diagnostics only (`eval/b1_success.py`).
+
+
 Hypothesis: explicit future-state from a physics filter beats implicit/latent
 predictors for dynamic grasping — smaller, cheaper, easier to debug.
 

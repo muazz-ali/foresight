@@ -42,7 +42,10 @@ DEFAULT_CFG = FORESIGHT_ROOT / "sim" / "phase0_cfg.yaml"
 
 SPEEDS_CMS = (0, 10, 20, 30)
 DELTAS_MS = (0, 100, 200, 300)
-OBJECTS = ("egg",) * 27 + ("lemon",) * 27 + ("onion",) * 26  # 80
+# Claim object set (Oct 29): low fruit only; tall fruit out of scope
+# (foresight_plan.md "Claim scope"). 16 paired seed slots per object = 80 per cell.
+CLAIM_OBJECTS = ("egg", "kiwi", "lemon", "lime", "onion")
+OBJECTS = tuple(o for o in CLAIM_OBJECTS for _ in range(16))  # 80
 assert len(OBJECTS) == 80
 
 # Unseen: v=30 or Δ=300. Seen: v≤20 and Δ≤200.
@@ -121,7 +124,7 @@ def freeze_config(out: Path, cfg_path: Path) -> Path:
         "claim_timing.delta_meas_replan_ms": 330.0,
         "claim_timing.pre_shape_slack_mm": 5.0,
         "claim_timing.pre_shape_max_open_mm": 80.0,
-        "scene.object_categories": ["egg", "lemon", "onion"],
+        "scene.object_categories": list(CLAIM_OBJECTS),
     }
     (out / "b1_overrides.json").write_text(json.dumps(overrides, indent=2) + "\n")
     # Human-readable frozen pointer file.
@@ -179,7 +182,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--object",
         default=None,
-        help="Fix object category (egg|lemon|onion). One scene per process "
+        help="Fix object category (one of CLAIM_OBJECTS). One scene per process "
         "(Isaac cannot rebuild World). Seed indices for that object only.",
     )
     p.add_argument("--seed-start", type=int, default=0, help="Inclusive index into the 80 paired seeds")
@@ -262,10 +265,10 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
     log.info("device=%s role=%s phase=%s out=%s", device, args.role, phase, out)
 
     # One Isaac scene per process (GroundPlane clash if rebuilt). Fix the
-    # object category here; host launches egg/lemon/onion workers with the
+    # object category here; host launches one worker per claim object with the
     # matching --seed-start/--seed-end so paired seeds stay aligned.
     obj_cat = args.object or "egg"
-    cfg.setdefault("scene", {})["object_categories"] = ["egg", "lemon", "onion"]
+    cfg.setdefault("scene", {})["object_categories"] = list(CLAIM_OBJECTS)
     log.info("building scene object=%s device=%s", obj_cat, device)
     scene = Phase0Scene(
         cfg,
@@ -364,6 +367,11 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
             ),
             "success": bool(scored["success"]),
             "failure_mode": scored["failure_mode"],
+            "first_attempt": bool(scored.get("first_attempt", False)),
+            "n_close_entries": int(scored.get("n_close_entries", 0)),
+            "diag_closed_above": bool(scored.get("diag_closed_above", False)),
+            "spawn_redraws": int(meta.get("spawn_redraws", 0) or 0),
+            "ride_j7_margin_rad": meta.get("ride_j7_margin_rad"),
             "close_xy_err_mm": (
                 None
                 if meta.get("close_xy_err_m") is None
@@ -411,7 +419,7 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
         return row
 
     def run_cell(cell: str, v_cms: int, d_ms: int, n: int, *, early_stop: bool) -> dict:
-        """Run seed indices [i0, i1] ∩ [0, n). Host merges egg/lemon/onion shards."""
+        """Run seed indices [i0, i1] ∩ [0, n). Host merges per-object shards."""
         rows: list[dict] = []
         fails = 0
         indices = [i for i in range(min(int(n), 80)) if i0 <= i <= i1]
@@ -695,7 +703,7 @@ def _write_report(out: Path) -> None:
 
     # Failure modes
     lines += ["", "## Failure modes (F1–F7)", ""]
-    modes = ["unreachable", "never_closed", "closed_above", "closed_empty_xy", "knocked", "slipped", "other"]
+    modes = ["unreachable", "never_closed", "closed_above", "closed_empty_xy", "knocked", "slipped", "not_placed", "other"]
     lines.append("| cell | " + " | ".join(modes) + " |")
     lines.append("|---|" + "|".join(["---"] * len(modes)) + "|")
     for c in main:

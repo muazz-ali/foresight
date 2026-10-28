@@ -15,7 +15,10 @@ OUT=$ROOT/${1:?usage: launch_c30_all_objects.sh OUT_DIR}
 
 CELLS=${CELLS:-C30,C31,C33}
 N_PER=${N_PER:-5}
-OBJECTS=${OBJECTS:-apple,avocado,egg,kiwi,lemon,lime,onion,orange,peach,tangerine}
+OBJECTS=${OBJECTS:-egg,kiwi,lemon,lime,onion}
+# SEED_IDX: seed slot per object (seeds 1000 + slot*N_PER + k). Default keeps the
+# 10-object slots (egg 2 … onion 6) so runs compare seed-for-seed with C30 v5.
+SEED_IDX=${SEED_IDX:-2,3,4,5,6}
 # DUMP=mp4 → h5+json+mp4; DUMP=h5 → h5+json only (faster re-runs).
 DUMP=${DUMP:-mp4}
 if [[ "$DUMP" == "h5" ]]; then
@@ -31,6 +34,11 @@ mkdir -p "$OUT/logs"
 rm -f "$OUT/STOP"
 
 IFS=',' read -r -a OBJ_ARR <<< "$OBJECTS"
+IFS=',' read -r -a IDX_ARR <<< "$SEED_IDX"
+if [[ ${#IDX_ARR[@]} -ne ${#OBJ_ARR[@]} ]]; then
+  echo "SEED_IDX needs one slot per object" >&2
+  exit 2
+fi
 echo "OUT=$OUT cells=$CELLS n_per=$N_PER dump=$DUMP objects=${OBJ_ARR[*]}"
 
 $PY -c "
@@ -79,7 +87,7 @@ for i in "${!OBJ_ARR[@]}"; do
   if [[ -n "${pids[$gpu]:-}" ]]; then
     wait "${pids[$gpu]}" || true
   fi
-  run_one_object "$gpu" "$obj" "$i" &
+  run_one_object "$gpu" "$obj" "${IDX_ARR[$i]}" &
   pids[$gpu]=$!
   echo $! >"$OUT/logs/gpu${gpu}_${obj}.pid"
 done

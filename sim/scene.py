@@ -636,7 +636,14 @@ class Phase0Scene:
         # (scratch probe_lag_variants, Oct 28): 30 cm/s trail −7.9 → +0.2 mm.
         self._joint_vel_ff = bool(robot_cfg.get("joint_velocity_ff", False))
         self._ramp_q0: torch.Tensor | None = None  # arm q* at the start of the tick
-        self._ramp_qd: torch.Tensor | None = None  # arm q̇* for this tick
+        self._ramp_qd: torch.Tensor | None = None  # arm q̇* (refreshed every substep)
+        self._ramp_v = np.zeros(3)  # TCP velocity (world) the ramp follows this tick
+        # Spawn filter (reset_episode): re-draw throws whose ride needs j7 within
+        # this many rad of a limit. 0 = off.
+        scene_cfg = cfg.get("scene", {}) if isinstance(cfg.get("scene"), dict) else {}
+        self._spawn_j7_margin = float(scene_cfg.get("spawn_j7_margin_rad", 0.0))
+        self._spawn_max_redraws = int(scene_cfg.get("spawn_max_redraws", 20))
+        self._spawn_redraws, self._last_ride_j7_margin = 0, None
 
         # Three object velocities on purpose:
         #   _obj_velocity  — live speed that drives the coast
@@ -1041,78 +1048,95 @@ class Phase0Scene:
             tip_on_side_quat_wxyz,
         )
 
-        pos0, lin_vel = sample_throw(
-            rng,
-            self._xy_bounds,
-            speed=speed,
-            spawn_pad=pad,
-            throw_randomness=throw_r,
-        )
-
-        # Tip cans/bottles/cups on their side so they can roll (not upright slide).
-        # Empty tip_roll_categories → never tip (physics grasp cannot reach the
-        # low center of a side-lying can; see phase0_cfg comment).
-        tip_cats = sc.get("tip_roll_categories")
-        tip_set = (
-            {str(c).lower() for c in tip_cats}
-            if tip_cats is not None
-            else set(ROLL_TIP_CATEGORIES)
-        )
-        cat = (
-            "primitive"
-            if self._use_primitive
-            else (self._active_usd.parent.name if self._active_usd is not None else "")
-        )
-        tip = (not self._use_primitive) and cat.lower() in tip_set and speed > 1e-6
-        upright = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-        size = (
-            self._object_size
-            if self._object_size is not None
-            else np.array([0.06, 0.06, 0.06], dtype=np.float64)
-        )
-        if tip:
-            quat = tip_on_side_quat_wxyz(lin_vel[:2], rng).astype(np.float64)
-            sit_h = sit_half_height_m(size, tipped=True)
-        else:
-            quat = upright.copy()
-            sit_h = float(self._object_half_height)
-        # Episode sit height (coast keeps this Z). Upright mesh uses mesh half-height.
-        self._episode_object_half_height = float(sit_h)
-        # Root pose so collision centre is at (xy, table+sit_h).
-        off = np.asarray(self._object_centre_offset, dtype=np.float64).reshape(3)
-        pos = np.array(
-            [
-                float(pos0[0]) - float(off[0]),
-                float(pos0[1]) - float(off[1]),
-                float(self._table_z) + float(sit_h) - float(off[2]),
-            ],
-            dtype=np.float64,
-        )
-        # Far-rim spawn is the play +X edge; mesh half-width can hang past the
-        # table (egg seed-50194: center 0.78 → PhysX walked it to 0.82 off-table
-        # during settle). Pull the center in by half-XY + 5 mm.
-        half_xy = 0.5 * float(max(abs(size[0]), abs(size[1])))
-        rim_pad = float(half_xy) + 0.005
-        if self._table_box is not None:
-            pos[0] = min(float(pos[0]), float(self._table_box[1][0]) - rim_pad)
-            pos[0] = max(float(pos[0]), float(self._table_box[0][0]) + rim_pad)
-            pos[1] = float(
-                np.clip(
-                    pos[1],
-                    float(self._table_box[0][1]) + rim_pad,
-                    float(self._table_box[1][1]) - rim_pad,
-                )
+        # Spawn filter: re-draw the throw while the ride would push the wrist
+        # (joint 7) within ride_j7_margin of a limit (sim/ride_ik_check.py).
+        spawn_redraws, ride_j7_margin = 0, None
+        while True:
+            pos0, lin_vel = sample_throw(
+                rng,
+                self._xy_bounds,
+                speed=speed,
+                spawn_pad=pad,
+                throw_randomness=throw_r,
             )
-        (bx0, bx1), (by0, by1) = self._xy_bounds
-        pos[0] = float(np.clip(pos[0], bx0, bx1))
-        pos[1] = float(np.clip(pos[1], by0, by1))
-        # Cap spawn inside arm reach. Long tables put the far rim at ~1.5 m
-        # (smoke i14); DiffIK never meets the object before the catch-box exit.
-        robot_cfg = self.cfg.get("robot", {}) if isinstance(self.cfg.get("robot"), dict) else {}
-        max_reach = float(robot_cfg.get("max_reach_dist", 0.85))
-        reach_spawn_cap = max(float(bx0) + 0.05, float(max_reach) - 0.05)
-        if float(pos[0]) > reach_spawn_cap:
-            pos[0] = reach_spawn_cap
+
+            # Tip cans/bottles/cups on their side so they can roll (not upright slide).
+            # Empty tip_roll_categories → never tip (physics grasp cannot reach the
+            # low center of a side-lying can; see phase0_cfg comment).
+            tip_cats = sc.get("tip_roll_categories")
+            tip_set = (
+                {str(c).lower() for c in tip_cats}
+                if tip_cats is not None
+                else set(ROLL_TIP_CATEGORIES)
+            )
+            cat = (
+                "primitive"
+                if self._use_primitive
+                else (self._active_usd.parent.name if self._active_usd is not None else "")
+            )
+            tip = (not self._use_primitive) and cat.lower() in tip_set and speed > 1e-6
+            upright = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            size = (
+                self._object_size
+                if self._object_size is not None
+                else np.array([0.06, 0.06, 0.06], dtype=np.float64)
+            )
+            if tip:
+                quat = tip_on_side_quat_wxyz(lin_vel[:2], rng).astype(np.float64)
+                sit_h = sit_half_height_m(size, tipped=True)
+            else:
+                quat = upright.copy()
+                sit_h = float(self._object_half_height)
+            # Episode sit height (coast keeps this Z). Upright mesh uses mesh half-height.
+            self._episode_object_half_height = float(sit_h)
+            # Root pose so collision centre is at (xy, table+sit_h).
+            off = np.asarray(self._object_centre_offset, dtype=np.float64).reshape(3)
+            pos = np.array(
+                [
+                    float(pos0[0]) - float(off[0]),
+                    float(pos0[1]) - float(off[1]),
+                    float(self._table_z) + float(sit_h) - float(off[2]),
+                ],
+                dtype=np.float64,
+            )
+            # Far-rim spawn is the play +X edge; mesh half-width can hang past the
+            # table (egg seed-50194: center 0.78 → PhysX walked it to 0.82 off-table
+            # during settle). Pull the center in by half-XY + 5 mm.
+            half_xy = 0.5 * float(max(abs(size[0]), abs(size[1])))
+            rim_pad = float(half_xy) + 0.005
+            if self._table_box is not None:
+                pos[0] = min(float(pos[0]), float(self._table_box[1][0]) - rim_pad)
+                pos[0] = max(float(pos[0]), float(self._table_box[0][0]) + rim_pad)
+                pos[1] = float(
+                    np.clip(
+                        pos[1],
+                        float(self._table_box[0][1]) + rim_pad,
+                        float(self._table_box[1][1]) - rim_pad,
+                    )
+                )
+            (bx0, bx1), (by0, by1) = self._xy_bounds
+            pos[0] = float(np.clip(pos[0], bx0, bx1))
+            pos[1] = float(np.clip(pos[1], by0, by1))
+            # Cap spawn inside arm reach. Long tables put the far rim at ~1.5 m
+            # (smoke i14); DiffIK never meets the object before the catch-box exit.
+            robot_cfg = self.cfg.get("robot", {}) if isinstance(self.cfg.get("robot"), dict) else {}
+            max_reach = float(robot_cfg.get("max_reach_dist", 0.85))
+            reach_spawn_cap = max(float(bx0) + 0.05, float(max_reach) - 0.05)
+            if float(pos[0]) > reach_spawn_cap:
+                pos[0] = reach_spawn_cap
+            ride_j7_margin = self._ride_j7_margin(pos, lin_vel, speed)
+            if (
+                ride_j7_margin is None
+                or ride_j7_margin >= self._spawn_j7_margin
+                or spawn_redraws >= self._spawn_max_redraws
+            ):
+                break
+            spawn_redraws += 1
+            logger.info(
+                "    spawn re-draw %d: j7 margin %.2f rad < %.2f (seed %d)",
+                spawn_redraws, ride_j7_margin, self._spawn_j7_margin, int(seed),
+            )
+        self._spawn_redraws, self._last_ride_j7_margin = spawn_redraws, ride_j7_margin
 
         # Small random box shift per episode, clipped to where the arm can reach.
         # House layout already parked the bowl off the throw band.
@@ -1241,6 +1265,8 @@ class Phase0Scene:
             "tags": [tag],
             "init_pos": pos.tolist(),
             "init_vel": lin_vel.tolist(),
+            "spawn_redraws": int(self._spawn_redraws),
+            "ride_j7_margin_rad": self._last_ride_j7_margin,
             "init_quat_wxyz": quat.tolist(),
             "grasp_mode": "weld" if self._weld else "physics",
             **self._house_meta,
@@ -1796,11 +1822,44 @@ class Phase0Scene:
             vt = torch.zeros_like(self.robot.data.joint_vel_target)
             vt[:, self._arm_idx] = qd
             self.robot.set_joint_velocity_target(vt)
-            self._ramp_q0, self._ramp_qd = new_joint_pos.clone(), qd
+            self._ramp_q0, self._ramp_qd, self._ramp_v = new_joint_pos.clone(), qd, v
         self._last_gripper_open = g
         # Weld: teleport fingers. Physics grasp: PD target only, fingers stall on the object.
         if self._weld:
             self._snap_fingers(g)
+
+    def _ride_j7_margin(self, root_pos: np.ndarray, lin_vel: np.ndarray, speed: float) -> float | None:
+        """Smallest j7 distance (rad) to a limit over the planned chase + ride.
+
+        None when the filter is off or the object does not move (no pads-across
+        yaw then). Path = collision centre (root + centre offset) at grasp height.
+        """
+        if self._spawn_j7_margin <= 0.0 or float(speed) <= 0.02:
+            return None
+        from sim.ride_ik_check import ride_j7_margin
+        from sim.state_machine import _yaw_about_z
+
+        sm = self.cfg.get("state_machine_params", {})
+        off = np.asarray(self._object_centre_offset, dtype=np.float64).reshape(3)
+        centre = np.asarray(root_pos, dtype=np.float64) + off
+        down = np.asarray(self.cfg["robot"]["init_pose"][3:], dtype=np.float64)
+        heading = float(np.arctan2(lin_vel[1], lin_vel[0]))
+        q_home = self.robot.data.default_joint_pos[0, self._arm_idx].detach().cpu().numpy()
+        r = ride_j7_margin(
+            q_home=q_home,
+            home_quat_wxyz=down,
+            pad_quat_wxyz=_yaw_about_z(down, heading),
+            spawn_xyz=centre,
+            vel_xy=np.asarray(lin_vel, dtype=np.float64)[:2],
+            tcp=float(self._tcp_offset[0, 2].item()),
+            dt=float(self.dt),
+            wait_s=float(sm.get("settle_s", 0.05)),
+            chase_speed=float(sm.get("ee_speed_max", 0.365)),
+            ride_s=1.0,
+            keep_r_min=float(sm.get("reach_zone_radius", 0.2)),
+        )
+        m = r["margin"]
+        return None if not np.isfinite(m) else float(m)
 
     def _tcp_joint_velocity(self, jacobian: torch.Tensor, v_w: np.ndarray) -> torch.Tensor:
         """Arm q̇* that moves the TCP (pinch) at ``v_w`` with no rotation.
@@ -1923,6 +1982,21 @@ class Phase0Scene:
             if substep_cb is not None:
                 substep_cb(self, self._sim_time)
             if self._ramp_q0 is not None:
+                if k > 0:
+                    # Fresh q̇* = J_tcp⁺·v from this substep's state. A straight hand
+                    # line needs changing joint rates; one q̇* held for the whole
+                    # tick left a v²-scaling cross-track offset (step-1 probe:
+                    # ≤ 1.3 mm → ≤ 0.5 mm at 30 cm/s). Ramp continues from where
+                    # the previous substep's target ended.
+                    jac = self.robot.root_physx_view.get_jacobians()[
+                        :, self._jac_idx, :, self._arm_idx
+                    ]
+                    qd = self._tcp_joint_velocity(jac, self._ramp_v)
+                    self._ramp_q0 = self._ramp_q0 + (self._ramp_qd - qd) * k * self.physics_dt
+                    self._ramp_qd = qd
+                    vt = torch.zeros_like(self.robot.data.joint_vel_target)
+                    vt[:, self._arm_idx] = qd
+                    self.robot.set_joint_velocity_target(vt)
                 # Arm q* for the END of this substep: q0 + q̇*·(k+1)·dt_phys.
                 tgt = self.robot.data.joint_pos_target.clone()
                 tgt[:, self._arm_idx] = self._ramp_q0 + self._ramp_qd * (k + 1) * self.physics_dt

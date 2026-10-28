@@ -108,10 +108,29 @@ def test_delayed_ride_aims_at_p_now_not_base_tau(sm):
         ee_vel=vel,
     )
     assert cmd.stage in (STAGE_APPROACH, STAGE_CLOSE)
-    # Inside 2 mm hold snaps aim to ee; DiffIK FF still carries v̂_obj.
-    assert cmd.position[0] == pytest.approx(float(ee[0]), abs=3e-3)
+    # Inside the 2 mm box aim = p_now (= ee here); DiffIK FF carries v̂_obj.
+    assert cmd.position[0] == pytest.approx(float(p_now[0]), abs=1e-6)
     assert cmd.velocity is not None
     assert cmd.velocity[0] == pytest.approx(0.30, abs=1e-9)  # DiffIK FF = v̂_obj
+
+
+def test_inside_close_box_aims_at_object_not_hand(sm):
+    """No hold rule: 1.5 mm inside the close box, aim = object_now, not the hand."""
+    sm.stage = STAGE_APPROACH
+    sm.z_grasp = 0.036
+    sm.set_aim_xy_bounds([[0.20, 0.90], [-0.40, 0.40]])
+    vel = np.array([0.30, 0.0, 0.0])
+    obj = np.array([0.55, 0.0, 0.036])
+    ee = obj + np.array([0.0015, -0.0015, 0.0])
+    sm._prev_ee = ee.copy()  # hand still: |Δv| = 30 cm/s, so the close gate stays shut
+    cmd = sm.step(
+        _state(obj, vel), ee, sm._down_quat,
+        delta_meas_s=0.0, delta_true_s=0.0, ee_vel=np.zeros(3),
+    )
+    assert cmd.stage == STAGE_APPROACH
+    assert sm.aim_branch == "settle"
+    assert cmd.position[0] == pytest.approx(float(obj[0]), abs=1e-6)
+    assert cmd.position[1] == pytest.approx(float(obj[1]), abs=1e-6)
 
 
 def test_delayed_ride_settle_is_p_now(sm):
@@ -150,7 +169,7 @@ def test_zero_delay_ride_settle_is_p_now(sm):
     sm.set_aim_xy_bounds([[0.20, 0.90], [-0.40, 0.40]])
     vel = np.array([0.30, 0.0, 0.0])
     obj = np.array([0.55, 0.0, 0.036])
-    # Sit in the chase box but outside the 2 mm hold so aim is not snapped to ee.
+    # Sit in the chase box, outside the 2 mm close box (ride pull off here).
     ee = obj + np.array([-0.005, 0.0, 0.0])
     ee[2] = sm.z_grasp
     sm._prev_ee = ee - vel * sm.dt
