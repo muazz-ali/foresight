@@ -197,9 +197,11 @@ state_machine_params:
   max_aim_ahead_ms: 400
   # Aim farther for tip lag (not a wait). Measure: tools/diag/probe_diffik_tracking.py.
   tip_lag_pad_ms: 0
-  # Chase planning speed = measured far-chase average (C30 v5, 50 eps:
-  # 0.365 m/s median, 0.353–0.424). 250 made the far-chase lead ~5× too short.
-  hand_speed_max_cm_s: 36.5
+  # Chase planning speed. Measured far-chase average is 0.365 m/s (C30 v5), but
+  # planning with it puts the aim ~0.8× the gap ahead: the hand approaches from
+  # in front and never enters the ride box (stage A, aa7346d: 0/25, 19
+  # unreachable). 250 → 25/25 first-attempt on the same seeds.
+  hand_speed_max_cm_s: 250.0
   aim_refine_iters: 3
   # Chase near-box: |dx|,|dy|,|dz| (mm). Inside → settle aim (object + 1 tick).
   # Close only when XY also ≤ close_xy_ok (B5: mean |d| ≤ 2 mm).

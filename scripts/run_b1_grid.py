@@ -338,6 +338,8 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
                 "delta_ms": int(d_ms),
                 "success": bool(scored["success"]),
                 "failure_mode": scored["failure_mode"],
+                "first_attempt": bool(scored.get("first_attempt", False)),
+                "n_close_entries": int(scored.get("n_close_entries", 0)),
                 **meta,
                 **episode_for_json(ep),
             }
