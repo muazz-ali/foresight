@@ -22,6 +22,7 @@ smoke / debug so you can plot root causes later. Leave off for the full 1,280
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import logging
 import math
@@ -205,6 +206,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated cell tags to keep (e.g. C30,C31,C33). "
         "Filters the role's cell list after build; unknown tags are ignored.",
     )
+    p.add_argument(
+        "--episode-timeout-s",
+        type=float,
+        default=180.0,
+        help="Watchdog: if one episode (incl. h5/mp4 write) takes longer, dump every "
+        "thread's Python stack to logs/watchdog_<object>.txt and exit code 1. "
+        "Slowest of 637 past episodes: 35 s. 0 = off. Why: Isaac froze once mid-episode "
+        "(Oct 29, lemon C21 s1033) with no error and the worker sat 7 h.",
+    )
+    p.add_argument(
+        "--skip-done",
+        action="store_true",
+        help="Reuse an episode already in cells/<cell>/episodes.jsonl (that row is written "
+        "last, after h5/json/mp4) instead of re-running it. For restarting a worker.",
+    )
     return p
 
 
@@ -279,8 +295,26 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
     expert = PickPlaceStateMachine(cfg)
     i0 = int(args.seed_start)
     i1 = int(args.seed_end)
+    wd_s = float(getattr(args, "episode_timeout_s", 0.0) or 0.0)
+    wd_file = None
+    if wd_s > 0:
+        (out / "logs").mkdir(parents=True, exist_ok=True)
+        wd_file = (out / "logs" / f"watchdog_{obj_cat}.txt").open("a")
+        log.info("episode watchdog %.0f s → %s", wd_s, wd_file.name)
 
-    def run_one(
+    def run_one(**kw) -> dict:
+        """One episode under the watchdog (see --episode-timeout-s)."""
+        if wd_file is None:
+            return _run_one(**kw)
+        wd_file.write(f"{time.strftime('%F %T')} pid {os.getpid()} start {kw.get('cell')} s{kw.get('seed')}\n")
+        wd_file.flush()
+        faulthandler.dump_traceback_later(wd_s, exit=True, file=wd_file)
+        try:
+            return _run_one(**kw)
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+    def _run_one(
         *,
         cell: str,
         v_cms: int,
@@ -425,18 +459,33 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
         rows: list[dict] = []
         fails = 0
         indices = [i for i in range(min(int(n), 80)) if i0 <= i <= i1]
+        done: dict[tuple[int, str], dict] = {}
+        jl = out / "cells" / cell / "episodes.jsonl"
+        if getattr(args, "skip_done", False) and jl.exists():
+            for line in jl.read_text().splitlines():
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if getattr(args, "save_mp4", False) and not (r.get("video") and Path(r["video"]).exists()):
+                    continue
+                done[(int(r["seed"]), str(r.get("object")))] = r
         for k, i in enumerate(indices):
             if stopped(out) and early_stop and k > 0:
                 log.warning("STOP seen — finishing cell %s early after %d eps", cell, k)
                 break
             obj = OBJECTS[i]
-            row = run_one(
-                cell=cell,
-                v_cms=v_cms,
-                d_ms=d_ms,
-                seed=seed_i(i),
-                object_usd=obj,
-            )
+            if (seed_i(i), obj) in done:
+                row = done[(seed_i(i), obj)]
+                log.info("%s s%d already in episodes.jsonl — reused, not re-run", cell, seed_i(i))
+            else:
+                row = run_one(
+                    cell=cell,
+                    v_cms=v_cms,
+                    d_ms=d_ms,
+                    seed=seed_i(i),
+                    object_usd=obj,
+                )
             rows.append(row)
             if not row["success"]:
                 fails += 1

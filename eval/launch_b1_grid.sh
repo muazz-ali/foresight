@@ -37,14 +37,12 @@ print('froze', '$OUT')
 
 run_worker() {
   local gpu=$1 role=$2 obj=$3 s0=$4 s1=$5 phase=$6
-  local logf=$OUT/logs/${role}_${obj}_${phase}.log
   echo "start role=$role obj=$obj gpu=$gpu seeds=$s0..$s1 phase=$phase"
-  CUDA_VISIBLE_DEVICES=$gpu $PY $ROOT/scripts/run_b1_grid.py \
-    --headless --enable_cameras --device cuda:0 \
+  # Wrapper: episode watchdog + restart with --skip-done + one Kit log per worker.
+  GPU=$gpu TAG=${role}_${obj}_${phase} bash "$ROOT/eval/run_b1_worker.sh" "$OUT" \
     --role "$role" --phase "$phase" --object "$obj" \
     --seed-start "$s0" --seed-end "$s1" \
-    "${MP4_FLAG[@]}" "${ES_FLAG[@]}" \
-    -o "$OUT" >"$logf" 2>&1 &
+    "${MP4_FLAG[@]}" "${ES_FLAG[@]}" &
   echo $! >"$OUT/logs/${role}_${obj}_${phase}.pid"
 }
 
