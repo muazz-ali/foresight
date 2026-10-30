@@ -321,6 +321,8 @@ def run_episode(
         "delta_round_s": [],
         # Expert code-path flag: index into AIM_BRANCHES (meta aim_branch_codes).
         "aim_branch": [],
+        # Expert's object-now p + v·Δ_meas (NaN on non-chase ticks).
+        "p_now": [],
     }
     if save_images:
         log["static_cam_rgb"] = []
@@ -396,7 +398,6 @@ def run_episode(
 
         obs_buf = ObsDelayBuffer(dt=float(scene.dt))
         delta_meas = DeltaMeasSampler(
-            delta_true_s=float(delta_true_s),
             noise_std_s=float(ct.get("delta_meas_noise_s", 0.005)),
             replan_period_s=float(ct.get("delta_meas_replan_s", 0.33)),
             seed=int(seed) + 3,
@@ -512,7 +513,8 @@ def run_episode(
             wrist_cam_z = delayed.wrist_cam_z
             t_capture_used = float(delayed.t_capture)
             delta_round = float(obs_buf.last_round_dt_s)
-            delta_meas_s = float(delta_meas.update(now))
+            # F1: measured frame age + η (the real robot has no true Δ).
+            delta_meas_s = float(delta_meas.update(now, t_capture_used))
             planned = expert.step(
                 state,
                 ee_pos,
@@ -523,7 +525,6 @@ def run_episode(
                 static_cam_z=static_z,
                 wrist_cam_z=wrist_cam_z,
                 delta_meas_s=delta_meas_s,
-                delta_true_s=float(delta_true_s),
                 forecast_off=bool(forecast_off),
                 ee_vel=ee_vel,
             )
@@ -656,6 +657,7 @@ def run_episode(
         log["aim_branch"].append(
             AIM_BRANCHES.index(getattr(expert, "aim_branch", "none"))
         )
+        log["p_now"].append(np.asarray(getattr(expert, "p_now", np.full(3, np.nan))).copy())
         ctr = scene.get_container_pose()
         log["container_pos"].append(
             ctr[0].copy() if ctr is not None else np.full(3, np.nan)

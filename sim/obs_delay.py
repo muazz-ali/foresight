@@ -108,12 +108,13 @@ class ObsDelayBuffer:
 
 @dataclass
 class DeltaMeasSampler:
-    """Draw η ~ N(0, σ) once per replan cycle; hold Δ_meas until the next.
+    """F1: Δ_meas = (t_exec − t_capture) + η, clamped ≥ 0.
 
-    Replan period defaults to 0.33 s (≈ 10 ticks at 30 Hz). Δ_meas is clamped ≥ 0.
+    The age is measured from the frame actually used, so on startup ticks
+    (frame younger than the cell's Δ) Δ_meas follows the real age. η ~ N(0, σ)
+    is redrawn once per replan period (0.33 s ≈ 10 ticks at 30 Hz) and held.
     """
 
-    delta_true_s: float
     noise_std_s: float = 0.005
     replan_period_s: float = 0.33
     seed: int = 0
@@ -124,23 +125,21 @@ class DeltaMeasSampler:
 
     def __post_init__(self) -> None:
         self._rng = np.random.default_rng(int(self.seed))
-        self._delta_meas_s = max(0.0, float(self.delta_true_s))
-        self._eta_s = 0.0
 
     def reset(self, *, seed: int | None = None) -> None:
         if seed is not None:
             self._rng = np.random.default_rng(int(seed))
         self._last_replan_t = -1e9
-        self._delta_meas_s = max(0.0, float(self.delta_true_s))
+        self._delta_meas_s = 0.0
         self._eta_s = 0.0
 
-    def update(self, now: float) -> float:
-        """Maybe redraw η; return current Δ_meas (≥ 0)."""
+    def update(self, now: float, t_capture: float) -> float:
+        """Maybe redraw η; return Δ_meas = max(0, (now − t_capture) + η)."""
         now = float(now)
         if now - self._last_replan_t >= float(self.replan_period_s) - 1e-12:
             self._eta_s = float(self._rng.normal(0.0, float(self.noise_std_s)))
-            self._delta_meas_s = max(0.0, float(self.delta_true_s) + self._eta_s)
             self._last_replan_t = now
+        self._delta_meas_s = max(0.0, (now - float(t_capture)) + self._eta_s)
         return float(self._delta_meas_s)
 
     @property

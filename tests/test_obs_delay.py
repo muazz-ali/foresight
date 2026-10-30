@@ -39,14 +39,42 @@ def test_buffer_returns_nearest_capture():
 
 
 def test_delta_meas_redraws_once_per_replan_and_clamps():
-    samp = DeltaMeasSampler(delta_true_s=0.0, noise_std_s=0.005, replan_period_s=0.33, seed=1)
-    a = samp.update(0.0)
-    b = samp.update(0.10)
-    assert a == b  # held within cycle
-    assert a >= 0.0
-    c = samp.update(0.34)
-    # May differ after replan; still ≥ 0.
-    assert c >= 0.0
+    samp = DeltaMeasSampler(noise_std_s=0.005, replan_period_s=0.33, seed=1)
+    a = samp.update(0.0, 0.0)
+    eta0 = samp.eta_s
+    b = samp.update(0.10, 0.10)
+    assert samp.eta_s == eta0  # η held within the cycle
+    assert a == b and a >= 0.0  # same age (0) → same Δ_meas, clamped ≥ 0
+    samp.update(0.34, 0.34)
+    assert samp.eta_s != eta0  # redrawn after 0.33 s
+    for k in range(200):  # clamp holds for any draw at age 0
+        assert samp.update(0.34 * (k + 2), 0.34 * (k + 2)) >= 0.0
+
+
+def test_delta_meas_equals_frame_age_when_eta_zero():
+    """F1 with η = 0: Δ_meas = t_exec − t_capture, including startup ticks."""
+    samp = DeltaMeasSampler(noise_std_s=0.0, seed=3)
+    buf = ObsDelayBuffer(dt=1.0 / 30.0)
+    delta = 0.300
+    for i in range(40):
+        now = i / 30.0
+        st = oracle_from_gt([0.5, 0, 0.05], [0.3, 0, 0], now)
+        buf.push(DelayedFrame(now, st, 0.3, None, None, None, None))
+        fr = buf.get_delayed(now, delta)
+        d = samp.update(now, fr.t_capture)
+        assert d == pytest.approx(now - fr.t_capture, abs=1e-12)
+        if i < 9:  # only frame 0 exists: age = now, younger than Δ
+            assert fr.t_capture == 0.0 and d < delta
+    assert d == pytest.approx(delta, abs=1e-9)
+
+
+def test_delta_meas_adds_held_eta_to_age():
+    samp = DeltaMeasSampler(noise_std_s=0.005, seed=7)
+    d0 = samp.update(1.0, 0.8)
+    eta = samp.eta_s
+    assert d0 == pytest.approx(max(0.0, 0.2 + eta), abs=1e-12)
+    d1 = samp.update(1.1, 0.8)  # same η, age grew by 0.1 s
+    assert d1 == pytest.approx(max(0.0, 0.3 + eta), abs=1e-12)
 
 
 def test_w_pre_clamp_at_80mm():

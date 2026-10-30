@@ -104,7 +104,6 @@ def test_delayed_ride_aims_at_p_now_not_base_tau(sm):
         ee,
         sm._down_quat,
         delta_meas_s=delta,
-        delta_true_s=delta,
         ee_vel=vel,
     )
     assert cmd.stage in (STAGE_APPROACH, STAGE_CLOSE)
@@ -125,7 +124,7 @@ def test_inside_close_box_aims_at_object_not_hand(sm):
     sm._prev_ee = ee.copy()  # hand still: |Δv| = 30 cm/s, so the close gate stays shut
     cmd = sm.step(
         _state(obj, vel), ee, sm._down_quat,
-        delta_meas_s=0.0, delta_true_s=0.0, ee_vel=np.zeros(3),
+        delta_meas_s=0.0, ee_vel=np.zeros(3),
     )
     assert cmd.stage == STAGE_APPROACH
     assert sm.aim_branch == "settle"
@@ -152,7 +151,6 @@ def test_delayed_ride_settle_is_p_now(sm):
         ee,
         sm._down_quat,
         delta_meas_s=delta,
-        delta_true_s=delta,
         ee_vel=vel,
     )
     assert cmd.position[0] == pytest.approx(float(p_now[0]), abs=1e-6)
@@ -178,7 +176,6 @@ def test_zero_delay_ride_settle_is_p_now(sm):
         ee,
         sm._down_quat,
         delta_meas_s=0.0,
-        delta_true_s=0.0,
         ee_vel=vel,
     )
     assert cmd.position[0] == pytest.approx(float(obj[0]), abs=1e-6)
@@ -198,7 +195,6 @@ def test_delayed_chase_travel_from_p_now_no_double_delta(sm):
         ee,
         sm._down_quat,
         delta_meas_s=delta,
-        delta_true_s=delta,
     )
     # Aim should be ahead of p_now by travel·v, not stuck at v·dt past p_now.
     # Full double-count lead would put aim near p_delayed + v*(Δ + travel + tau).
@@ -222,7 +218,6 @@ def _far_chase_cmd(sm, delta):
         ee,
         sm._down_quat,
         delta_meas_s=delta,
-        delta_true_s=delta,
     )
     return cmd, sm.aim_branch
 
@@ -378,6 +373,39 @@ def test_close_rides_object_xy(sm):
     sm.timer_s = sm.finger_close_s + 1e-6
     cmd2 = sm.step(_state(obj, vel), ee, sm._down_quat)
     assert cmd2.attach_object and not cmd2.kinematic_object
+
+
+def test_close_ff_is_xy_only(sm):
+    """CLOSE feeds v̂_obj forward in XY only; a popping object's v_z is dropped.
+
+    Why: the z FF fed the squeeze pop back into the hand, so close/lift labels
+    depended on Δ (pop 13.5 mm at Δ0 vs 2.4 mm at Δ300).
+    """
+    sm.stage = STAGE_CLOSE
+    sm.z_grasp = 0.036
+    sm.timer_s = 0.0
+    sm.set_aim_xy_bounds([[0.40, 0.90], [-0.20, 0.20]])
+    obj = np.array([0.55, 0.0, 0.036])
+    vel = np.array([0.30, -0.10, 0.25])  # squeeze pop: object moving up
+    cmd = sm.step(_state(obj, vel), obj.copy(), sm._down_quat)
+    assert cmd.stage == STAGE_CLOSE and cmd.kinematic_object
+    np.testing.assert_allclose(cmd.velocity, [0.30, -0.10, 0.0], atol=1e-12)
+    # Chase keeps the full v̂_obj.
+    sm.reset()
+    sm.stage = STAGE_APPROACH
+    sm.set_aim_xy_bounds([[0.20, 1.20], [-0.40, 0.40]])
+    cmd = sm.step(_state(obj, vel), np.array([0.40, 0.0, 0.40]), sm._down_quat)
+    np.testing.assert_allclose(cmd.velocity, vel, atol=1e-12)
+
+
+def test_p_now_uses_delta_meas(sm):
+    """F2: p_now = p_delayed + v·Δ_meas, and the expert logs it."""
+    sm.stage = STAGE_APPROACH
+    sm.set_aim_xy_bounds([[0.20, 1.20], [-0.40, 0.40]])
+    vel = np.array([0.30, 0.10, 0.0])
+    p = np.array([0.60, 0.0, 0.03])
+    sm.step(_state(p, vel), np.array([0.40, 0.0, 0.40]), sm._down_quat, delta_meas_s=0.137)
+    np.testing.assert_allclose(sm.p_now[:2], p[:2] + vel[:2] * 0.137, atol=1e-12)
 
 
 def test_intercept_aim_clips_to_table(sm):

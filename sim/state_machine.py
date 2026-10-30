@@ -529,6 +529,7 @@ class PickPlaceStateMachine:
         # Chase stopped by the reach rule → B1 judge labels it F1 "unreachable".
         self.reach_stopped = False
         self.aim_branch = "none"  # last tick's chase-aim branch (AIM_BRANCHES)
+        self.p_now = np.full(3, np.nan)  # last chase tick's object-now (F2)
 
     def set_pre_shape(self, open_frac: float, *, w_pre_m: float | None = None, clamped: bool = False) -> None:
         """Set approach gripper opening (0=shut, 1=full). Call once per episode from w_pre."""
@@ -868,7 +869,6 @@ class PickPlaceStateMachine:
         wrist_cam_z: float | None = None,
         *,
         delta_meas_s: float | None = None,
-        delta_true_s: float | None = None,
         forecast_off: bool = False,
         ee_vel: np.ndarray | None = None,
     ) -> ExpertCommand:
@@ -877,11 +877,10 @@ class PickPlaceStateMachine:
         ``state`` must be the delayed observation pack for B1 (GT at t-Δ), not
         live GT. Live proprio (``ee_pos`` / ``ee_quat`` / ``ee_vel``) is fine.
 
-        ``delta_meas_s``: age used to build p_now = p_delayed + v·Δ for chase
-        travel (do not add Δ again on top of travel). 
-        Ride aim = p_now. ``delta_true_s``: true age of ``state`` — gate/settle against
-        p + v·Δ_true (not noisy Δ_meas; η was kicking good close ticks out of
-        the 2 mm box). ``forecast_off``: aim at the delayed position p.
+        ``delta_meas_s``: Δ_meas (F1: measured frame age + η). The only Δ the
+        expert sees: p_now = p_delayed + v·Δ_meas (F2) for chase, ride, gate
+        and reach stop (do not add Δ again on top of travel). Ride aim = p_now.
+        ``forecast_off``: aim at the delayed position p.
         ``ee_vel``: Isaac EE-link world velocity for the close-speed gate
         (preferred). Falls back to FD of ``ee_pos`` only when omitted (unit tests).
         """
@@ -898,6 +897,7 @@ class PickPlaceStateMachine:
             v_hand = None if self._prev_ee is None else (ee - self._prev_ee) / max(self.dt, 1e-6)
         self._prev_ee = ee.copy()
         self.aim_branch = "none"  # set below only if a chase aim is computed
+        self.p_now = np.full(3, np.nan)  # logged object-now (chase ticks only)
         self._ee_hist.append(ee.copy())
         del self._ee_hist[:-90]  # keep 3 s at 30 Hz (Δ ≤ 300 ms needs 10)
         # Hand when the observed frame was taken (Δ_meas ago; live when no delay).
@@ -970,31 +970,21 @@ class PickPlaceStateMachine:
                 z_floor = float(self._z_latch.z_table) + float(self.min_aim_z_above_table)
                 if target_z < z_floor:
                     target_z = z_floor
-                # Delayed obs is at t−Δ. Gate/settle against true *now*
-                # (p + v·Δ_true when known). Fall back to Δ_meas.
-                # Chase travel uses p_now from Δ_meas (may include η).
+                # Delayed obs is at t−Δ. p_now = p + v·Δ_meas (F2): one Δ for
+                # chase, ride and gate; the real robot has only the measured age.
                 # Sign: e = hand − object; along-track + = hand ahead of object.
-                if bool(forecast_off):
+                if bool(forecast_off) or delta_meas_s is None:
                     obj_now = obj
-                elif delta_true_s is not None:
-                    obj_now = self._forecast(obj, vel, float(delta_true_s))
-                elif delta_meas_s is not None:
-                    obj_now = self._forecast(obj, vel, float(delta_meas_s))
                 else:
-                    obj_now = obj
+                    obj_now = self._forecast(obj, vel, float(delta_meas_s))
+                self.p_now = np.asarray(obj_now, dtype=np.float64).copy()
                 near_ok, err_xy, err_z = self._grasp_gate_ok(
                     ee, obj_now, wrist_depth_m, goal_z=target_z
                 )
                 # Age of the observation (0 when live). Only used for the lead
                 # log line — the aim below has no Δ fork: obj_now already
                 # unwraps Δ once, so Δ=0 and Δ>0 run the same formulas.
-                obs_age_s = (
-                    0.0
-                    if delta_meas_s is None
-                    else float(
-                        delta_true_s if delta_true_s is not None else delta_meas_s
-                    )
-                )
+                obs_age_s = 0.0 if delta_meas_s is None else float(delta_meas_s)
                 # Ride: reference is p_now (unwrap Δ once). Settle aim = p_now,
                 # no hand-written +dt: with DiffIK FF (v̂_obj) a +v·dt aim parks
                 # the hand v·dt/(1+ride_k) ahead — outside the 2 mm close box
@@ -1295,10 +1285,12 @@ class PickPlaceStateMachine:
         # attach). Once held, v̂_obj IS the hand velocity: feeding it forward
         # made the arm aim 1/K ahead of its own motion — carry overshot to 31 cm
         # and dove to 8 cm into the bowl (C30 s1000/s1001).
-        if self.stage in (STAGE_APPROACH, STAGE_DESCEND) or (
-            self.stage == STAGE_CLOSE and kin and not attach
-        ):
+        if self.stage in (STAGE_APPROACH, STAGE_DESCEND):
             cmd_vel = vel.copy()  # v̂_obj
+        elif self.stage == STAGE_CLOSE and kin and not attach:
+            # XY only: the squeeze pops the object up, and a z FF fed that pop
+            # back into the hand (pop 13.5 mm at Δ0 vs 2.4 mm at Δ300, v8).
+            cmd_vel = np.array([vel[0], vel[1], 0.0], dtype=np.float64)
         else:
             cmd_vel = np.zeros(3, dtype=np.float64)
 
