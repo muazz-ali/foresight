@@ -69,7 +69,12 @@ else
   run_worker 1 lemon 27 53
   wait
   run_worker 0 onion 54 79
+  run_worker 1 kiwi 16 31
   wait
+  run_worker 0 lemon 32 47
+  run_worker 1 lime 48 63
+  wait
+
 fi
 
 $PY -c "

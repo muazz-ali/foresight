@@ -146,7 +146,7 @@ def load_frozen(out: Path, fallback_cfg: Path) -> dict:
 
     snap = out / "phase0_cfg_snapshot.yaml"
     cfg = load_yaml(snap if snap.exists() else fallback_cfg)
-    ov_path = out / "b1_overrides.json"
+    ov_path = out / "b1_overrides.json"  # overrides for the config
     if ov_path.exists():
         ov = json.loads(ov_path.read_text())
         # Apply dotted keys that are still human units into raw then re-normalize
@@ -285,6 +285,7 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
     # matching --seed-start/--seed-end so paired seeds stay aligned.
     obj_cat = args.object or "egg"
     cfg.setdefault("scene", {})["object_categories"] = list(CLAIM_OBJECTS)
+
     log.info("building scene object=%s device=%s", obj_cat, device)
     scene = Phase0Scene(
         cfg,
@@ -292,6 +293,8 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
         object_usd=obj_cat,
         asset_seed=1000,
     )
+
+    log.info("expert initialized")
     expert = PickPlaceStateMachine(cfg)
     i0 = int(args.seed_start)
     i1 = int(args.seed_end)
@@ -329,6 +332,8 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
         save_images = bool(save_images or want_dump)
         expert.reset()
         t0 = time.time()
+
+        log.info("Running episode with seed %s", seed)
         ep, meta = run_episode(
             scene,
             expert,
@@ -341,6 +346,7 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
         )
         dt = float(cfg.get("sim", {}).get("dt", 1.0 / 30.0))
         scored = classify_b1(ep, meta, dt=dt, z_table=float(meta.get("table_z", 0.0)))
+
         cell_dir = out / "cells" / cell
         cell_dir.mkdir(parents=True, exist_ok=True)
         stem = f"{cell}_v{v_cms:02d}_d{d_ms:03d}_s{int(seed)}_{object_usd}"
@@ -727,11 +733,11 @@ def _write_report(out: Path) -> None:
     # Keep main 16 only.
     main = [c for c in cells if c["cell"] in {x[0] for x in UNSEEN_ORDER + SEEN_ORDER}]
     lines = [
-        "# B1 oracle expert — speed × delay grid",
+        "# B1 oracle expert — speed x delay grid",
         "",
         f"Output: `{out}`",
         "",
-        "## 4×4 success grid",
+        "## 4x4 success grid",
         "",
         "| | Δ=0 | Δ=100 | Δ=200 | Δ=300 |",
         "|---|---|---|---|---|",
