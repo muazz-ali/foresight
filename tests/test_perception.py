@@ -3,7 +3,7 @@
 Run from the repo root:  pytest tests/test_perception.py -v
 
 Synthetic frames and tracks only — the real-data numbers come from
-``scripts/g2_perception_report.py``. Synthetic jitter is 0.5 mm per frame; real
+``eval/g2_perception_report.py``. Synthetic jitter is 0.5 mm per frame; real
 static-cam fixes jitter ~0.3 mm frame to frame (on top of a slow ~1.4 mm bias).
 Speed / position bars are B's training noise (3 cm/s, 1.5 cm), not tighter.
 """

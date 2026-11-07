@@ -48,8 +48,8 @@ def main() -> None:
     from sim.scene import Phase0Scene, load_cfg
 
     cfg = load_cfg(args.cfg)
-    cfg.setdefault("claim_timing", {})["obs_delay_buffer"] = False
-    cfg["claim_timing"]["enforce_apply_at"] = False
+    cfg.setdefault("claim_timing", {})["enabled_noise_on_replan"] = False
+    cfg["claim_timing"]["apply_delta_delay_to_robot"] = False
     print("building Phase0Scene…", flush=True)
     scene = Phase0Scene(cfg, enable_cameras=False, object_usd="egg", asset_seed=1000)
     print("reset_episode…", flush=True)

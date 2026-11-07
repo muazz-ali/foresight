@@ -14,12 +14,12 @@ Install: `~/Desktop/IsaacLab` → `muazzam/IsaacLab`. Connect cookbook: `ppt.md`
 3. Loop: `sim.reset()` once → `set_target` → `write_data_to_sim` → `sim.step()` → `update`.
 4. GLFW / "no display" warnings are expected headless — ignore. Real failures: wrong env, early imports, missing cameras flag.
 5. Multi-GPU / multi-process: **disjoint seeds**; index tensors per-env (`[env_i]`), never hardcode `[0]`.
-6. **Own the runtime in `sim/`.** Do not `sys.path` DynamicVLA for the expert or episode loop. Assets from `~/Desktop/muazzam/{objects,scenes}` are fine; their Python SM is not.
+6. **Own the runtime in `sim/`.** Do not `sys.path` DynamicVLA for the state machine or episode loop. Assets from `~/Desktop/muazzam/{objects,scenes}` are fine; their Python SM is not.
 
 ## Foresight specifics
 - Cameras mirror the real rig: static front RGB + wrist RGB-D.
 - Start with scripted object motion; physics rolling later.
-- Expert: plan §4 jobs as stage ids 0–9 on GT `ObjectState`, implemented under `sim/` (stage 2 unused).
+- State machine: plan §4 jobs as stage ids 0–8 on GT `ObjectState`, implemented under `sim/`.
 - Log the conditioning vector *exactly* as the policy will see it.
 - Prove **one** successful episode + shapes before scaling collection.
 - Success criterion and failure taxonomy are Foresight-owned; log `max_sm`, `z_max`, `z_end` so taxonomy is diagnosable.

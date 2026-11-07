@@ -149,7 +149,7 @@ _run_smoke() {
     "${DEVICE_ARGS[@]}"
   echo "[p1] $label collect done → $out"
   if [[ "$DEBUG" == "1" ]] || [[ -n "$(find "$out" -name '*.h5' 2>/dev/null | head -1)" ]]; then
-    "$PY" "$ROOT/scripts/check_collect_recordings.py" --root "$out" -c "$cfg" || true
+    "$PY" "$ROOT/tools/diag/check_collect_recordings.py" --root "$out" -c "$cfg" || true
   fi
   if [[ -f "$out/collect_report.json" ]]; then
     "$PY" -c "import json; r=json.load(open('$out/collect_report.json')); print(json.dumps({k:r[k] for k in ('successes','attempts','success_rate','elapsed_s')}, indent=2))"

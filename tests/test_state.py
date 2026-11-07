@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Unit tests for frozen ObjectState (no Isaac required)."""
+"""Unit tests for frozen ObjectState + light collect helpers (no Isaac)."""
 
 from __future__ import annotations
 
@@ -17,9 +16,9 @@ def test_oracle_predict_and_condition():
     np.testing.assert_allclose(fut.position, [0.45, 0.0, 0.05], atol=1e-9)
     vec = conditioning_vector(st, delta=0.25)
     assert vec.shape == (CONDITIONING_DIM,)
-    assert CONDITIONING_LAYOUT == ("p_hat_x", "p_hat_y", "v_hat_x", "v_hat_y")
-    np.testing.assert_allclose(vec[:2], fut.position[:2])
-    np.testing.assert_allclose(vec[2:4], fut.velocity[:2])
+    assert CONDITIONING_LAYOUT == ("p_hat_x", "p_hat_y", "p_hat_z", "v_hat_x", "v_hat_y")
+    np.testing.assert_allclose(vec[:3], fut.position[:3])
+    np.testing.assert_allclose(vec[3:5], fut.velocity[:2])
 
 
 def test_flat_roundtrip_len():
@@ -46,7 +45,7 @@ def test_episode_for_json_is_light():
         "object_vel": np.tile([0.2, 0.0, 0.0], (T, 1)),
         "ee_pos": np.zeros((T, 3)),
         "gripper": np.ones(T),
-        "conditioning": np.tile([0.45, 0.0, 0.2, 0.0], (T, 1)),
+        "conditioning": np.tile([0.45, 0.0, 0.05, 0.2, 0.0], (T, 1)),
         "timestamp": np.arange(1, T + 1, dtype=np.float64) * 0.04,
         "filter_redetect_counts": np.array([0, 0, 1, 1, 2], dtype=np.int64),
         "static_cam_rgb": np.zeros((T, 8, 8, 3), dtype=np.uint8),
@@ -55,7 +54,7 @@ def test_episode_for_json_is_light():
     assert d["conditioning_dim"] == CONDITIONING_DIM
     assert d["conditioning_layout"] == list(CONDITIONING_LAYOUT)
     assert abs(d["vel_xy_median_m_s"] - 0.2) < 1e-6
-    assert d["cond0"] == [0.45, 0.0, 0.2, 0.0]
+    assert d["cond0"] == [0.45, 0.0, 0.05, 0.2, 0.0]
     assert "trace" not in d
     assert "frames" in d and len(d["frames"]) == T
     assert d["arrays"]["static_cam_rgb"]["shape"] == [T, 8, 8, 3]
@@ -66,7 +65,7 @@ def test_episode_for_json_is_light():
     assert d["highlights"]  # at least stage changes
 
 
-def test_write_episode_h5_is_4d_not_12():
+def test_write_episode_h5_is_5d_not_12():
     import tempfile
     from pathlib import Path
 
@@ -94,7 +93,7 @@ def test_write_episode_h5_is_4d_not_12():
         try:
             write_episode_h5(p, bad)
         except ValueError as ex:
-            assert "4" in str(ex)
+            assert str(CONDITIONING_DIM) in str(ex)
         else:
             raise AssertionError("expected 12-D conditioning to fail")
 
@@ -113,10 +112,10 @@ def test_sm_stage_order_and_success_latch():
     from sim.success import episode_success
 
     assert STAGE_APPROACH < STAGE_CLOSE < STAGE_LIFT < STAGE_CARRY < STAGE_OPEN < STAGE_DONE
-    assert STAGE_SCHEMA.done == STAGE_DONE == 9
+    assert STAGE_SCHEMA.done == STAGE_DONE == 8
     T = 8
     ep = {
-        "stage": np.array([0, 1, 2, 4, 5, 6, 7, 9], dtype=np.int64),
+        "stage": np.array([0, 1, 2, 3, 4, 5, 6, 8], dtype=np.int64),
         "object_pos": np.zeros((T, 3)),
         "container_pos": np.tile([0.50, 0.30, 0.05], (T, 1)),
     }
@@ -124,16 +123,5 @@ def test_sm_stage_order_and_success_latch():
     ep["object_pos"][-1, :2] = [0.50, 0.30]
     assert episode_success(ep) is True
     ep_miss = dict(ep)
-    ep_miss["stage"] = np.array([0, 1, 2, 4, 4, 4, 4, 4], dtype=np.int64)
+    ep_miss["stage"] = np.array([0, 1, 2, 3, 3, 3, 3, 3], dtype=np.int64)
     assert episode_success(ep_miss) is False
-
-
-
-if __name__ == "__main__":
-    test_oracle_predict_and_condition()
-    test_flat_roundtrip_len()
-    test_kinematic_forecast_matches_cv()
-    test_episode_for_json_is_light()
-    test_write_episode_h5_is_4d_not_12()
-    test_sm_stage_order_and_success_latch()
-    print("interfaces/state + motion forecast OK")

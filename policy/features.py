@@ -127,7 +127,12 @@ def _load_instructions() -> dict:
 
 
 # Longer names first so "tangerine" is not read as "orange".
+# Mode-2 cubes first so "red cube" / ``cube_red`` map before fruit stems.
 _OBJECT_KEYS = (
+    "cube_blue",
+    "cube_red",
+    "cube_green",
+    "cube_yellow",
     "tangerine",
     "avocado",
     "orange",
@@ -141,6 +146,7 @@ _OBJECT_KEYS = (
     "can",
 )
 _CONTAINER_KEYS = ("basket", "bowl", "box")
+_CUBE_COLORS = ("blue", "red", "green", "yellow")
 
 
 def _stem(name: str | None, fallback: str) -> str:
@@ -151,9 +157,18 @@ def _stem(name: str | None, fallback: str) -> str:
 
 def object_key(name: str | None) -> str:
     """Map a category or a full sentence onto a template key."""
+    low = (name or "").strip().lower()
+    # Mode 2: ``cube_red`` folder or "Grasp the red cube …"
+    for color in _CUBE_COLORS:
+        token = f"cube_{color}"
+        if token in low.replace(" ", "_") or f"{color} cube" in low:
+            return token
+        if _stem(low, "") == f"cube{color}":
+            return token
     key = _stem(name, "object")
-    low = (name or "").lower()
     for name_i in _OBJECT_KEYS:
+        if name_i.startswith("cube_"):
+            continue
         if key == name_i or key.startswith(name_i) or name_i in low:
             return name_i
     return key

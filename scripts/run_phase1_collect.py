@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Record Phase 1 demos with the scripted expert (for policy training).
+"""Record Phase 1 demos with the scripted sm (for policy training).
 
 Always saves camera images + a text instruction. Speeds vary 0-20 cm/s.
 
-What it does: runs our expert over many episodes, keeps the ones that succeed,
+What it does: runs our sm over many episodes, keeps the ones that succeed,
 and saves them (images, hand moves, the 4 policy numbers) for training.
 It runs by hand, in the sim conda env, before the training step.
 
@@ -69,7 +69,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "conditioning look-ahead (s); default is expert.conditioning_delta_s "
+            "conditioning look-ahead (s); default is sm.policy_look_ahead_s "
             "(else lookahead_s)"
         ),
     )
@@ -133,7 +133,7 @@ def _sample_speed(
     return float(np.clip(base + jitter, 0.0, speed_max))
 
 
-def run_collection(args, scene, expert) -> dict:
+def run_collection(args, scene, sm) -> dict:
     """Keep running episodes until enough succeed (or the try cap hits). Returns a report.
 
     Each try is judged by OUR success rule (sim/success.py) and labelled with a
@@ -161,7 +161,7 @@ def run_collection(args, scene, expert) -> dict:
     # In list mode, make sure every listed speed gets at least one success.
     if speed_mode == "list" and speed_list is not None:
         target = max(target, len(speed_list))
-    # Safety cap so a broken expert cannot loop forever. Default is the larger
+    # Safety cap so a broken sm cannot loop forever. Default is the larger
     # of 3x target and target+50 (small targets still get room to retry).
     max_attempts = int(args.max_attempts or max(3 * target, target + 50))
     # Seeded: the same --seed gives the same speed draws.
@@ -202,7 +202,7 @@ def run_collection(args, scene, expert) -> dict:
         try:
             episode, meta = run_episode(
                 scene,
-                expert,
+                sm,
                 seed=seed,
                 speed=speed,
                 save_images=save_images,
@@ -210,16 +210,16 @@ def run_collection(args, scene, expert) -> dict:
                     float(args.delta)
                     if args.delta is not None
                     else float(
-                        getattr(expert, "conditioning_delta_s", expert.lookahead_s)
+                        getattr(sm, "policy_look_ahead_s", sm.max_aim_ahead_s)
                     )
                 ),
             )
             # OUR success rule (sim/success.py), not DynamicVLA's object_picked.
             success = episode_success(
                 episode,
-                z_lift_min=float(expert.lift_height),
-                container_xy_tol=float(expert.place_xy_tol),
-                place_stage=int(expert.stage_schema.done),
+                z_lift_min=float(sm.lift_height_m),
+                container_xy_tol=float(sm.place_xy_tol),
+                place_stage=int(sm.stage_schema.done),
             )
         except Exception as ex:
             # Log the full error and score this try as a failure (not a skip).
@@ -240,7 +240,7 @@ def run_collection(args, scene, expert) -> dict:
         # Facts (farthest stage, object height low/high/end) kept so a failure
         # label can be double-checked later.
         diag = episode_diagnostics(
-            episode, z_lift_min=float(expert.lift_height)
+            episode, z_lift_min=float(sm.lift_height_m)
         )
         # Why it failed: never-engaged | too-late | early-close | ... or "success".
         failure = classify_failure(
@@ -249,8 +249,8 @@ def run_collection(args, scene, expert) -> dict:
             object_z_min=diag["z_min"],
             object_z_max=diag["z_max"],
             object_z_end=diag["z_end"],
-            z_lift_min=float(expert.lift_height),
-            schema=expert.stage_schema,
+            z_lift_min=float(sm.lift_height_m),
+            schema=sm.stage_schema,
             off_table=bool(meta.get("off_table", False)),
             abort_reason=meta.get("abort_reason"),
         )
@@ -321,9 +321,9 @@ def run_collection(args, scene, expert) -> dict:
                                 meta.get(
                                     "delta",
                                     getattr(
-                                        expert,
-                                        "conditioning_delta_s",
-                                        expert.lookahead_s,
+                                        sm,
+                                        "policy_look_ahead_s",
+                                        sm.max_aim_ahead_s,
                                     ),
                                 )
                             )
@@ -333,14 +333,14 @@ def run_collection(args, scene, expert) -> dict:
                 },
             )
             if args.debug:
-                from sim.video import gates_from_expert, write_debug_mp4
+                from sim.video import gates_from_state_machine, write_debug_mp4
 
                 fps = int(scene.cfg.get("static_camera", {}).get("fps", 25))
                 write_debug_mp4(
                     episode,
                     speed_dir / f"{ep_name}.mp4",
                     fps=fps,
-                    gates=gates_from_expert(expert),
+                    gates=gates_from_state_machine(sm),
                 )
 
         # New seed each try: different start, still repeatable. seed_start/seed_end
@@ -376,7 +376,7 @@ def run_collection(args, scene, expert) -> dict:
 
 
 def main() -> None:
-    """Start Isaac (cameras forced on), build scene + expert, collect, then exit.
+    """Start Isaac (cameras forced on), build scene + sm, collect, then exit.
 
     Isaac's AppLauncher must start BEFORE any isaaclab / omni import, so the
     sim imports sit inside this function.
@@ -416,13 +416,13 @@ def main() -> None:
             container_usd=args.container_usd,
             asset_seed=int(args.seed),
         )
-        expert = PickPlaceStateMachine(cfg, dt=scene.dt)
+        sm = PickPlaceStateMachine(cfg, dt=scene.dt)
         logging.info(
             "P1 scene ready object=%s container=%s",
             getattr(scene, "_active_usd", None),
             getattr(scene, "_container_usd", None),
         )
-        run_collection(args, scene, expert)
+        run_collection(args, scene, sm)
     except Exception:
         logging.exception("Phase1 collect failed")
         exit_code = 1

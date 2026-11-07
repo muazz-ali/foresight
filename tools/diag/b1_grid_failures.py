@@ -73,8 +73,8 @@ def one(row):
             hand_z_err_mm=float(1000 * np.median(ee[r, 2] - ob[r, 2])),
         )
     # stop / end of chase
-    home = np.where(st == 8)[0]
-    closes = np.where(st == 3)[0]
+    home = np.where(st == 7)[0]
+    closes = np.where(st == 2)[0]
     if len(closes):
         c = closes[0]
         out["close_t_s"] = float(c * dt)
@@ -85,7 +85,7 @@ def one(row):
         post = np.arange(c, n)
         d_oh = np.linalg.norm(ob[post] - ee[post], axis=1)
         out["max_obj_hand_after_close_mm"] = float(1000 * d_oh.max())
-        lift = np.where(st == 4)[0]
+        lift = np.where(st == 3)[0]
         out["obj_z_gain_mm"] = float(1000 * (ob[post, 2].max() - ob[c, 2]))
         out["stages_after_close"] = sorted(set(st[c:].tolist()))
     elif len(home):

@@ -9,7 +9,7 @@ Links:
   2 Aiming   aim vs p_now (ride ticks)
   3 Tracking hand vs aim; v_hand (Isaac) vs v_obj
   4 Close    e_now / e_pred / Δv gates
-  5 Close mechanics  gripper + object motion in stage 3
+  5 Close mechanics  gripper + object motion in stage 2
   6 Lift/hold  object−hand while holding
 
 Usage:
@@ -41,8 +41,8 @@ def _dv_lim_m_s() -> float:
         from interfaces.config import load_yaml
 
         cfg = load_yaml(Path(__file__).resolve().parents[2] / "sim" / "phase0_cfg.yaml")
-        ct = cfg.get("claim_timing") or {}
-        slack = float(ct.get("close_speed_slack_m", DEFAULT_SLACK_M))
+        sm = cfg.get("state_machine_params") or {}
+        slack = float(sm.get("close_speed_slack_m", DEFAULT_SLACK_M))
     except Exception:  # noqa: BLE001 — offline diag must not die on cfg glitches
         slack = float(DEFAULT_SLACK_M)
     return max_speed_diff_m_s(slack_m=slack, close_time_s=DEFAULT_CLOSE_TIME_S)
@@ -50,7 +50,7 @@ def _dv_lim_m_s() -> float:
 
 DV_LIM = _dv_lim_m_s()
 DT = 1.0 / 30.0
-STAGE_APPROACH, STAGE_CLOSE, STAGE_LIFT = 1, 3, 4
+STAGE_APPROACH, STAGE_CLOSE, STAGE_LIFT = 1, 2, 3
 
 
 def _med_p95(x: np.ndarray) -> dict:
@@ -177,7 +177,7 @@ def analyze_episode(h5_path: Path) -> dict:
         frac_both = float("nan")
         ticks_to_gate = None
 
-    # Link 5: stage-3 mechanics (no contact flags in log).
+    # Link 5: stage-2 mechanics (no contact flags in log).
     # Gripper in this h5 is the commanded open fraction after the step; on
     # close entry it is often already 0, so "time to ≤0.2" is N/A — not 0 s shut.
     if len(closes):

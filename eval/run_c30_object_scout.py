@@ -3,12 +3,12 @@
 
 Why a separate script: ``run_b1_grid.py`` hardcodes the USD catalog to
 egg/lemon/onion, so apple/kiwi/… never enter the pool. This scout keeps the
-same expert / cells / dump layout, but builds the catalog from the requested
+same sm / cells / dump layout, but builds the catalog from the requested
 category only (no control or cfg edits).
 
 Usage:
   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. PYTHONNOUSERSITE=1 \\
-    python scripts/run_c30_object_scout.py --headless --enable_cameras \\
+    python eval/run_c30_object_scout.py --headless --enable_cameras \\
       --object apple --seeds 1000,1001,1002,1003,1004 \\
       --save-mp4 -o data/eval/C1_c30_all_objects/apple
 """
@@ -90,12 +90,12 @@ def main() -> None:
         from sim.collect import episode_for_json, run_episode, write_episode_h5
         from sim.scene import Phase0Scene
         from sim.state_machine import PickPlaceStateMachine
-        from sim.video import gates_from_expert, write_debug_mp4
+        from sim.video import gates_from_state_machine, write_debug_mp4
 
         cfg = load_frozen(out, Path(args.sim_cfg_file))
         cfg.setdefault("robot", {})["gripper_close_time_s"] = float(args.t_close_ms) * 1e-3
-        cfg.setdefault("claim_timing", {})["obs_delay_buffer"] = True
-        cfg["claim_timing"]["enforce_apply_at"] = False
+        cfg.setdefault("claim_timing", {})["enabled_noise_on_replan"] = True
+        cfg["claim_timing"]["apply_delta_delay_to_robot"] = False
         # Catalog = this category only (phase0_cfg may list many; pick_usd filters).
         cfg.setdefault("scene", {})["object_categories"] = [obj_cat]
         device = str(getattr(args, "device", None) or "cuda:0")
@@ -108,7 +108,7 @@ def main() -> None:
             object_usd=obj_cat,
             asset_seed=int(seeds[0]),
         )
-        expert = PickPlaceStateMachine(cfg)
+        sm = PickPlaceStateMachine(cfg)
         want_mp4 = bool(args.save_mp4)
         want_h5 = bool(args.save_h5 or args.save_mp4)
         # RGB only needed when stitching mp4.
@@ -118,11 +118,11 @@ def main() -> None:
             cell_dir = out / "cells" / cell
             cell_dir.mkdir(parents=True, exist_ok=True)
             for seed in seeds:
-                expert.reset()
+                sm.reset()
                 t0 = time.time()
                 ep, meta = run_episode(
                     scene,
-                    expert,
+                    sm,
                     seed=int(seed),
                     speed=float(v_cms) / 100.0,
                     save_images=want_images,
@@ -175,7 +175,7 @@ def main() -> None:
                         fps = int(cfg.get("static_camera", {}).get("fps", 25))
                         video_path = cell_dir / f"{stem}.mp4"
                         write_debug_mp4(
-                            ep, video_path, fps=fps, gates=gates_from_expert(expert)
+                            ep, video_path, fps=fps, gates=gates_from_state_machine(sm)
                         )
                 row = {
                     "cell": cell,

@@ -81,7 +81,7 @@ Raw fit: `data/eval/fix1_static_offset/closeout_lag_fit.json`.
 - `control/close_guard.py` — `predictive_close_check`
 - `sim/gripper_actuator.py` — `nominal_t_contact_s` (130 ms)
 - `sim/state_machine.py` — predictive gate; pinch tcp default
-- `sim/phase0_cfg.yaml` — `tcp_offset_mm: 103.4`, `close_settle_ticks: 1`
+- `sim/cfg/collect.yaml` — `tcp_offset_mm: 103.4` (historical note: `close_settle_ticks` removed)
 - `eval/b1_success.py`, `eval/b5_hand_trail_bias.py` — pinch / contact scoring
 - `interfaces/grasp_height.py` — DEFAULT tcp 103.4 mm
 - `tests/test_predictive_close.py`

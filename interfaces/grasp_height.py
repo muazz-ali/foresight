@@ -1,19 +1,16 @@
 """Grasp height from object top (claim Z update).
 
 Plain words:
-  z_grasp = max(z_top − g, z_table + c)
+  Expert aims object centre. From a measured top:
+  z_grasp = max(z_top − half_height, z_table + c)
 
-  * z_top — object top height (m). From wrist depth (high percentile of object
-    pixels) or from sim GT (centre + half-height).
-  * g — how far the fingers push down past the top (insertion).
-  * c — keep fingertips off the table.
-  * Collect: while hand is ≥ 20 cm above the top, keep reading z_grasp every
-    step and store them (wrist depth is usually good this far).
-  * Lock: when hand drops below 10 cm, freeze to the median of those readings
-    (D405 gets bad in the last ~7 cm — stop trusting new depth).
+  * z_top — object top (wrist depth or GT centre + half-height).
+  * half_height — from the mesh each episode (not a yaml insert knob).
+  * c — keep fingertips off the table (table_clear).
+  * z_slack — only close-band: |hand Z − target| ≤ z_slack/2.
+  * Collect while hand is high; lock when close (D405 bad in the last ~7 cm).
 
-p̂z in the policy pack is this z_grasp (vz = 0), so approach offsets d_z stay
-the same for short and tall objects.
+p̂z in the policy pack is this z_grasp (vz = 0).
 
 Dual-cam fuse (optional): wrist RGB-D + static depth → one z_top per step
 via ``fuse_z_top`` (average when both good; prefer wrist when close).
@@ -360,7 +357,11 @@ class ZLatch:
 
     @classmethod
     def from_cfg(cls, cfg: dict) -> ZLatch:
-        """Read claim_height / state_machine_params knobs (SI after normalize)."""
+        """Read claim_height knobs (SI after normalize).
+
+        ``insert_m`` starts as a placeholder; the expert overwrites it each
+        episode with mesh half-height so top − insert ≈ object centre.
+        """
         ch = cfg.get("claim_height") if isinstance(cfg, dict) else None
         ch = ch if isinstance(ch, dict) else {}
         sm = cfg.get("state_machine_params") if isinstance(cfg, dict) else None
@@ -368,12 +369,24 @@ class ZLatch:
         scene = cfg.get("scene") if isinstance(cfg, dict) else None
         scene = scene if isinstance(scene, dict) else {}
         z_table = float(scene.get("table_height", 0.0) or 0.0)
+        # Prefer scene object_radius as the pre-episode half-height guess.
+        half_guess = float(scene.get("object_radius") or DEFAULT_INSERT_M)
         return cls(
-            insert_m=float(ch.get("finger_insert_m", sm.get("finger_insert_m", DEFAULT_INSERT_M))),
+            insert_m=half_guess,
             clear_m=float(ch.get("table_clear_m", sm.get("table_clear_m", DEFAULT_CLEAR_M))),
             z_table=z_table,
-            latch_lo_m=float(ch.get("latch_lo_m", DEFAULT_LATCH_LO_M)),
-            latch_hi_m=float(ch.get("latch_hi_m", DEFAULT_LATCH_HI_M)),
+            latch_lo_m=float(
+                ch.get(
+                    "stop_trusting_depth_below_m",
+                    ch.get("latch_lo_m", DEFAULT_LATCH_LO_M),
+                )
+            ),
+            latch_hi_m=float(
+                ch.get(
+                    "use_depth_below_m",
+                    ch.get("latch_hi_m", DEFAULT_LATCH_HI_M),
+                )
+            ),
             z_slack_m=float(ch.get("z_slack_m", sm.get("z_slack_m", DEFAULT_Z_SLACK_M))),
             max_samples=int(ch.get("max_samples", DEFAULT_MAX_SAMPLES)),
         )

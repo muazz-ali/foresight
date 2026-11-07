@@ -75,6 +75,31 @@ templates:
     - "Grab the peach and place it into the {container}."
     - "Take the peach and set it in the {container}."
     - "Lift the peach and drop it in the {container}."
+  # Mode 2 static cubes — color noun must stay in every line.
+  cube_blue:
+    - "Pick the blue cube and place it in the {container}."
+    - "Grasp the blue cube and put it in the {container}."
+    - "Grab the blue cube and place it into the {container}."
+    - "Take the blue cube and set it in the {container}."
+    - "Lift the blue cube and drop it in the {container}."
+  cube_red:
+    - "Pick the red cube and place it in the {container}."
+    - "Grasp the red cube and put it in the {container}."
+    - "Grab the red cube and place it into the {container}."
+    - "Take the red cube and set it in the {container}."
+    - "Lift the red cube and drop it in the {container}."
+  cube_green:
+    - "Pick the green cube and place it in the {container}."
+    - "Grasp the green cube and put it in the {container}."
+    - "Grab the green cube and place it into the {container}."
+    - "Take the green cube and set it in the {container}."
+    - "Lift the green cube and drop it in the {container}."
+  cube_yellow:
+    - "Pick the yellow cube and place it in the {container}."
+    - "Grasp the yellow cube and put it in the {container}."
+    - "Grab the yellow cube and place it into the {container}."
+    - "Take the yellow cube and set it in the {container}."
+    - "Lift the yellow cube and drop it in the {container}."
   default:
     - "Pick the {object} and place it in the {container}."
     - "Grasp the {object} and put it in the {container}."

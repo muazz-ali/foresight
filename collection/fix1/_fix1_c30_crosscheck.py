@@ -53,8 +53,8 @@ def main() -> None:
 
     cfg = load_cfg(Path(args.sim_cfg_file))
     # Δ = 0: live GT, no obs-delay buffer
-    cfg.setdefault("claim_timing", {})["obs_delay_buffer"] = False
-    cfg["claim_timing"]["enforce_apply_at"] = False
+    cfg.setdefault("claim_timing", {})["enabled_noise_on_replan"] = False
+    cfg["claim_timing"]["apply_delta_delay_to_robot"] = False
     cfg.setdefault("sim", {})["device"] = str(getattr(args, "device", None) or "cuda:0")
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -62,11 +62,11 @@ def main() -> None:
     scene = Phase0Scene(cfg, enable_cameras=False, object_usd="egg", asset_seed=1000)
     rows = []
     for seed in SEEDS:
-        expert = PickPlaceStateMachine(cfg)
+        sm = PickPlaceStateMachine(cfg)
         # Match B1 C30: 30 cm/s, Δ=0
         log, meta = run_episode(
             scene,
-            expert,
+            sm,
             seed=int(seed),
             speed=SPEED_CMS / 100.0,
             save_images=False,

@@ -5,7 +5,7 @@ Writes ``c30_first_attempt_<object>.json`` plus per-seed ``.h5`` / ``.json`` /
 ``.mp4`` under ``cells/C30/``.
 
   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. PYTHONNOUSERSITE=1 \\
-    python scripts/_fix1_c30_first_attempt.py --headless --enable_cameras \\
+    python collection/fix1/_fix1_c30_first_attempt.py --headless --enable_cameras \\
       --device cuda:0 --object egg --seeds 1000,1001,1003
 """
 
@@ -74,17 +74,17 @@ def main() -> None:
     from sim.collect import episode_for_json, run_episode, write_episode_h5
     from sim.scene import Phase0Scene, load_cfg
     from sim.state_machine import PickPlaceStateMachine
-    from sim.video import gates_from_expert, write_debug_mp4
+    from sim.video import gates_from_state_machine, write_debug_mp4
 
     obj = str(args.object).strip().lower()
     seeds = _parse_seeds(args.seeds)
     asset_seed = int(args.asset_seed) if args.asset_seed is not None else int(seeds[0])
 
     cfg = load_cfg(Path(args.sim_cfg_file))
-    cfg.setdefault("claim_timing", {})["obs_delay_buffer"] = True
-    cfg["claim_timing"]["enforce_apply_at"] = False
+    cfg.setdefault("claim_timing", {})["enabled_noise_on_replan"] = True
+    cfg["claim_timing"]["apply_delta_delay_to_robot"] = False
     # Δ=0 first-attempt: freeze η so aim lead and gate are repeatable.
-    cfg["claim_timing"]["delta_meas_noise_ms"] = 0.0
+    cfg["claim_timing"]["delta_meas_noise_s"] = 0.0
     cfg.setdefault("sim", {})["device"] = str(getattr(args, "device", None) or "cuda:0")
     out = Path(args.output_dir)
     cell_dir = out / "cells" / "C30"
@@ -96,10 +96,10 @@ def main() -> None:
     )
     rows = []
     for seed in seeds:
-        expert = PickPlaceStateMachine(cfg)
+        sm = PickPlaceStateMachine(cfg)
         log, meta = run_episode(
             scene,
-            expert,
+            sm,
             seed=int(seed),
             speed=0.30,
             save_images=True,
@@ -136,7 +136,7 @@ def main() -> None:
             json.dump(payload, fp, indent=2, default=str)
         fps = int(cfg.get("static_camera", {}).get("fps", 25))
         mp4_path = cell_dir / f"{stem}.mp4"
-        write_debug_mp4(log, mp4_path, fps=fps, gates=gates_from_expert(expert))
+        write_debug_mp4(log, mp4_path, fps=fps, gates=gates_from_state_machine(sm))
 
         row = {
             "seed": int(seed),
@@ -144,8 +144,8 @@ def main() -> None:
             "failure_mode": mode,
             "first_attempt": True,
             "category": cat,
-            "close_xy_err_m": getattr(expert, "close_xy_err_m", None),
-            "dv_at_close_m_s": getattr(expert, "dv_at_close_m_s", None),
+            "close_xy_err_m": getattr(sm, "close_xy_err_m", None),
+            "dv_at_close_m_s": getattr(sm, "dv_at_close_m_s", None),
             "h5": str(h5_path),
             "mp4": str(mp4_path),
         }

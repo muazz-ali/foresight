@@ -1,0 +1,11 @@
+# Evaluation delay / old-frame knobs.
+# Units: seconds (SI). load_yaml folds this into claim_timing.
+
+evaluation:
+  # Pin one delay instead of drawing a random one (s).
+  eval_delta_s: 0.0
+  # When true, the expert sees an old frame instead of the live object.
+  enabled_noise_on_replan: false
+  # Used only when enabled_noise_on_replan is true:
+  delta_meas_noise_s: 0.005       # noise on the measured delay (~5 ms)
+  replan_meas_noise_s: 0.330      # redraw that noise about every 0.33 s

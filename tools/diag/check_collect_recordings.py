@@ -12,7 +12,7 @@ check after collection. For each .h5 it asks:
 Exit code 0 = all good, 1 = something is off (see "issues" in the JSON).
 
 Usage:
-  python scripts/check_collect_recordings.py --root data/p1_smoke
+  python tools/diag/check_collect_recordings.py --root data/p1_smoke
 """
 
 from __future__ import annotations
@@ -25,10 +25,10 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-FORESIGHT_ROOT = Path(__file__).resolve().parents[1]
+FORESIGHT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(FORESIGHT_ROOT))
 
-from interfaces.config import conditioning_delta_s, gripper_limits, load_yaml  # noqa: E402
+from interfaces.config import policy_look_ahead_s, gripper_limits, load_yaml  # noqa: E402
 from interfaces.state import conditioning_vector, oracle_from_gt  # noqa: E402
 
 
@@ -103,7 +103,7 @@ def main() -> None:
     args = p.parse_args()
 
     cfg = load_yaml(args.sim_cfg_file)
-    expect_delta = conditioning_delta_s(cfg)
+    expect_delta = policy_look_ahead_s(cfg)
     grip_open_m, grip_close_m = gripper_limits(cfg)
     root = Path(args.root)
     h5s = sorted(root.rglob("*.h5"))

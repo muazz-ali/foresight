@@ -19,7 +19,7 @@ mkdir -p "$OUT/logs"
 rc=1
 for try in $(seq 1 "$TRIES"); do
   # --kit_args=VALUE form: argparse rejects a separate value that starts with "--".
-  CUDA_VISIBLE_DEVICES=${GPU:?set GPU} "$PY" "$ROOT/scripts/run_b1_grid.py" \
+  CUDA_VISIBLE_DEVICES=${GPU:?set GPU} "$PY" "$ROOT/eval/run_b1_grid.py" \
     --headless --enable_cameras --device cuda:0 --skip-done \
     "--kit_args=--/log/file=$OUT/logs/kit_${TAG}_try${try}.log" \
     -o "$OUT" "$@" >>"$OUT/logs/$TAG.log" 2>&1

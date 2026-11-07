@@ -7,7 +7,7 @@ alwaysApply: true
 
 **Hypothesis.** Explicit future-state from a physics filter beats implicit/latent predictors for dynamic grasping — smaller, cheaper, easier to debug.
 
-**Source of truth:** `foresight_plan.md`. **`ppt.md` = Isaac launch/connect only** (not DynamicVLA architecture). Sim + expert SM live in this repo. Do not invent a competing architecture.
+**Source of truth:** `foresight_plan.md`. **`ppt.md` = Isaac launch/connect only** (not DynamicVLA architecture). Sim + state machine live in this repo. Do not invent a competing architecture. Words: .
 
 ## Four jobs only
 1. **Where/when** → tracker + Kalman filter (~200 lines)

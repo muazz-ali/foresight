@@ -5,7 +5,7 @@ Read-only on H5+JSON and LeRobot trees. Does not train.
 
 Usage:
   /home/gpuadmin/anaconda3/envs/dynamicVLA_training/bin/python \\
-    scripts/audit_p3_dataset_balance.py
+    tools/diag/audit_p3_dataset_balance.py
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from policy.convert_h5 import list_success_episodes  # noqa: E402

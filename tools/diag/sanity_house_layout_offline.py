@@ -8,7 +8,7 @@ Picks 10 houses by seed, builds play layout + throws, checks:
   4) throws stay in bounds and aim into the catch band
 
 Need ≥8/10 seeds to pass. Run:
-  python scripts/sanity_house_layout_offline.py
+  python tools/diag/sanity_house_layout_offline.py
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from sim.house_layout import (  # noqa: E402

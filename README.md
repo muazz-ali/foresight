@@ -4,7 +4,7 @@ Teach a small robot policy to catch **moving** objects by telling it **where the
 
 **Idea in one line:** predict the object’s future place with a simple physics tracker → give those numbers to a small policy → close the gripper at the right time.
 
-Full write-up: [`foresight_plan.md`](foresight_plan.md) · How we work: [`AGENTS.md`](AGENTS.md) · Isaac Sim tips: `~/Desktop/muazzam/ppt.md` (outside this repo)
+Full write-up: [`foresight_plan.md`](foresight_plan.md) · How we work: [`AGENTS.md`](AGENTS.md) · Isaac tips: `~/Desktop/muazzam/ppt.md` (outside this repo)
 
 ---
 
@@ -12,7 +12,7 @@ Full write-up: [`foresight_plan.md`](foresight_plan.md) · How we work: [`AGENTS
 
 | Checkpoint | What “pass” means | Status |
 |---|---|---|
-| **G0** | Scripted expert works ≥70% from still → 20 cm/s (bins 0 / 10 / 15 / 20); we can record hundreds of demos per hour | **PASS** on the older 0–40 cm/s sweep (report file not in this checkout) |
+| **G0** | State machine works ≥70% from still → 20 cm/s (bins 0 / 10 / 15 / 20); we can record hundreds of demos per hour | **PASS** on the older 0–40 cm/s sweep (report file not in this checkout) |
 | **G1** | Model keeps grasp rate flat 0 → 20 cm/s; zero the 4 numbers at eval and success collapses | **PASS** (Sep 13 2026). 84 / 70 / 71% at 0 / 15 / 20 cm/s; zero-out 2% still; drop still→20 is 13 points (<15 cap). n = 100 per bin. Details: plan §5 |
 | G2a | Camera + filter numbers close to sim truth: at 20 cm/s, median ≤ 1 cm and RMSE ≤ 2 cm vs the sim-truth p̂ | **PASS** (Sep 18 2026, offline). 0.34 / 1.14 cm on demos, 0.31 / 1.26 cm on model eval runs. Report: `data/eval/p2_perception_report/REPORT.md` |
 | G2b | Swap sim truth → camera numbers in the model, same seeds: success drops < 10 points at 15 and 20 cm/s | **PASS** (Sep 29 2026). Filter 92 / 65 / 65 of 100 at 0 / 15 / 20 cm/s. Drop vs oracle is 5 points at 15 cm/s and 6 at 20. Logs: `data/eval/g2b_n100/` |
@@ -21,7 +21,7 @@ Full write-up: [`foresight_plan.md`](foresight_plan.md) · How we work: [`AGENTS
 
 “Success” on G1 / G2 = the policy's grasp holds under the eval latch, then a script places (`--force-place`). Phase 3 / G3 uses a real physics grasp on the throw task.
 
-Lesson from G0: do **not** wrap DynamicVLA’s pick state machine. Our expert and scene live in this repo under `sim/`.
+Lesson from G0: do **not** wrap DynamicVLA’s pick controller. Our state machine and scene live in this repo under `sim/`.
 
 ---
 
@@ -30,7 +30,7 @@ Lesson from G0: do **not** wrap DynamicVLA’s pick state machine. Our expert an
 | Job | What it does | Where |
 |---|---|---|
 | Where / when | Track object + predict a bit ahead | `perception/` |
-| What / how | Small policy + 4 future numbers today (~12 later) | `policy/` |
+| What / how | Small policy + 5-number pack | `policy/` |
 | Exactly when | Fast last-cm grasp close | `control/` (Phase 3 / G3) |
 | Clock | Time-stamped action queue | `control/` (Phase 3 / G3) |
 
@@ -40,7 +40,7 @@ Lesson from G0: do **not** wrap DynamicVLA’s pick state machine. Our expert an
 position, velocity, covariance, timestamp, valid
 ```
 
-The policy’s future numbers are built from that message (`interfaces/state.py`). Today that is **4 numbers**: where the object will be in 0.25 s (x, y) and its speed (x, y). Δ = 0.25 s is fixed in `sim/phase0_cfg.yaml`.
+The policy’s future numbers are built from that message (`interfaces/state.py`). Live pack is **5 numbers**: future XY (`p̂x`, `p̂y`), grasp height (`p̂z`), and speed (`vx`, `vy`). Look-ahead Δ is baked into XY (drawn 0–200 ms when collecting; see `sim/cfg/training.yaml`).
 
 ---
 
@@ -48,9 +48,9 @@ The policy’s future numbers are built from that message (`interfaces/state.py`
 
 ```text
 interfaces/   shared object state + future-number helper
-sim/          Isaac table scene, scripted expert, recording
+sim/          Isaac table scene, state machine, recording
 perception/   static camera → blob tracker → Kalman filter → object state (Phase 2)
-policy/       turn demos into LeRobot data; train SmolVLA with the 4 numbers
+policy/       turn demos into LeRobot data; train SmolVLA with the 5-number pack
 scripts/      run collection, convert, train, eval, G2 perception report
 eval/         checkpoint score helpers (G0 / G1)
 tests/        Isaac-free tests (expert, perception)
@@ -71,7 +71,7 @@ runs/         local only: trained checkpoint (p1_r4k_b = Phase-1 model)
 | Sim conda env | e.g. `dynamicVLA_isaac` — **do not** train in this env |
 | Train conda env | e.g. `dynamicVLA_training` (LeRobot / SmolVLA) |
 | Extra Python (sim) | `h5py`, `imageio`, `opencv-python`, `scipy`, `pyyaml` |
-| Meshes (optional) | USD objects under paths in `sim/phase0_cfg.yaml` |
+| Meshes (optional) | USD objects under paths in `sim/cfg/collect.yaml` |
 
 ```bash
 conda activate dynamicVLA_isaac
@@ -96,9 +96,9 @@ Always pass `--headless --enable_cameras` for real RGB. Headless alone → black
 No Isaac needed for:
 
 ```bash
-python scripts/test_state.py
+pytest tests/test_state.py
 pytest tests/test_perception.py              # perception unit tests
-python scripts/g2_perception_report.py       # G2a report from recorded episodes (~25 s)
+python eval/g2_perception_report.py       # G2a report from recorded episodes (~25 s)
 ```
 
 ---
@@ -112,9 +112,9 @@ python scripts/g2_perception_report.py       # G2a report from recorded episodes
 
 ---
 
-## Scripted expert (plan §4)
+## State machine (plan §4)
 
-Stages (ids 0–9): **intercept** the moving object (look ahead, Z on object) → **close, lift** → **carry, lower, open** → **home / done**. Stage 2 (go down) is unused. Missed grasp retries intercept.
+Stages (ids 0–8): **intercept** the moving object (look ahead, Z on object) → **close, lift** → **carry, lower, open** → **home / done**. A miss does not re-chase. The episode ends at `episode_max_ms`.
 
 Success = lift + hold / place rules in `sim/success.py`.  
 Failure labels each episode:  
@@ -132,7 +132,7 @@ The model was trained on 3,718 recorded demos (commands in [`policy/README.md`](
 
 Replace sim truth with what the static camera sees: blob tracker → pixel-to-table → Kalman filter → the same 4 numbers. The model was **not** retrained for G2b.
 
-- **Done — G2a (offline):** `perception/` + `python scripts/g2_perception_report.py`. At 20 cm/s the camera numbers sit 0.3 cm (median) from sim truth, and every fruit is tracked, including the white egg.
+- **Done — G2a (offline):** `perception/` + `python eval/g2_perception_report.py`. At 20 cm/s the camera numbers sit 0.3 cm (median) from sim truth, and every fruit is tracked, including the white egg.
 - **Done — G2b (Isaac):** `--cond-source filter` on the G1 seeds. Grasp rate dropped 5 points at 15 cm/s and 6 points at 20 cm/s (both under the 10-point bar). Flips: `data/eval/g2b_n100/flips.json`.
 
 ---
@@ -147,7 +147,7 @@ Build first (no collect yet): throw catch expert, `control/` buffer + reflex, wr
 
 ## What we are **not** building yet
 
-No big learned world model, no optical-flow network, no policy from scratch, no full 6D pose first (center + speed is enough), no second sim collect after Phase 3 freezes, no DynamicVLA state machine as our expert.
+No big learned world model, no optical-flow network, no policy from scratch, no full 6D pose first (center + speed is enough), no second sim collect after Phase 3 freezes, no DynamicVLA state machine as our state machine.
 
 ---
 

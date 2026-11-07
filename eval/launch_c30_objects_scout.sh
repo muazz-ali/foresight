@@ -43,7 +43,7 @@ run_worker() {
   local gpu=$1 obj=$2 s0=$3 s1=$4
   local logf=$OUT/logs/gpu${gpu}_${obj}.log
   echo "start gpu=$gpu obj=$obj seeds=$s0..$s1 cells=$CELLS"
-  CUDA_VISIBLE_DEVICES=$gpu $PY $ROOT/scripts/run_b1_grid.py \
+  CUDA_VISIBLE_DEVICES=$gpu $PY $ROOT/eval/run_b1_grid.py \
     --headless --enable_cameras --device cuda:0 \
     --role all --phase full --object "$obj" \
     --seed-start "$s0" --seed-end "$s1" --n "$N" \

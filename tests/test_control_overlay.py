@@ -1,4 +1,4 @@
-"""Isaac-free: reflex overlay rebuilds an ExpertCommand-like dataclass."""
+"""Isaac-free: reflex overlay rebuilds an StateMachineCommand-like dataclass."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def test_overlay_closes_when_near():
         timestamp=0.0,
         valid=True,
     )
-    # Stage 2 (unused go-down id): may steer, but must not force attach yet.
+    # Stage 2 is close: near the object the reflex may force the grasp.
     cmd = _Cmd(
         position=ee.copy(),
         quat_wxyz=np.array([0.0, 1.0, 0.0, 0.0]),
@@ -64,12 +64,13 @@ def test_overlay_closes_when_near():
         attach_object=False,
     )
     out_cmd, rout = overlay_reflex(cmd, reflex, obj, ee)
-    assert rout is not None and rout.active
-    assert not out_cmd.attach_object
-    # Stage 3 (close): may force the grasp.
-    cmd.stage = 3
-    out_cmd, rout = overlay_reflex(cmd, reflex, obj, ee)
     assert rout is not None and rout.close
     assert out_cmd.gripper_open == 0.0
     assert out_cmd.attach_object
     assert not out_cmd.kinematic_object
+    # Intercept (stage 1) must not be overridden.
+    cmd.stage = 1
+    out_cmd, rout = overlay_reflex(cmd, reflex, obj, ee)
+    assert rout is None
+    assert out_cmd.gripper_open == 1.0
+    assert not out_cmd.attach_object

@@ -1,19 +1,18 @@
 # Foresight research
 
-**Goal** (from `foresight_plan.md`): flat pick-and-place success from **0 to 0.20 m/s**, in sim and on the real robot. Speeds of 0.5–1.0 m/s are stretch targets, attempted only after the scripted expert clears them.
+**Goal** (from `foresight_plan.md`): flat pick-and-place success from **0 to 0.20 m/s**, in sim and on the real robot. Speeds of 0.5–1.0 m/s are stretch targets, attempted only after the **state machine** clears them.
 
-Tags: **[fact]** measured, **[calc]** derived, **[lit]** from papers, **[interp]** our reading.
-
+Tags: **[fact]** measured, **[calc]** derived, **[lit]** from papers, **[interp]** our reading.  
 ---
 
 ## 1. The system today
 
 ### 1.1 Stack
-- **Policy:** SmolVLA. The vision encoder (SigLIP) and the first 16 language-model layers are frozen; only the action expert and the state projection are trained. It predicts 50 actions per call, and eval runs the first 8 (0.32 s) before planning again. [fact]
-- **Input numbers, every 25 Hz step:** 8 robot numbers plus 4 object numbers: where the object will be in Δ = 0.25 s ($\hat p_x, \hat p_y$) and its velocity ($\hat v_x, \hat v_y$). Planned: add Δ itself as a 13th input, so the policy can handle varying delay. [fact / plan]
+- **Policy:** SmolVLA. The vision encoder (SigLIP) and the first 16 language-model layers are frozen; only the action head and the state projection are trained. It predicts 50 actions per call, and eval runs the first 8 (0.32 s) before planning again. [fact]
+- **Input numbers (claim stack, 30 Hz):** robot state plus a **5-number** pack — future XY ($\hat p_x, \hat p_y$), grasp height $\hat p_z$, velocity ($\hat v_x, \hat v_y$). Look-ahead Δ is baked into XY (train draw 0–200 ms). Older notes below may still say 25 Hz / 4 numbers / fixed 0.25 s. [fact / plan]
 - **Language:** one template, "Pick the {object} and place it in the {container}". Every demo has one object and one container, so the instruction never has to choose anything. [fact]
 - **Data:** 5,568 episodes (~630k frames) at 0 / 0.10 / 0.15 / 0.20 m/s. [fact]
-- **Expert (teacher):** our own scripted state machine (`sim/state_machine.py`, section 4). Limits: section 5. Success is judged by our own rule, not DynamicVLA's.
+- **State machine:** scripted demo controller (`sim/state_machine.py`, section 4). Limits: section 5. Success is judged by our own rule, not DynamicVLA's.
 
 ### 1.2 Measured behaviour (V2 checkpoint)
 
@@ -26,7 +25,7 @@ Tags: **[fact]** measured, **[calc]** derived, **[lit]** from papers, **[interp]
 | Wrong object name, or grey wrist image | Still succeeds | Shows language and wrist camera are barely used |
 | **Tracker input, n = 80**, at 0 / 0.10 / 0.15 / 0.20 m/s | **95 / 81 / 63 / 46%** | Not flat |
 | True object state + close rule, n = 40 | Up to **100 / 100 / 95 / 85%** | Sim truth only |
-| Scripted expert (true state, with retries) | ~88 / 83 / 78 / 72% | Ceiling for any claim |
+| State machine (true state, with retries) | ~88 / 83 / 78 / 72% | Ceiling for any claim |
 | Tracker error | Median ~0.4 cm far from the hand; 2–5 cm near the grasp | Occlusion and bias |
 
 ### 1.3 What this means
@@ -111,7 +110,7 @@ No estimator, including a neural network, can beat this bound on the same frames
 ### 3.5 Statistics for claims
 - Scout with n = 20 per speed; claim with **n ≥ 80 per speed**, using Wilson intervals.
 - Claiming "flat ≥ 95%" with a lower bound ≥ 90% needs **n ≈ 139 per speed** if the true rate is ~95%.
-- The policy cannot beat the expert at that speed. If the expert's ceiling is 90%, a 95% claim is impossible.
+- The policy cannot beat the state machine at that speed. If the state machine's ceiling is 90%, a 95% claim is impossible.
 
 ### 3.6 Inference budget
 Total delay is perception + inference + actuation:
@@ -125,9 +124,9 @@ With camera and motor at ~50 ms, inference must stay under ~50 ms.
 
 ---
 
-## 4. Scripted expert (sim)
+## 4. State machine (sim)
 
-Code: `sim/state_machine.py`; settings: `sim/phase0_cfg.yaml` → `state_machine_params`. Normal path: start → intercept → close → lift → place → home (stage 2 is unused).
+Code: `sim/state_machine.py`; settings: `sim/cfg/state_machine.yaml` → `state_machine_params`. Normal path: start → intercept → close → lift → place → home.
 
 ```mermaid
 flowchart TD
@@ -149,9 +148,9 @@ flowchart TD
 
 ---
 
-## 5. Teacher issues (scripted expert limits)
+## 5. State-machine limits (demo ceiling)
 
-**Teacher** = the scripted expert in `sim/state_machine.py` (also called the expert or the collector). It is the program that moves the arm in demos and that sets the **ceiling**: how well a perfect imitator could do if it copied that teacher.
+**State machine** = scripted controller in `sim/state_machine.py` (older notes may say expert / teacher / collector). It moves the robot in demos and sets the **ceiling**: how well a perfect imitator could do if it copied those demos.
 
 **Why this section exists.** Gate **G-speed** says: do not claim a learned policy at a speed where the teacher already fails. That is fair — but the teacher has bugs and design limits. **Fix the teacher, re-measure the ceiling, then raise the claim.** Fixing the teacher does *not* remove physics (delay, finger size, arm acceleration); it only raises the bar that is under our control.
 
@@ -161,7 +160,7 @@ Measured teacher success with true object state and retries (approx.): **~88 / 8
 
 | # | Issue (plain words) | What goes wrong | How to fix (teacher / scene) |
 |---|---------------------|-----------------|------------------------------|
-| 1 | **No fast inner loop near contact** | The expert mostly commands at the same slow rate as the rest of the sim (~25–50 commands per second). At 0.5 m/s the object moves centimetres between commands, so the fingers cannot stay centred. | Add a **servo**: a small fast controller (≥ 100–250 updates per second) that only holds hand–object gap in the last ~10 cm. That is experiment **E6**. |
+| 1 | **No fast inner loop near contact** | The state machine mostly commands at the same slow rate as the rest of the sim (~25–50 commands per second). At 0.5 m/s the object moves centimetres between commands, so the fingers cannot stay centred. | Add a **servo**: a small fast controller (≥ 100–250 updates per second) that only holds hand–object gap in the last ~10 cm. That is experiment **E6**. |
 | 2 | **Approach takes too long** | Lead time is capped (~0.25 s look-ahead). Models of intercept show that if the hand starts late (order ~1–2 s travel), many throws become unreachable at 1 m/s. | Plan the intercept once, stream a faster path; shorten time-to-first-motion; pre-position the hand earlier. |
 | 3 | **Finger pads face the wrong way** | Two-finger grippers have a wide “pad” direction and a tight “closing” direction. If the object slides **across** the narrow gap, a few millimetres of error miss. If it slides **along** the pads, the same error often still catches. | Rotate the hand so pads line up with the object’s velocity before close (code already has yaw helpers; use them on every throw direction). |
 | 4 | **Sim “stall before close” artifact** | In some collects the object is held still (pose-scripted / immovable) while the fingers push against it. That teaches bad timing and inflates or warps success. | Keep the object free to move until the grasp finishes. |
@@ -169,13 +168,13 @@ Measured teacher success with true object state and retries (approx.): **~88 / 8
 | 6 | **Gripper close is slow** | Fingers take tens of milliseconds to shut (sim often ~80 ms; a real Franka hand can be slower). The object keeps moving during that time. | Measure real close time; match hand speed to object speed while closing; trigger close earlier by that delay. |
 | 7 | **Weak velocity matching at contact** | If the hand is nearly stopped and the object is still sliding, the object can slip out of the pads during the close. | Feed-forward object velocity into the hand command; servo holds relative speed near zero. |
 | 8 | **Lag pad `tau` may not match real lag** | `tau` ≈ approach pad + one control step: a guess of “command now → motion later.” If the guess is wrong, the hand aims ahead of or behind the object. | Measure command→motion delay on the real stack; set `tau` (and train-time Δ) from that number. |
-| 9 | **Constant-speed / kinematic object in sim** | Many demos move the object at constant velocity. Real slides decelerate; throws are ballistic. A teacher tuned on constant speed aims wrong on real motion. | Add friction / deceleration and throw physics in the expert’s forecast; test both. |
-| 10 | **Retries hide misses** | On a miss, the expert goes back to intercept (bounded retries). Reported success with retries looks higher than a single-shot policy. | Always report **clean (no retry)** and **with retry** separately; policy claims should match the no-retry bar unless the policy also retries. |
+| 9 | **Constant-speed / kinematic object in sim** | Many demos move the object at constant velocity. Real slides decelerate; throws are ballistic. A teacher tuned on constant speed aims wrong on real motion. | Add friction / deceleration and throw physics in the state machine’s forecast; test both. |
+| 10 | **Retries hide misses** | On a miss, the state machine goes back to intercept (bounded retries). Reported success with retries looks higher than a single-shot policy. | Always report **clean (no retry)** and **with retry** separately; policy claims should match the no-retry bar unless the policy also retries. |
 | 11 | **Bounce / wall timing** | Closing is blocked if a wall hit comes first; some throws never get a legal close window. | Better bounce forecast; choose catch points earlier; reject hopeless throws from the claim set and report that filter. |
 | 12 | **Top-down grasp only** | Orientation is mostly “fingers down,” maybe yaw. Tilted or spinning objects need more orientation control. | Add yaw (and later pitch) selection from object shape / motion; out of scope until planar high-speed works. |
 | 13 | **Lift / carry / place stalls** | After a grasp, stages can time out (“lift stalled,” “carry stalled”) and go home as failure even if the pinch was fine. | Tune lift heights and timeouts; check grip force / torsion in sim (carry slips are not always a “squeeze harder” problem). |
 | 14 | **Oracle teacher vs noisy sensors** | Ceiling numbers above use **true** sim object state. A teacher that must use the camera tracker will score lower. | Measure a **tracker-fed expert** ceiling too; that is the fair bar for a policy that uses the tracker. |
-| 15 | **No wrist depth in the teacher loop** | The scripted expert uses ground-truth object pose, not a wrist camera fit. It never practices recovering from occlusion the way the policy must. | Optional: run a teacher variant that closes from wrist estimate for demos meant to teach that skill. |
+| 15 | **No wrist depth in the teacher loop** | The state machine uses ground-truth object pose, not a wrist camera fit. It never practices recovering from occlusion the way the policy must. | Optional: run a teacher variant that closes from wrist estimate for demos meant to teach that skill. |
 | 16 | **Arm acceleration / workspace limits** | Matching 1 m/s can need hard accelerations and leave little room to brake. If the arm cannot reach the intercept in time, the teacher fails even with perfect aim math. | Pre-position; reject unreachable throws; verify real robot speed/accel limits (do not trust recalled datasheet numbers alone). |
 | 17 | **Impact and bounce on contact** | Hard pinch at high relative speed can knock the object away. Soft-catch literature succeeds by “moving with” the object briefly. | Soft pads, short follow-through before clamp, or a cup/funnel for stretch speeds. |
 | 18 | **Throw direction diversity** | Random throws that leave the workspace or cross the fingers the hard way dominate failures; a “realistic throw” subset looks much better. | Fix pad alignment and intercept for all directions; always publish the **full** distribution next to any filtered subset. |
@@ -187,7 +186,7 @@ Measured teacher success with true object state and retries (approx.): **~88 / 8
 
 ### 5.3 Rule after fixes
 1. Change one teacher/hardware lever (servo, pads-along, free object, fingers, measured `tau`).
-2. Re-run the scripted expert at each speed (**E6**), with and without retries, true-state and tracker-fed if both matter.
+2. Re-run the state machine at each speed (**E6**), with and without retries, true-state and tracker-fed if both matter.
 3. New **G-speed** line = highest speed where teacher success ≥ 90% (pre-register n, e.g. ≥ 40 scout then ≥ 80 to claim).
 4. Only then collect policy demos at that speed.
 
@@ -227,7 +226,7 @@ Measured teacher success with true object state and retries (approx.): **~88 / 8
 
 | Group | Takeaway |
 |---|---|
-| SmolVLA, π0, OpenVLA | Freezing the backbone and training only the expert is normal for SmolVLA; OpenVLA often trains vision too. Language use has to be **tested**, not assumed |
+| SmolVLA, π0, OpenVLA | Freezing the backbone and training only the state machine is normal for SmolVLA; OpenVLA often trains vision too. Language use has to be **tested**, not assumed |
 | Shortcut learning | Copycat and causal confusion are known failure modes; DART adds noise during collection |
 | Moving-object VLAs (DynamicVLA, AHEAD, Reflex, DSDyn, …) | Latency handling and look-ahead help; **none** shows ≥ 1 m/s together with ≥ 95% |
 | Explicit future pose (SIDO, PAF-Grasp) | Closest relatives; real conveyors mostly ≤ 0.2 m/s |

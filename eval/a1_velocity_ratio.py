@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from interfaces.config import conditioning_delta_s, load_yaml  # noqa: E402
+from interfaces.config import policy_look_ahead_s, load_yaml  # noqa: E402
 from interfaces.state import conditioning_vector  # noqa: E402
 from perception.estimator import StaticCamEstimator  # noqa: E402
 
@@ -58,7 +58,7 @@ def _init():
     global _CFG, _DELTA
     cv2.setNumThreads(1)
     _CFG = load_yaml(ROOT / "sim" / "phase0_cfg.yaml")
-    _DELTA = conditioning_delta_s(_CFG)
+    _DELTA = policy_look_ahead_s(_CFG)
 
 
 def one(path: str) -> dict:

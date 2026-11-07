@@ -11,7 +11,7 @@ rm -f "$OUT"/.lock_* "$OUT/settles.jsonl"
 
 for obj in egg lemon onion; do
   echo "=== fix1 measure object=$obj ==="
-  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} $PY "$ROOT/scripts/fix1_static_offset.py" \
+  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} $PY "$ROOT/eval/fix1_static_offset.py" \
     --headless --enable_cameras --device cuda:0 \
     --object "$obj" -o "$OUT" \
     2>&1 | tee "$OUT/logs/${obj}.log"

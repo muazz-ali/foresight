@@ -9,8 +9,8 @@ from control.close_guard import (
     max_speed_diff_m_s,
     predictive_close_check,
 )
-from control.delay import DelayInjection, DelaySample
-from control.expert_overlay import overlay_reflex
+from control.delay_injection import DelayInjection, DelaySample
+from control.reflex_overlay import overlay_reflex
 from control.reflex import ReflexClose, ReflexOut
 
 __all__ = [

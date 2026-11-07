@@ -1,4 +1,4 @@
-"""Isaac-free tests for the intercept-servo expert.
+"""Isaac-free tests for the intercept-servo sm.
 
 Run from the repo root:  pytest tests/test_state_machine.py -v
 
@@ -19,7 +19,6 @@ from sim.state_machine import (
     STAGE_APPROACH,
     STAGE_CARRY,
     STAGE_CLOSE,
-    STAGE_DESCEND,
     STAGE_DONE,
     STAGE_HOME,
     STAGE_LIFT,
@@ -68,6 +67,26 @@ def _riding(sm, ee, vel):
 # --------------------------------------------------------------- interception
 
 
+def test_object_inside_base_circle_goes_home(sm):
+    """One rule: object within 10 cm of the base → stop and go home."""
+    assert sm.robot_base_safe_zone_m == pytest.approx(0.10, abs=1e-9)
+    sm.stage = STAGE_APPROACH
+    cmd = sm.step(
+        _state([0.09, 0.0, 0.03], [-0.30, 0.0, 0.0]),
+        np.array([0.40, 0.0, 0.40]),
+        sm._down_quat,
+    )
+    assert cmd.stage == STAGE_HOME
+    sm.stage = STAGE_APPROACH
+    sm.reach_stopped = False
+    cmd = sm.step(
+        _state([0.15, 0.0, 0.03], [-0.30, 0.0, 0.0]),
+        np.array([0.40, 0.0, 0.40]),
+        sm._down_quat,
+    )
+    assert cmd.stage == STAGE_APPROACH
+
+
 def test_lead_collapses_to_pad_when_on_top(sm):
     """Riding the object → horizon is pure lag compensation, not 0.25 s ahead.
 
@@ -113,23 +132,22 @@ def test_delayed_ride_aims_at_p_now_not_base_tau(sm):
     assert cmd.velocity[0] == pytest.approx(0.30, abs=1e-9)  # DiffIK FF = v̂_obj
 
 
-def test_inside_close_box_aims_at_object_not_hand(sm):
-    """No hold rule: 1.5 mm inside the close box, aim = object_now, not the hand."""
+def test_inside_close_box_closes_and_holds_the_hand(sm):
+    """Inside 2 mm the fingers close, and the hand is not yanked to a new aim."""
     sm.stage = STAGE_APPROACH
     sm.z_grasp = 0.036
     sm.set_aim_xy_bounds([[0.20, 0.90], [-0.40, 0.40]])
     vel = np.array([0.30, 0.0, 0.0])
     obj = np.array([0.55, 0.0, 0.036])
     ee = obj + np.array([0.0015, -0.0015, 0.0])
-    sm._prev_ee = ee.copy()  # hand still: |Δv| = 30 cm/s, so the close gate stays shut
+    sm._prev_ee = ee.copy()
     cmd = sm.step(
         _state(obj, vel), ee, sm._down_quat,
         delta_meas_s=0.0, ee_vel=np.zeros(3),
     )
-    assert cmd.stage == STAGE_APPROACH
-    assert sm.aim_branch == "settle"
-    assert cmd.position[0] == pytest.approx(float(obj[0]), abs=1e-6)
-    assert cmd.position[1] == pytest.approx(float(obj[1]), abs=1e-6)
+    assert cmd.stage == STAGE_CLOSE
+    assert cmd.position[0] == pytest.approx(float(ee[0]), abs=1e-6)
+    assert cmd.position[1] == pytest.approx(float(ee[1]), abs=1e-6)
 
 
 def test_delayed_ride_settle_is_p_now(sm):
@@ -235,12 +253,21 @@ def test_far_chase_same_formula_for_zero_and_delayed(sm):
 
 def test_aim_branch_flag_per_tick(sm):
     """Expert reports which aim branch ran; 'none' when no chase aim is built."""
-    sm.stage = STAGE_RESET
+    sm.stage = STAGE_DONE
     sm.step(_state([0.55, 0.0, 0.03], [0.0, 0.0, 0.0]), np.array([0.4, 0.0, 0.4]), sm._down_quat)
     assert sm.aim_branch == "none"
     assert sm.aim_branch in AIM_BRANCHES
     _, br = _far_chase_cmd(sm, 0.10)
     assert br == "far_chase"
+
+
+def test_start_chases_on_the_first_step(sm):
+    """Stage 0 does not sit at home. The first step is already the chase."""
+    sm.reset()
+    assert sm.stage == STAGE_RESET
+    sm.step(_state([0.55, 0.0, 0.03], [0.0, 0.0, 0.0]), np.array([0.4, 0.0, 0.4]), sm._down_quat)
+    assert sm.stage == STAGE_APPROACH
+    assert sm.aim_branch != "none"
 
 
 def test_lead_is_capped_at_lookahead_when_far(sm):
@@ -250,10 +277,10 @@ def test_lead_is_capped_at_lookahead_when_far(sm):
     """
     obj = np.array([1.20, 0.50, 0.03])
     ee = np.array([0.20, 0.0, 0.55])
-    assert sm.lookahead_s == pytest.approx(0.40, abs=1e-9)
+    assert sm.max_aim_ahead_s == pytest.approx(0.40, abs=1e-9)
     for speed in (0.20, 0.40, 0.80):
         lead = sm._intercept_lead_s(ee, obj, np.array([0.0, speed, 0.0]))
-        assert lead == pytest.approx(sm.lookahead_s + sm.robot_approach_pad_s, abs=1e-6)
+        assert lead == pytest.approx(sm.max_aim_ahead_s + sm.robot_approach_pad_s, abs=1e-6)
 
 
 def test_approach_aims_ahead_of_a_moving_object(sm):
@@ -293,7 +320,7 @@ def test_close_gate_requires_hand_at_object_centre(sm):
 
 
 def test_z_gate_honors_yaml_not_z_slack_half(sm):
-    """Close Z tol is grasp_xyz_ok[2] (12 mm), not claim z_slack/2 (2.5 mm).
+    """Close Z tol is grasp_xyz_ok_m[2] (12 mm), not claim z_slack/2 (2.5 mm).
 
     Why: a 30 cm/s smoke near-hit (8.8 mm above centre) never closed when the
     gate was clamped to 2.5 mm, then the object hit the pedestal.
@@ -302,7 +329,7 @@ def test_z_gate_honors_yaml_not_z_slack_half(sm):
     obj = np.array([0.55, 0.0, 0.036])
     vel = np.zeros(3)
     zg = sm._update_z_grasp(obj.copy(), obj)
-    assert sm.grasp_xyz_ok[2] == pytest.approx(0.012, abs=1e-9)
+    assert sm.grasp_xyz_ok_m[2] == pytest.approx(0.012, abs=1e-9)
     # 8 mm above centre: inside yaml box + XY settled → CLOSE.
     near = _riding(sm, np.array([obj[0], obj[1], zg + 0.008]), vel)
     assert sm.step(_state(obj, vel), near, sm._down_quat).stage == STAGE_CLOSE
@@ -319,7 +346,7 @@ def test_close_requires_xy_settle_2mm(sm):
     obj = np.array([0.55, 0.0, 0.036])
     vel = np.zeros(3)
     zg = sm._update_z_grasp(obj.copy(), obj)
-    # 5 mm off in X: inside grasp_xyz_ok (10 mm) but outside close_xy_ok (2 mm).
+    # 5 mm off in X: inside grasp_xyz_ok_m (10 mm) but outside close_xy_ok (2 mm).
     almost = _riding(sm, np.array([obj[0] + 0.005, obj[1], zg]), vel)
     assert sm.step(_state(obj, vel), almost, sm._down_quat).stage == STAGE_APPROACH
     # 1 mm off: settled → CLOSE.
@@ -329,24 +356,14 @@ def test_close_requires_xy_settle_2mm(sm):
     assert sm.step(_state(obj, vel), tight, sm._down_quat).stage == STAGE_CLOSE
 
 
-def test_predictive_close_waits_when_approach_would_overshoot(sm):
-    """|e|≤2 mm is not enough if e+Δv·t_contact still lands outside the box.
-
-    Hand 1 mm short but still charging at +5 cm/s → predicted gap at
-    t_contact≈130 ms is past the object → stay in intercept.
-    """
+def test_inside_2mm_closes_even_if_speeds_differ(sm):
+    """The 2 mm box is the close. A hand already there does not wait on speed."""
     sm.stage = STAGE_APPROACH
     obj = np.array([0.55, 0.0, 0.036])
     vel = np.zeros(3)
     zg = sm._update_z_grasp(obj.copy(), obj)
-    # Hand behind object, approaching fast (not speed-matched).
     ee = np.array([obj[0] - 0.001, obj[1], zg])
-    sm._prev_ee = ee - np.array([0.05, 0.0, 0.0]) * sm.dt  # v_hand ≈ +5 cm/s
-    assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_APPROACH
-    # Same pose, matched speed → e_pred ≈ e → CLOSE.
-    sm.stage = STAGE_APPROACH
-    sm.timer_s = 0.0
-    ee = _riding(sm, ee, vel)
+    sm._prev_ee = ee - np.array([0.05, 0.0, 0.0]) * sm.dt  # hand still at ~5 cm/s
     assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_CLOSE
 
 
@@ -399,7 +416,7 @@ def test_close_ff_is_xy_only(sm):
 
 
 def test_p_now_uses_delta_meas(sm):
-    """F2: p_now = p_delayed + v·Δ_meas, and the expert logs it."""
+    """F2: p_now = p_delayed + v·Δ_meas, and the sm logs it."""
     sm.stage = STAGE_APPROACH
     sm.set_aim_xy_bounds([[0.20, 1.20], [-0.40, 0.40]])
     vel = np.array([0.30, 0.10, 0.0])
@@ -425,7 +442,7 @@ def test_far_rim_spawn_still_chased(sm):
     """Object just past aim inset but inside escape box → keep chasing.
 
     Smoke lemon seed-50194 sat on the far rim past the 2 cm aim inset and the
-    old escape check sent the expert home on frame 1.
+    old escape check sent the sm home on frame 1.
     """
     sm.stage = STAGE_APPROACH
     sm.set_aim_xy_bounds([[0.12, 0.76], [-0.23, 0.23]])  # inset
@@ -473,38 +490,31 @@ def test_chase_gate_is_measured_against_the_object_not_the_aim(sm):
     assert sm.grasp_err_xy is not None and sm.grasp_err_xy < 1e-6
 
 
-def test_close_waits_for_speed_match(sm):
-    """B3: on the object but slower than it → keep riding; matched → CLOSE."""
-    assert sm.close_speed_gate  # claim_timing.close_speed_guard: true
+def test_close_does_not_wait_for_a_speed_sample(sm):
+    """Inside 2 mm the fingers close on that step, even with no hand-speed sample yet."""
     sm.stage = STAGE_APPROACH
     obj = np.array([0.55, 0.0, 0.03])
     vel = np.array([0.30, 0.0, 0.0])
     zg = sm._update_z_grasp(obj.copy(), obj)
     ee = np.array([obj[0], obj[1], zg])
-    # First tick: no hand velocity yet → no close.
     sm._prev_ee = None
-    assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_APPROACH
-    # Hand at 25 cm/s under a 30 cm/s object: Δv·80 ms = 4 mm > 2.5 mm → wait.
-    sm._prev_ee = ee - np.array([0.25, 0.0, 0.0]) * sm.dt
-    assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_APPROACH
-    # Hand at 29 cm/s: 0.8 mm → close.
-    sm._prev_ee = ee - np.array([0.29, 0.0, 0.0]) * sm.dt
     assert sm.step(_state(obj, vel), ee, sm._down_quat).stage == STAGE_CLOSE
 
 
-def test_grasp_xyz_ok_is_a_box(sm):
+def test_grasp_xyz_ok_m_is_a_box(sm):
     """Gate uses |dx|, |dy|, |dz| — not a single XY norm alone."""
     obj = np.array([0.55, 0.0, 0.03])
     ok, _, _ = sm._grasp_gate_ok(obj.copy(), obj)
     assert ok
-    just_out_x = obj + np.array([sm.grasp_xyz_ok[0] + 1e-4, 0.0, 0.0])
+    just_out_x = obj + np.array([sm.grasp_xyz_ok_m[0] + 1e-4, 0.0, 0.0])
     assert not sm._grasp_gate_ok(just_out_x, obj)[0]
-    just_out_z = obj + np.array([0.0, 0.0, sm.grasp_xyz_ok[2] + 1e-4])
+    just_out_z = obj + np.array([0.0, 0.0, sm.grasp_xyz_ok_m[2] + 1e-4])
     assert not sm._grasp_gate_ok(just_out_z, obj)[0]
 
 
-def test_place_tol_is_not_the_servo_tol(sm):
-    assert sm.place_xy_tol > sm.servo_xy_tol
+def test_in_container_uses_the_arrival_box(sm):
+    """Object counts as in the bowl when it is inside the same 30 mm box as arrival."""
+    assert sm.place_xy_tol == pytest.approx(sm.arrived_m, abs=1e-9)
     assert sm._in_container(np.array([0.50 + sm.place_xy_tol - 0.005, 0.30, 0.05]))
     assert not sm._in_container(np.array([0.50 + sm.place_xy_tol + 0.005, 0.30, 0.05]))
 
@@ -515,38 +525,38 @@ def test_arrived_z_tol_is_looser_than_grasp_z(sm):
     assert sm.place_z_tol > sm.grasp_z_tol
 
 
-def test_go_home_retreats_straight_up_before_crossing(sm):
-    """Physics grasp does not pin the placed object: leave vertically first.
-
-    A big Z jump made DiffIK swing ~5 cm in XY and the open fingers swept the
-    fruit out of the box (34% of g0_object_smoke successes).
-    """
+def test_go_home_rises_above_the_rim_before_crossing(sm):
+    """After the drop, rise above the rim with XY held, then head to the start pose."""
     sm.stage = STAGE_HOME
     ee = np.array([0.50, 0.30, 0.06])
     obj = np.array([0.50, 0.30, 0.04])
     start = ee.copy()
-    for i in range(60):
-        cmd = sm.step(_state(obj, np.zeros(3), i * sm.dt), ee, sm._down_quat)
-        if ee[2] < start[2] + sm.release_retreat_m - sm.release_step_m:
-            # Retreat leg: XY pinned to where home began, Z leads by one small step.
-            assert np.allclose(cmd.position[:2], start[:2])
-            assert cmd.position[2] - ee[2] <= sm.release_step_m + 1e-9
+    cmd = sm.step(_state(obj, np.zeros(3), 0.0), ee, sm._down_quat)
+    assert np.allclose(cmd.position[:2], start[:2])
+    assert cmd.position[2] == pytest.approx(sm._clear_z())
+    for i in range(1, 60):
         ee = ee + 0.5 * (cmd.position - ee)  # crude lagging arm
-    assert ee[2] > start[2] + sm.release_retreat_m - sm.release_step_m
+        cmd = sm.step(_state(obj, np.zeros(3), i * sm.dt), ee, sm._down_quat)
     assert np.linalg.norm(ee[:2] - sm.init_pose[:2]) < np.linalg.norm(start[:2] - sm.init_pose[:2])
 
 
-def test_blocked_lower_over_box_still_opens(sm):
-    """Lower that cannot reach the drop height but sits over the box releases there."""
+def test_home_radius_is_a_ball_around_the_start(sm):
+    """Episode can finish when the hand is inside 10 cm of the start pose."""
+    assert sm.home_radius_m == pytest.approx(0.10, abs=1e-9)
+    home = sm.init_pose[:3]
+    assert sm._at_home(home + np.array([0.0, 0.0, 0.09]))
+    assert not sm._at_home(home + np.array([0.0, 0.0, 0.11]))
+
+
+def test_stuck_lower_keeps_trying(sm):
+    """A lower that never arrives does not give up on its own. The 8 s episode clock does."""
     sm.lift_z = 0.20
     sm.stage = STAGE_LOWER
-    ee = np.array([0.50, 0.30, 0.15])  # stuck 9 cm above the drop point, on the box XY
+    ee = np.array([0.50, 0.30, 0.15])
     obj = ee - np.array([0.0, 0.0, 0.01])
-    stages = []
-    for i in range(int((sm.stage_timeout_s + 0.5) / sm.dt)):
-        stages.append(sm.step(_state(obj, np.zeros(3), i * sm.dt), ee, sm._down_quat).stage)
-    assert STAGE_OPEN in stages
-    assert STAGE_HOME in stages and stages.index(STAGE_OPEN) < stages.index(STAGE_HOME)
+    for i in range(int(2.0 / sm.dt)):
+        stage = sm.step(_state(obj, np.zeros(3), i * sm.dt), ee, sm._down_quat).stage
+        assert stage == STAGE_LOWER
 
 
 def test_open_holds_the_hand_still(sm):
@@ -558,22 +568,23 @@ def test_open_holds_the_hand_still(sm):
     assert np.allclose(first, ee) and np.allclose(second, ee)
 
 
-def test_stage_timeout_retries_then_gives_up(sm):
-    """Intercept stalls re-intercept up to ``max_retries``, then go home."""
+def test_chase_does_not_retry_on_its_own(sm):
+    """A long chase stays in approach. The episode loop is the only timeout."""
     obj = np.array([1.40, 0.0, 0.03])  # unreachable
     ee = np.array([0.45, 0.0, 0.40])
     stages = []
-    for i in range(int(30.0 / sm.dt)):
+    for i in range(int(4.0 / sm.dt)):
         cmd = sm.step(_state(obj, np.zeros(3), i * sm.dt), ee, sm._down_quat)
         stages.append(cmd.stage)
-    assert sm.retries > 0, "never retried"
-    assert sm.retries <= sm.max_retries + 1
-    assert max(stages) >= STAGE_APPROACH
+    assert sm.retries == 0
+    assert set(stages) == {STAGE_APPROACH}
 
 
-def test_timeouts_are_per_stage_not_the_episode_window(sm):
-    assert sm.stage_timeout_s < sm.inference_window_s
-    assert sm.grasp_stage_timeout_s < sm.inference_window_s
+def test_only_clock_is_the_episode_window(sm):
+    assert sm.episode_max_s == pytest.approx(8.0)
+    assert not hasattr(sm, "stage_timeout_s")
+    assert not hasattr(sm, "grasp_stage_timeout_s")
+    assert not hasattr(sm, "max_retries")
 
 
 def test_stage_schema_matches_the_constants():
@@ -598,7 +609,7 @@ def test_stage_schema_matches_the_constants():
     assert (
         classify_failure(
             success=False,
-            max_stage=STAGE_DESCEND,
+            max_stage=STAGE_CLOSE,
             object_z_min=0.03,
             object_z_max=0.03,
             object_z_end=0.03,
@@ -617,14 +628,14 @@ def test_motion_coasts_straight():
     np.testing.assert_allclose(v, vel)
 
 
-def test_slip_goes_back_to_intercept(sm):
-    """Physics grasp: object far from the hand during lift → re-intercept, not carry on."""
+def test_slip_goes_home(sm):
+    """Physics grasp: object far from the hand during lift → go home, no re-chase."""
     sm.stage = STAGE_LIFT
     sm.lift_z = 0.2
     ee = np.array([0.55, 0.0, 0.15])
     obj = np.array([0.55, 0.0, 0.03])  # 12 cm below the hand
     cmd = sm.step(_state(obj, np.zeros(3)), ee, sm._down_quat)
-    assert cmd.stage == STAGE_APPROACH and sm.retries == 1
+    assert cmd.stage == STAGE_HOME and sm.retries == 0
     # Held (object at the hand) keeps lifting.
     sm.stage = STAGE_LIFT
     cmd = sm.step(_state(ee.copy(), np.zeros(3)), ee, sm._down_quat)
@@ -654,7 +665,7 @@ def test_hover_over_bowl_is_not_success():
     from sim.success import episode_success
 
     n = 20
-    stages = np.full(n, 9, dtype=np.int64)
+    stages = np.full(n, STAGE_DONE, dtype=np.int64)
     # Lifted, finished stages, XY over bowl — but hovering at carry height.
     pos = np.tile([0.50, 0.30, 0.15], (n, 1)).astype(np.float64)
     pos[:5, 2] = 0.20  # peak lift
@@ -684,7 +695,7 @@ def test_physics_grasp_helpers():
 def test_off_table_flag_labels_a_lost_object():
     from sim.success import classify_failure
 
-    kw = dict(success=False, max_stage=8, object_z_min=0.03, object_z_max=0.2,
+    kw = dict(success=False, max_stage=STAGE_HOME, object_z_min=0.03, object_z_max=0.2,
               object_z_end=0.03, schema=None)
     assert classify_failure(**kw) == "timeout"
     assert classify_failure(**kw, off_table=True) == "off-table"

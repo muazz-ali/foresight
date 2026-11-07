@@ -9,12 +9,12 @@ mkdir -p "$OUT/logs"
 # seed index i → seed 1000+i; want 1000,1001,1003 → indices 0,1,3
 # run seed-start/end covers a range; run three one-seed jobs for clarity
 rm -f "$OUT/STOP"
-$PY "$ROOT/scripts/run_b1_grid.py" --phase freeze -o "$OUT" \
+$PY "$ROOT/eval/run_b1_grid.py" --phase freeze -o "$OUT" \
   -c "$ROOT/sim/phase0_cfg.yaml" >>"$OUT/logs/freeze.log" 2>&1
 
 for idx in 0 1 3; do
   echo "=== C30 seed_index=$idx seed=$((1000+idx)) ===" | tee -a "$OUT/logs/launch.log"
-  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} $PY "$ROOT/scripts/run_b1_grid.py" \
+  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} $PY "$ROOT/eval/run_b1_grid.py" \
     --headless --enable_cameras --device cuda:0 \
     --phase c30 --object egg --n 1 \
     --seed-start "$idx" --seed-end "$idx" \

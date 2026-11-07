@@ -68,30 +68,23 @@ class DelayInjection:
 
     @classmethod
     def from_cfg(cls, cfg: dict[str, Any], *, seed: int = 0) -> DelayInjection:
-        """Build from ``claim_timing`` (preferred) or ``sim`` fallbacks."""
+        """Build from folded ``claim_timing`` (after load_yaml) or ``sim`` fallbacks.
+
+        Reads ``min_delta_delay_s`` / ``max_delta_delay_s`` / ``eval_delta_s``.
+        Jitter defaults to 0 (no extra noise on reported Δ).
+        """
         ct = cfg.get("claim_timing") if isinstance(cfg, dict) else None
         ct = ct if isinstance(ct, dict) else {}
         sim = cfg.get("sim") if isinstance(cfg, dict) else None
         sim = sim if isinstance(sim, dict) else {}
-        # Prefer SI keys after normalize_cfg_units; accept ms aliases if raw.
-        jitter = ct.get("delta_jitter_s", None)
-        if jitter is None and "delta_jitter_ms" in ct:
-            jitter = float(ct["delta_jitter_ms"]) * 1e-3
-        if jitter is None:
-            jitter = 0.010
-        tmin = ct.get("train_delta_min_s", None)
-        if tmin is None and "train_delta_min_ms" in ct:
-            tmin = float(ct["train_delta_min_ms"]) * 1e-3
+        jitter = float(ct.get("delta_jitter_s", 0.0) or 0.0)
+        tmin = ct.get("min_delta_delay_s", None)
         if tmin is None:
             tmin = 0.0
-        tmax = ct.get("train_delta_max_s", None)
-        if tmax is None and "train_delta_max_ms" in ct:
-            tmax = float(ct["train_delta_max_ms"]) * 1e-3
+        tmax = ct.get("max_delta_delay_s", None)
         if tmax is None:
             tmax = 0.200
         ed = ct.get("eval_delta_s", None)
-        if ed is None and "eval_delta_ms" in ct:
-            ed = float(ct["eval_delta_ms"]) * 1e-3
         if ed is None:
             ed = float(sim.get("inject_latency_s", 0.0) or 0.0)
         return cls(

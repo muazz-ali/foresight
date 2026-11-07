@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Measure the two arm numbers the intercept expert depends on: ``tip_lag_pad_ms`` and ``hand_speed_max_cm_s``.
+"""Measure the two arm numbers the intercept expert depends on: ``robot_approach_pad_s`` and ``robot_speed_max_m_s``.
 
-Both are currently *guesses* in ``sim/phase0_cfg.yaml``. Every 40 / 80 cm/s
+Both are currently *guesses* in ``sim/cfg/state_machine.yaml``. Every 0.40 / 0.80 m/s
 claim rests on them, so measure before tuning anything else.
 
   conda activate dynamicVLA_isaac
@@ -9,12 +9,12 @@ claim rests on them, so measure before tuning anything else.
 
 What it does
 ------------
-1. **Step response.** Command a 15 cm XY step from the init pose and fit a
-   first-order lag: ``tip_lag_pad_ms`` is the time to cover 63.2% of the step.
+1. **Step response.** Command a 0.15 m XY step from the init pose and fit a
+   first-order lag: ``robot_approach_pad_s`` is the time to cover 63.2% of the step.
 2. **Ramp tracking.** Command a target sliding at 0.8 m/s and read the
    steady-state trail distance. ``lag = trail / speed`` cross-checks (1); the
    two should agree within ~20%.
-3. **Speed cap.** Peak TCP speed reached during a long step is ``hand_speed_max_cm_s``.
+3. **Speed cap.** Peak TCP speed reached during a long step is ``robot_speed_max_m_s``.
 
 Writes ``tools/diag/out/servo_lag.json`` and prints the yaml lines to paste
 into ``state_machine_params``.
@@ -124,8 +124,8 @@ def main() -> None:
 
     lags = [x for x in (step["robot_approach_pad_s"], ramp["robot_approach_pad_s"]) if np.isfinite(x)]
     recommend = {
-        "tip_lag_pad_ms": int(round(1000.0 * float(max(lags)))) if lags else None,
-        "hand_speed_max_cm_s": round(100.0 * 0.9 * step["peak_tcp_speed_m_s"], 1),
+        "robot_approach_pad_s": round(float(max(lags)), 3) if lags else None,
+        "robot_speed_max_m_s": round(0.9 * step["peak_tcp_speed_m_s"], 3),
     }
     report = {
         "sim_dt": scene.dt,
@@ -140,9 +140,9 @@ def main() -> None:
     OUT.write_text(json.dumps(report, indent=2))
 
     print(json.dumps(report, indent=2))
-    print("\nPaste into sim/phase0_cfg.yaml under state_machine_params:")
-    print(f"  tip_lag_pad_ms: {recommend['tip_lag_pad_ms']}")
-    print(f"  hand_speed_max_cm_s: {recommend['hand_speed_max_cm_s']}")
+    print("\nPaste into sim/cfg/state_machine.yaml under state_machine_params:")
+    print(f"  robot_approach_pad_s: {recommend['robot_approach_pad_s']}")
+    print(f"  robot_speed_max_m_s: {recommend['robot_speed_max_m_s']}")
     if not report["agreement_ok"]:
         print("\nWARNING: step and ramp disagree by >20%. The arm is not a clean")
         print("first-order lag — report both numbers before trusting either.")

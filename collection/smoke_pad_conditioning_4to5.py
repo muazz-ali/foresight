@@ -8,7 +8,7 @@ Rewriting 115G of parquet in place is unsafe. Preferred smoke paths:
 
 1) **New claim collect** (true 5-D)::
 
-     python scripts/smoke_claim_grid.py --headless --enable_cameras --device cuda:0 \\
+     python eval/smoke_claim_grid.py --headless --enable_cameras --device cuda:0 \\
        --per-cell 10 -o data/claim_smoke
      python -m policy.convert_h5 --input-dir data/claim_smoke/... --repo-id foresight/claim_smoke
 
@@ -36,7 +36,7 @@ def main() -> None:
         shape = feats.get("observation.conditioning", {}).get("shape")
     print("old p3_throw conditioning shape:", shape)
     print("claim needs shape: [5]")
-    print("→ use scripts/smoke_claim_grid.py for the primary 20 min train smoke.")
+    print("→ use eval/smoke_claim_grid.py for the primary 20 min train smoke.")
     print("→ old-dataset 20 min smoke: train existing 4-D repo with train_smolvla")
     print("  and run eval_policy (pipeline check only; not a claim gate).")
 

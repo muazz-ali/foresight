@@ -49,7 +49,7 @@ def _transition(dt: float, accel_std: float) -> tuple[np.ndarray, np.ndarray]:
 class CVKalman:
     """Constant-velocity filter. State x = [x, y, vx, vy] in metres and m/s; P = its doubt."""
 
-    # Defaults from `scripts/g2_perception_report.py --tune` on demo speeds 12/14/16/18 cm/s
+    # Defaults from `eval/g2_perception_report.py --tune` on demo speeds 12/14/16/18 cm/s
     # (held out of the report). accel_std 2–4 is a flat optimum; 2 keeps v̂ calmer.
     # meas_std 4 mm (was 2 mm with the rung-1 tracker): the histogram tracker's fixes
     # are noisier on house tables; held-out box p̂ is unchanged (0.34 / 1.20 cm).

@@ -10,7 +10,7 @@ or ride correction. Writes ``data/eval/fix1_static_offset/``.
 
   conda activate dynamicVLA_isaac
   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. PYTHONNOUSERSITE=1 \\
-    python scripts/fix1_static_offset.py --headless --enable_cameras --device cuda:0
+    python eval/fix1_static_offset.py --headless --enable_cameras --device cuda:0
 
 Phases: measure | analyze | report (default: all after AppLauncher measure).
 """
@@ -309,7 +309,7 @@ def write_report(out: Path, fit: dict, *, before: dict | None = None, after: dic
         "",
         "- `sim/pinch_point.py`",
         "- `sim/scene.py` (`get_pinch_point`, `get_hand_pose`)",
-        "- `scripts/fix1_static_offset.py`",
+        "- `eval/fix1_static_offset.py`",
         "- `tests/test_pinch_point.py`",
         "",
     ]
@@ -345,8 +345,8 @@ def main() -> None:
         from sim.scene import Phase0Scene, load_cfg
 
         cfg = load_cfg(Path(args.sim_cfg_file))
-        cfg.setdefault("claim_timing", {})["obs_delay_buffer"] = False
-        cfg["claim_timing"]["enforce_apply_at"] = False
+        cfg.setdefault("claim_timing", {})["enabled_noise_on_replan"] = False
+        cfg["claim_timing"]["apply_delta_delay_to_robot"] = False
         device = str(getattr(args, "device", None) or "cuda:0")
         cfg.setdefault("sim", {})["device"] = device
 

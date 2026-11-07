@@ -1,0 +1,12 @@
+# Training / demo delay numbers (look-ahead Δ for the policy pack).
+# Units: seconds (SI). load_yaml folds this into claim_timing.
+
+policy_training_delay:
+  # When true: each step draws a Δ and logs it with the demo / pack.
+  delay_enabled: true
+  # Drawn wait range (s). Pack uses this as look-ahead; arm does not wait
+  # unless apply_delta_delay_to_robot is true.
+  min_delta_delay_s: 0.0
+  max_delta_delay_s: 0.200
+  # When true, the robot holds each move until t0 + drawn Δ. Off = numbers only.
+  apply_delta_delay_to_robot: false

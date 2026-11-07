@@ -25,9 +25,9 @@ left the table (z more than 3 cm below its spawn height). Also writes .mp4
 overlays: tracked blob centre, sim-truth projection and filter p̂ projection.
 
 Run from the repo root in the sim env:
-  python scripts/g2_perception_report.py            # report → data/eval/p2_perception_report/
-  python scripts/g2_perception_report.py --tune     # Kalman knobs on held-out speeds (not reported)
-  python scripts/g2_perception_report.py --sets house --out data/eval/p3_perception_house
+  python eval/g2_perception_report.py            # report → data/eval/p2_perception_report/
+  python eval/g2_perception_report.py --tune     # Kalman knobs on held-out speeds (not reported)
+  python eval/g2_perception_report.py --sets house --out data/eval/p3_perception_house
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import numpy as np
 FORESIGHT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(FORESIGHT_ROOT))
 
-from interfaces.config import conditioning_delta_s, load_yaml  # noqa: E402
+from interfaces.config import policy_look_ahead_s, load_yaml  # noqa: E402
 from interfaces.state import ObjectState, conditioning_vector  # noqa: E402
 from perception.estimator import StaticCamEstimator  # noqa: E402
 from perception.kalman import CVKalman  # noqa: E402
@@ -91,7 +91,7 @@ def _init_worker() -> None:
     global _CFG, _DELTA
     cv2.setNumThreads(1)
     _CFG = load_yaml(SIM_CFG)
-    _DELTA = conditioning_delta_s(_CFG)
+    _DELTA = policy_look_ahead_s(_CFG)
 
 
 def _oracle(o: np.ndarray) -> ObjectState:
@@ -509,7 +509,7 @@ def report(workers: int, out: Path, sets: str = "box", house_dirs=HOUSE_DIRS, n_
     kf = CVKalman()
     summary = {
         "what": "G2a offline: static-cam tracker + CV Kalman vs sim-truth pack, free-object frames",
-        "delta_s": conditioning_delta_s(load_yaml(SIM_CFG)),
+        "delta_s": policy_look_ahead_s(load_yaml(SIM_CFG)),
         "kalman": {k: getattr(kf, k) for k in ("meas_std", "accel_std", "init_vel_std",
                                                 "max_coast_s", "outlier_m", "max_speed")},
         "g2a_bars": {"median_cm": G2A_MEDIAN_M * 100, "rmse_cm": G2A_RMSE_M * 100, "speed": "20 cm/s"},
@@ -564,7 +564,7 @@ def tune(workers: int) -> None:
         "meas_std": (0.001, 0.002, 0.004, 0.006, 0.008),
         "accel_std": (0.3, 0.5, 1.0, 2.0, 4.0),
     }
-    delta = conditioning_delta_s(load_yaml(SIM_CFG))
+    delta = policy_look_ahead_s(load_yaml(SIM_CFG))
     rows = []
     for combo in itertools.product(*grid.values()):
         kw = dict(zip(grid, combo))

@@ -142,12 +142,9 @@ def main():
     a = ap.parse_args()
     cfg = load_yaml(ROOT / "sim" / "phase0_cfg.yaml")
     sim = cfg.get("sim", {})
-    if "dt" in sim:
-        h = float(sim["dt"])  # load_yaml converts dt_ms → dt (s)
-    elif "dt_ms" in sim:
-        h = float(sim["dt_ms"]) / 1000.0
-    else:
-        sys.exit("A3 stop: no sim.dt / sim.dt_ms in sim/phase0_cfg.yaml; cannot place τ_k = Δ + k·h.")
+    if "dt" not in sim:
+        sys.exit("A3 stop: no sim.dt in sim/phase0_cfg.yaml; cannot place τ_k = Δ + k·h.")
+    h = float(sim["dt"])
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     cells = [(float(c.split(":")[0]), float(c.split(":")[1]) / 1000.0) for c in a.cells]
     speeds = sorted({s for s, _ in cells})

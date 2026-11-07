@@ -58,9 +58,13 @@ def _init():
     ch = _CFG.get("claim_height") if isinstance(_CFG.get("claim_height"), dict) else {}
     robot = _CFG.get("robot") if isinstance(_CFG.get("robot"), dict) else {}
     wrist = _CFG.get("wrist_camera") if isinstance(_CFG.get("wrist_camera"), dict) else {}
-    _INSERT_M = float(ch.get("finger_insert_m", 0.03))
+    # Depth top → centre uses mesh half-height (scene object_radius guess here).
+    scene = _CFG.get("scene") if isinstance(_CFG.get("scene"), dict) else {}
+    _INSERT_M = float(scene.get("object_radius", 0.03))
     _CLEAR_M = float(ch.get("table_clear_m", 0.005))
-    _MIN_GAP_M = float(ch.get("latch_lo_m", 0.07))
+    _MIN_GAP_M = float(
+        ch.get("stop_trusting_depth_below_m", ch.get("latch_lo_m", 0.07))
+    )
     _Z_BIAS_M = float(ch.get("depth_z_bias_m", 0.0))
     _TCP = np.asarray(robot.get("tcp_offset", [0.0, 0.0, 0.107]), dtype=np.float64).reshape(3)
     _WRIST_POS = np.asarray(wrist.get("pos", [0.065, 0.0, 0.0]), dtype=np.float64).reshape(3)

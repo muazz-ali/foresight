@@ -9,7 +9,7 @@ Evidence-only. No production edits. No Isaac run.
 
 | Knob | Value | Source |
 |---|---|---|
-| Opening | **80 mm** | `robot.gripper_open_mm: 40` → Franka open ≈ `2 × gripper_open` (`sim/phase0_cfg.yaml` L52–95; `sim/scene.py` L407–410) |
+| Opening | **80 mm** | `robot.gripper_open: 0.04` → Franka open ≈ `2 × gripper_open` (`sim/cfg/collect.yaml`; `sim/scene.py`) |
 | Width gate | **≤ 75 mm** | `scene.max_object_width_mm` |
 | Width used | `max(sx, sy)` of USD bbox | same as `sim/asset_filters.horizontal_width_m` |
 | Finger / throw axis | world **Y** | cfg L99–101; house throws often aim at the bowl (±Y) |
@@ -17,7 +17,7 @@ Evidence-only. No production edits. No Isaac run.
 `sim/physics_grasp.py` has no size or τ — only grip material and wrist depth.  
 `muazzam/objects/metadata.json` is tags only. Sizes come from existing Isaac logs (`Skip object` / `Object mesh` lines under `data/**/*.log`).
 
-**Related but not τ:** expert close gate `grasp_xyz_ok_mm: [10, 10, 15]` (`phase0_cfg.yaml` L155).
+**Related but not τ:** expert close gate `grasp_xyz_ok_m: [0.01, 0.01, 0.012]` (`sim/cfg/state_machine.yaml`).
 
 ### Geometric τ by category (fitting meshes only)
 
@@ -51,8 +51,8 @@ Split **executed** command vs **logged** label in `sim/collect.py` (not inside t
 
 | Step | File:line | Today |
 |---|---|---|
-| Expert target | `sim/state_machine.py:709` | returns clean `ExpertCommand` |
-| Expert call | `sim/collect.py:294` | `cmd = expert.step(...)` |
+| State-machine target | `sim/state_machine.py:709` | returns clean `StateMachineCommand` |
+| State-machine call | `sim/collect.py:294` | `cmd = expert.step(...)` |
 | Execute | `sim/collect.py:300` | `scene.set_ee_target(cmd.position, ...)` |
 | Label | `sim/collect.py:326–328` | logs same `cmd.position` |
 

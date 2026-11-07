@@ -54,8 +54,8 @@ def main() -> None:
         cfg, enable_cameras=True, object_usd=args.object, asset_seed=args.asset_seed
     )
     latch_cfg = ZLatch.from_cfg(cfg)
-    expert = PickPlaceStateMachine(cfg)
-    expert._z_latch.z_table = float(scene._table_z)
+    sm = PickPlaceStateMachine(cfg)
+    sm._z_latch.z_table = float(scene._table_z)
     latch_cfg.z_table = float(scene._table_z)
 
     scene.reset_episode(seed=0, speed=0.0)
@@ -71,8 +71,8 @@ def main() -> None:
         clear_m=latch_cfg.clear_m,
     )
 
-    expert.reset()
-    expert._obj_half_h = half_mesh
+    sm.reset()
+    sm._obj_half_h = half_mesh
     gaps = np.linspace(0.25, 0.05, 41)
     rows = []
     n_samples_at_hi = 0
@@ -84,9 +84,9 @@ def main() -> None:
             scene.set_ee_target(ee, quat, 1.0)
             scene.step(kinematic_object=True)
 
-        zg = expert._update_z_grasp(ee, obj, wrist_depth=None, ee_quat=quat)
-        latched = expert._z_latch.latched_z_grasp is not None
-        n_samp = len(expert._z_latch.samples_z_grasp)
+        zg = sm._update_z_grasp(ee, obj, wrist_depth=None, ee_quat=quat)
+        latched = sm._z_latch.latched_z_grasp is not None
+        n_samp = len(sm._z_latch.samples_z_grasp)
         if float(gap) >= latch_cfg.latch_hi_m:
             n_samples_at_hi = n_samp
         if latched and locked_at_gap is None:
@@ -116,8 +116,8 @@ def main() -> None:
     ok_freeze = bool(z_after_lock) and max(z_after_lock) - min(z_after_lock) < 1e-6
     # GT still object → all samples ≈ expected_live; median should match.
     ok_value = (
-        expert._z_latch.latched_z_grasp is not None
-        and abs(float(expert._z_latch.latched_z_grasp) - expected_live) < 1e-3
+        sm._z_latch.latched_z_grasp is not None
+        and abs(float(sm._z_latch.latched_z_grasp) - expected_live) < 1e-3
     )
 
     report = {
@@ -136,7 +136,7 @@ def main() -> None:
         },
         "n_samples_while_high": n_samples_at_hi,
         "locked_at_gap_m": locked_at_gap,
-        "latched_z_grasp": expert._z_latch.latched_z_grasp,
+        "latched_z_grasp": sm._z_latch.latched_z_grasp,
         "ok_settings": ok_settings,
         "ok_collect_above_hi": ok_collect,
         "ok_lock_below_lo": ok_lock,

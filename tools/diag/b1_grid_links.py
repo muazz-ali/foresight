@@ -27,7 +27,7 @@ def one(row):
             m = np.degrees(np.minimum(q - LO, HI - q))
             out["j_margin_min_deg"] = m[sel].min(0).round(2).tolist() if sel.any() else None
             out["hand_r_min"] = float(np.linalg.norm(ee[sel, :2], axis=1).min()) if sel.any() else None
-            closes = np.where(st == 3)[0]
+            closes = np.where(st == 2)[0]
             out["close_frame"] = int(closes[0]) if len(closes) else None
             out["obj_r_at_close"] = float(np.linalg.norm(ob[closes[0], :2])) if len(closes) else None
             out["n_frames"] = int(len(st))

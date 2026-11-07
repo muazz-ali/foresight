@@ -1,0 +1,55 @@
+# State-machine knobs + grasp-height / pack Z.
+# Units: metres, seconds, m/s (SI). Keys match what the sim reads.
+#
+# close_at_object_center defaults to true in code (aim Z = object centre).
+
+# =============================================================================
+# STATE MACHINE — knobs in stage order (0 → done)
+# =============================================================================
+state_machine_params:
+
+  # --- stage 1: intercept → close ---
+  max_aim_ahead_s: 0.4
+  robot_speed_max_m_s: 2.5
+  aim_refine_iters: 3
+  # Chase near-box: |dx|,|dy|,|dz| (m). Inside → settle aim (object + 1 tick).
+  grasp_xyz_ok_m: [0.01, 0.01, 0.012]
+  # Inside the 0.01 m box the robot rides with the object.
+  # Inside this 0.002 m box the gripper closes.
+  close_xy_ok_m: 0.002
+  ride_correction_gain: 0.55
+  grasp_yaw_mode: along
+  # Object inside this circle around the base: stop and go home.
+  robot_base_safe_zone_m: 0.1
+
+  # --- stage 2: close ---
+  SM_hold_to_close_fingers_s: 0.3  # wait after close command, then lift
+  use_reflex: false
+
+  # --- stages 3–6: lift / carry / lower / open ---
+  lift_height_m: 0.12
+  robot_distance_to_object_m: 0.1   # farther than this → slip
+  arrived_xyz_m: 0.03               # |dx|, |dy|, and |dz| all inside this before next stage
+  release_below_rim_m: 0.01         # open at container center, this far under the rim
+
+  # --- stage 7: home ---
+  home_radius_m: 0.1                # within 0.10 m of start pose: stage can finish
+  move_up_above_container_m: 0.05   # after drop, rise this far above rim, then home
+
+  # --- budgets ---
+  episode_max_s: 8.0                # only clock: 8 seconds, then the episode ends
+
+# =============================================================================
+# GRASP HEIGHT — state-machine aim Z vs pack p̂z from wrist depth
+# =============================================================================
+# Wrist depth only trusted while robot–top gap ≥ 0.07 m (D405 bad closer in).
+claim_height:
+  # Pack height from wrist depth latch (not GT). Aim Z = object centre by default.
+  use_object_height_from_depth: true
+  table_clear_m: 0.005
+  z_slack_m: 0.005                  # height close-band; gate uses half
+  stop_trusting_depth_below_m: 0.07
+  use_depth_below_m: 0.20
+  depth_percentile: 90.0
+  depth_z_bias_m: 0.0
+  depth_rmse_max_m: 0.01

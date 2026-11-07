@@ -25,7 +25,7 @@ def main() -> None:
     p.add_argument("--asset-seed", type=int, default=40)
     p.add_argument("--cfg", default="sim/phase0_cfg.yaml")
     p.add_argument("--trace", type=int, default=1, help="print the close trace")
-    p.add_argument("--miss", action="store_true", help="expert never moves: object must leave the table")
+    p.add_argument("--miss", action="store_true", help="sm never moves: object must leave the table")
     p.add_argument("--dump", default="", help="dir: save wrist rgb + depth png at the close")
     AppLauncher.add_app_launcher_args(p)
     args, _ = p.parse_known_args([a for a in sys.argv[1:] if a != ""])
@@ -41,29 +41,29 @@ def main() -> None:
     scene = Phase0Scene(
         cfg, enable_cameras=bool(getattr(app, "_enable_cameras", False)), asset_seed=args.asset_seed
     )
-    expert = PickPlaceStateMachine(cfg, dt=scene.dt)
+    sm = PickPlaceStateMachine(cfg, dt=scene.dt)
     if args.miss:
-        expert.settle_s = 1e9
+        sm.hold_home = True
     for speed in args.speeds:
         for seed in args.seeds:
             ep, meta = run_episode(
-                scene, expert, seed=seed, speed=speed, save_images=bool(args.dump)
+                scene, sm, seed=seed, speed=speed, save_images=bool(args.dump)
             )
             ok = episode_success(
                 ep,
-                z_lift_min=expert.lift_height,
-                container_xy_tol=expert.place_xy_tol,
-                place_stage=expert.stage_schema.done,
+                z_lift_min=sm.lift_height_m,
+                container_xy_tol=sm.place_xy_tol,
+                place_stage=sm.stage_schema.done,
             )
-            d = episode_diagnostics(ep, z_lift_min=expert.lift_height)
+            d = episode_diagnostics(ep, z_lift_min=sm.lift_height_m)
             lab = classify_failure(
                 success=ok,
                 max_stage=d["max_stage"],
                 object_z_min=d["z_min"],
                 object_z_max=d["z_max"],
                 object_z_end=d["z_end"],
-                z_lift_min=expert.lift_height,
-                schema=expert.stage_schema,
+                z_lift_min=sm.lift_height_m,
+                schema=sm.stage_schema,
                 off_table=meta["off_table"],
             )
             print(

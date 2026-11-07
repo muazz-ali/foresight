@@ -29,7 +29,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import yaml
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject, RigidObjectCfg
@@ -70,14 +69,13 @@ def _require(cfg: dict, *keys: str) -> Any:
 def load_cfg(path: str | Path) -> dict:
     """Read the yaml config into a dict (mm/ms in file → metres/seconds here).
 
-    No defaults are filled in. A missing key fails loudly later (see ``_require``),
-    so a typo cannot quietly change an experiment.
+    Resolves ``include:`` lists (see ``interfaces.config.load_yaml``). No defaults
+    are filled in. A missing key fails loudly later (see ``_require``), so a typo
+    cannot quietly change an experiment.
     """
-    from interfaces.cfg_units import normalize_cfg_units
+    from interfaces.config import load_yaml
 
-    with open(path) as fp:
-        cfg = yaml.load(fp, Loader=yaml.FullLoader)
-    return normalize_cfg_units(cfg)
+    return load_yaml(path)
 
 
 def _euler_deg_to_wxyz(rotation_deg: list[float]) -> list[float]:
@@ -377,6 +375,8 @@ class Phase0Scene:
         from sim.asset_filters import merge_exclude_names
 
         sc = cfg.get("scene", {}) if isinstance(cfg.get("scene"), dict) else {}
+        # 1 = claim throw (default). 2 = static multi-cube language mode.
+        self._mode = int(sc.get("mode", 1))
         # Name bans: legacy usd_exclude + per-role lists (tomato, plate, …).
         self._usd_exclude_objects = merge_exclude_names(
             sc.get("usd_exclude"), sc.get("exclude_usd_objects")
@@ -410,8 +410,22 @@ class Phase0Scene:
         # Per-episode sit height (tipped cans use diameter/2, not upright height/2).
         self._episode_object_half_height = float(self._object_half_height)
         self.abort_reason: str | None = None  # set mid-episode by safety checks
+        # Mode 2: all colored cubes live here; ``self.object`` points at the target.
+        self._mode2_cubes: dict[str, RigidObject] = {}
+        self._mode2_usd: dict[str, Path] = {}
+        self._mode2_size: dict[str, np.ndarray] = {}
+        self._mode2_centre: dict[str, np.ndarray] = {}
+        self._mode2_half_h: dict[str, float] = {}
+        self._mode2_target: str | None = None
+        self._mode2_poses: dict[str, np.ndarray] = {}
 
-        if not self._use_primitive:
+        if self._play_layout is None:
+            raise RuntimeError("house layout missing after _setup_house_world")
+        self._table_z = float(self._play_layout.table_z)
+
+        if self._mode == 2:
+            self._setup_mode2_cubes(cfg, asset_rng)
+        elif not self._use_primitive:
             if self._usd_exclude_objects:
                 logger.info(
                     "USD object exclude: %s", sorted(self._usd_exclude_objects)
@@ -461,33 +475,44 @@ class Phase0Scene:
                 100.0 * float(self._object_half_height),
             )
 
-        # Table top Z. Layout maps the chosen table edge to z=0.
-        if self._play_layout is None:
-            raise RuntimeError("house layout missing after _setup_house_world")
-        self._table_z = float(self._play_layout.table_z)
+            # Start resting on the table top. Real start pose is set in reset_episode.
+            z0 = self._table_z + self._object_half_height
+            self.object = self._make_rigid(
+                prim_path="/World/Object",
+                usd_path=self._active_usd,
+                pos=np.array([0.50, 0.0, z0]),
+                lin_vel=np.zeros(3),
+                mass=float(_require(cfg, "scene", "object_mass")),
+                # Weld mode: kinematic body, motion is ours (pose write). Physics grasp:
+                # dynamic body; we still write the pose (velocity 0, so PhysX does not add
+                # a second v·dt) until the expert closes, then PhysX owns it.
+                kinematic=self._weld,
+                primitive_sphere=self._use_primitive,
+            )
 
-        # Start resting on the table top. Real start pose is set in reset_episode.
-        z0 = self._table_z + self._object_half_height
-        self.object = self._make_rigid(
-            prim_path="/World/Object",
-            usd_path=self._active_usd,
-            pos=np.array([0.50, 0.0, z0]),
-            lin_vel=np.zeros(3),
-            mass=float(_require(cfg, "scene", "object_mass")),
-            # Weld mode: kinematic body, motion is ours (pose write). Physics grasp:
-            # dynamic body; we still write the pose (velocity 0, so PhysX does not add
-            # a second v·dt) until the expert closes, then PhysX owns it.
-            kinematic=self._weld,
-            primitive_sphere=self._use_primitive,
-        )
-
-        if not self._weld:
-            bind_grip_material("/World/Object", float(_require(cfg, "scene", "object_friction")))
+            if not self._weld:
+                bind_grip_material(
+                    "/World/Object", float(_require(cfg, "scene", "object_friction"))
+                )
+        else:
+            z0 = self._table_z + self._object_half_height
+            self.object = self._make_rigid(
+                prim_path="/World/Object",
+                usd_path=None,
+                pos=np.array([0.50, 0.0, z0]),
+                lin_vel=np.zeros(3),
+                mass=float(_require(cfg, "scene", "object_mass")),
+                kinematic=self._weld,
+                primitive_sphere=True,
+            )
 
         # E3 option: a second, static object on the table (a distractor for language tests).
         # Kinematic and never grasp-tracked; logged in meta only. Off unless a USD is given.
+        # Mode 2 already places all cubes — skip the single distractor hook.
         self.distractor: RigidObject | None = None
-        self._distractor_usd: Path | None = Path(distractor_usd) if distractor_usd else None
+        self._distractor_usd: Path | None = (
+            None if self._mode == 2 else (Path(distractor_usd) if distractor_usd else None)
+        )
         self._distractor_half_height = 0.0
         if self._distractor_usd is not None:
             dsize = usd_bbox_size(self._distractor_usd)
@@ -711,7 +736,7 @@ class Phase0Scene:
         for _try in range(40):
             try:
                 cand = pick_house(scene_dir, asset_rng, cam_specs, max_tries=1)
-                # Prefer yaml container_xy (meters after cfg_units); else house defaults.
+                # Prefer yaml container_xy (metres); else house defaults.
                 bowl_kw: dict = {}
                 ctr = cfg["scene"].get("container_xy")
                 if ctr is not None and len(ctr) >= 2:
@@ -994,30 +1019,19 @@ class Phase0Scene:
         )
 
     def get_drop_target(self) -> np.ndarray:
-        """EE pose inside the box: container XY, Z from floor + object size.
+        """EE pose at the bowl center, release_below_rim under the rim.
 
-        Stays below the rim and below carry height so lower-into-box goes down, not up.
+        That is where the fingers open. The point stays above the bowl floor.
         """
         if self.container is None:
             raise RuntimeError("Place needs a container; no fallback pose.")
-        floor_z = float(self._container_pos[2] - self._container_half_height)
         rim_z = float(self._container_pos[2] + self._container_half_height)
-        sit_z = floor_z + float(self._object_half_height)
-        # Start from "object sits on the box floor" plus a small gap, then clamp
-        # below: under the rim (hand fits in) and under carry height (move goes down).
-        gap = float(_require(self.cfg, "state_machine_params", "drop_z_gap"))
-        # Prefer drop_rim_clear_m from yaml; fall back to grasp_xyz_ok Z if omitted.
-        sm = _require(self.cfg, "state_machine_params")
-        grasp_ok = sm["grasp_xyz_ok"]
-        place_z = float(grasp_ok[2])
-        rim_clear = float(sm.get("drop_rim_clear_m", place_z))
-        hover_clear = place_z
-        drop_z = sit_z + gap
-        if rim_z > sit_z:
-            drop_z = min(drop_z, rim_z - rim_clear)
-        drop_z = max(drop_z, sit_z)
-        carry_z = float(self.get_carry_pose()[2])
-        drop_z = min(drop_z, carry_z - hover_clear)
+        floor_z = float(self._container_pos[2] - self._container_half_height)
+        # Open at the bowl center, release_below_rim under the rim.
+        below = float(_require(self.cfg, "state_machine_params", "release_below_rim_m"))
+        drop_z = rim_z - below
+        if drop_z < floor_z:
+            drop_z = floor_z
         return np.array(
             [
                 float(self._container_pos[0]),
@@ -1027,12 +1041,307 @@ class Phase0Scene:
             dtype=np.float64,
         )
 
+    def _setup_mode2_cubes(self, cfg: dict, asset_rng: np.random.Generator) -> None:
+        """Spawn all Mode-2 colored cubes once; ``self.object`` tracks the target.
+
+        Each category folder under ``object_dir`` must hold one graspable USD
+        (e.g. ``cube_red/red_block.usd``). Call from ``__init__`` when ``mode==2``.
+        """
+        from sim.asset_filters import object_fits_gripper
+        from sim.state_machine_logs import fmt_size_cm
+        from sim.usd_bbox import usd_visual_collision_boxes
+
+        if self._usd_exclude_objects:
+            logger.info("USD object exclude: %s", sorted(self._usd_exclude_objects))
+        if not self._categories:
+            raise RuntimeError("Mode 2 needs scene.object_categories (cube colors)")
+
+        mass = float(_require(cfg, "scene", "object_mass"))
+        friction = float(_require(cfg, "scene", "object_friction"))
+        for i, cat in enumerate(self._categories):
+            raw = list_category_usds(
+                self._object_dir, [cat], exclude=self._usd_exclude_objects
+            )
+            graspable = _filter_graspable_usds(raw, max_width_m=self._max_object_width_m)
+            if not graspable:
+                raise FileNotFoundError(
+                    f"Mode 2: no graspable USD in {self._object_dir / cat} "
+                    f"(width ≤ {1000.0 * self._max_object_width_m:.0f} mm)"
+                )
+            # Prefer ``{color}_block.usd`` when several meshes share the folder.
+            preferred = [p for p in graspable if p.stem.endswith("_block") or cat.split("_")[-1] in p.stem]
+            usd = preferred[0] if preferred else graspable[0]
+            boxes = usd_visual_collision_boxes(usd)
+            size = np.asarray(boxes["size"], dtype=np.float64)
+            centre = np.asarray(boxes["centre"], dtype=np.float64)
+            if not object_fits_gripper(size, self._max_object_width_m):
+                raise RuntimeError(
+                    f"Mode 2 object {usd.stem} size {fmt_size_cm(size)} "
+                    f"wider than gripper max {1000.0 * self._max_object_width_m:.0f} mm"
+                )
+            half_h = half_height_from_size(size)
+            prim = f"/World/Cube_{cat}"
+            # Physics grasp on target: non-weld → dynamic body; distractors stay kinematic.
+            body = self._make_rigid(
+                prim_path=prim,
+                usd_path=usd,
+                pos=np.array([0.45 + 0.08 * i, 0.0, self._table_z + half_h]),
+                lin_vel=np.zeros(3),
+                mass=mass,
+                kinematic=bool(self._weld),
+                primitive_sphere=False,
+            )
+            if not self._weld:
+                bind_grip_material(prim, friction)
+            self._mode2_cubes[cat] = body
+            self._mode2_usd[cat] = usd
+            self._mode2_size[cat] = size
+            self._mode2_centre[cat] = centre
+            self._mode2_half_h[cat] = float(half_h)
+            logger.info(
+                "Mode 2 cube: %s  %s  size %s (%s)",
+                cat,
+                usd.stem,
+                fmt_size_cm(size),
+                boxes["used"],
+            )
+
+        # Seed active pointers from the first cube; reset_episode retargets each ep.
+        first = str(self._categories[0])
+        self._mode2_target = first
+        self.object = self._mode2_cubes[first]
+        self._active_usd = self._mode2_usd[first]
+        self._object_size = self._mode2_size[first].copy()
+        self._object_centre_offset = self._mode2_centre[first].copy()
+        self._object_half_height = float(self._mode2_half_h[first])
+        self._episode_object_half_height = float(self._object_half_height)
+        self._object_usds = list(self._mode2_usd.values())
+        _ = asset_rng  # same seed still drives house/container picks above
+
+    def _bind_mode2_target(self, color: str) -> None:
+        """Point expert / physics helpers at this cube color for the episode."""
+        if color not in self._mode2_cubes:
+            raise KeyError(f"Mode 2 unknown cube color {color!r}")
+        self._mode2_target = color
+        self.object = self._mode2_cubes[color]
+        self._active_usd = self._mode2_usd[color]
+        self._object_size = self._mode2_size[color].copy()
+        self._object_centre_offset = self._mode2_centre[color].copy()
+        self._object_half_height = float(self._mode2_half_h[color])
+        self._episode_object_half_height = float(self._object_half_height)
+
+    def _pin_mode2_distractors(self) -> None:
+        """Keep non-target cubes glued to their episode spawn (static props)."""
+        if self._mode != 2 or not self._mode2_poses or self._mode2_target is None:
+            return
+        upright = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        for color, body in self._mode2_cubes.items():
+            if color == self._mode2_target:
+                continue
+            pos = self._mode2_poses[color]
+            off = self._mode2_centre[color]
+            root_pos = np.array(
+                [
+                    float(pos[0]) - float(off[0]),
+                    float(pos[1]) - float(off[1]),
+                    float(pos[2]) - float(off[2]),
+                ],
+                dtype=np.float64,
+            )
+            pose = torch.zeros((1, 7), device=self.robot.device, dtype=torch.float32)
+            pose[0, 0:3] = torch.tensor(root_pos, device=self.robot.device)
+            pose[0, 3:7] = torch.tensor(upright, device=self.robot.device)
+            body.write_root_pose_to_sim(pose)
+            v = torch.zeros((1, 6), device=self.robot.device, dtype=torch.float32)
+            body.write_root_velocity_to_sim(v)
+
+    def _reset_mode2_episode(self, *, seed: int) -> dict[str, Any]:
+        """Static multi-cube reset: place all four, pick language target, speed 0."""
+        from sim.mode2_layout import randomize as mode2_randomize
+
+        rng = np.random.default_rng(int(seed))
+        sc = self.cfg.get("scene", {}) if isinstance(self.cfg.get("scene"), dict) else {}
+        # Representative half-height (cubes are equal); layout uses one Z for all.
+        hh = float(next(iter(self._mode2_half_h.values())))
+        layout = mode2_randomize(
+            seed=int(seed),
+            xy_bounds=self._xy_bounds,
+            table_z=float(self._table_z),
+            half_height=hh,
+            spawn_pad=float(self._spawn_xy_pad),
+            container_xy=None if self.container is None else self._container_pos[:2],
+            colors=tuple(self._categories),
+            min_separation_m=float(sc.get("mode2_min_separation_m", 0.12)),
+            container_clearance_m=float(sc.get("mode2_container_clearance_m", 0.15)),
+            max_tries=int(sc.get("mode2_max_place_tries", 80)),
+        )
+        target = str(layout["target_color"])
+        poses: dict[str, np.ndarray] = layout["poses"]
+        self._mode2_poses = {k: v.copy() for k, v in poses.items()}
+        self._bind_mode2_target(target)
+
+        # Nudge the box from the house seed (same as Mode 1).
+        if self.container is not None:
+            cx0 = float(
+                self._play_layout.container_xy[0]
+                if self._play_layout is not None
+                else self._container_pos[0]
+            )
+            cy0 = float(
+                self._play_layout.container_xy[1]
+                if self._play_layout is not None
+                else self._container_pos[1]
+            )
+            j = self._container_jitter_xy
+            (cxmin, cxmax), (cymin, cymax) = self._container_xy_clip
+            cx = float(np.clip(cx0 + rng.uniform(-j, j), cxmin, cxmax))
+            cy = float(np.clip(cy0 + rng.uniform(-j, j), cymin, cymax))
+            cz = self._table_z + self._container_half_height
+            self._container_pos = np.array([cx, cy, cz], dtype=np.float64)
+
+        upright = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        self.robot.reset()
+        for body in self._mode2_cubes.values():
+            body.reset()
+        if self.container is not None:
+            self.container.reset()
+        for cam in self.cameras.values():
+            cam.reset()
+
+        home = self.robot.data.default_joint_pos.clone()
+        self.robot.write_joint_state_to_sim(home, self.robot.data.default_joint_vel)
+        self.robot.set_joint_position_target(home)
+        self.robot.set_joint_velocity_target(torch.zeros_like(home))
+        self._ramp_q0, self._ramp_qd = None, None
+
+        for color, body in self._mode2_cubes.items():
+            pos = poses[color]
+            off = self._mode2_centre[color]
+            root_pos = np.array(
+                [
+                    float(pos[0]) - float(off[0]),
+                    float(pos[1]) - float(off[1]),
+                    float(pos[2]) - float(off[2]),
+                ],
+                dtype=np.float64,
+            )
+            self._mode2_poses[color] = pos.copy()
+            root = torch.zeros((1, 13), device=self.robot.device, dtype=torch.float32)
+            root[0, 0:3] = torch.tensor(root_pos, device=self.robot.device)
+            root[0, 3:7] = torch.tensor(upright, device=self.robot.device)
+            body.write_root_state_to_sim(root)
+            body.write_data_to_sim()
+
+        if self.container is not None:
+            croot = torch.zeros((1, 13), device=self.robot.device, dtype=torch.float32)
+            croot[0, 0:3] = torch.tensor(self._container_pos, device=self.robot.device)
+            croot[0, 3:7] = torch.tensor(upright, device=self.robot.device)
+            self.container.write_root_state_to_sim(croot)
+            self.container.write_data_to_sim()
+
+        self.robot.write_data_to_sim()
+
+        tgt_pos = self._mode2_poses[target].copy()
+        off = self._object_centre_offset
+        root_tgt = np.array(
+            [
+                float(tgt_pos[0]) - float(off[0]),
+                float(tgt_pos[1]) - float(off[1]),
+                float(tgt_pos[2]) - float(off[2]),
+            ],
+            dtype=np.float64,
+        )
+        self._obj_kinematic = True
+        self._phys_free = False
+        self._obj_velocity = np.zeros(3, dtype=np.float64)
+        self._coast_pos = None if self._weld else root_tgt.copy()
+        self._coast_quat = None if self._weld else upright.copy()
+        self.off_table = False
+        self.abort_reason = None
+
+        for _ in range(8):
+            for k in range(self.n_substeps):
+                self._physics_substep(last=(k == self.n_substeps - 1))
+
+        self._obj_velocity = np.zeros(3, dtype=np.float64)
+        self._obj_speed_cmd = np.zeros(3, dtype=np.float64)
+        self._obj_vel_obs = np.zeros(3, dtype=np.float64)
+        if not self._weld:
+            self._coast_pos = root_tgt.copy()
+            self._write_object_pose(root_tgt, upright, np.zeros(3))
+        self._pin_mode2_distractors()
+        self._prev_obj_pos = (
+            self.object.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
+        )
+        self._obj_kinematic = True
+        self._phys_free = False
+        self.off_table = False
+        self.abort_reason = None
+        self._attached = False
+        self._attach_offset = np.zeros(3, dtype=np.float64)
+        self._freeze_pose = None
+        self._was_frozen = False
+        self._sim_time = 0.0
+        self._last_capture_t0 = 0.0
+        self._last_gripper_open = 1.0
+        self.ik.reset()
+        self._spawn_redraws, self._last_ride_j7_margin = 0, None
+
+        cube_meta = [
+            {
+                "color": c,
+                "usd": str(self._mode2_usd[c]),
+                "pos": self._mode2_poses[c].tolist(),
+                "is_target": c == target,
+            }
+            for c in self._categories
+        ]
+        self._meta = {
+            "mode": 2,
+            "usd": str(self._active_usd) if self._active_usd else None,
+            "category": target,
+            "object_half_height": float(self._episode_object_half_height),
+            "object_half_height_upright": float(self._object_half_height),
+            "object_tipped": False,
+            "throw_randomness": 0.0,
+            "table_z": float(self._table_z),
+            "container_usd": str(self._container_usd) if self._container_usd else None,
+            "container_category": (
+                self._container_usd.parent.name if self._container_usd else None
+            ),
+            "distractor_usd": None,
+            "distractor_category": None,
+            "distractor_pos": None,
+            "cubes": cube_meta,
+            "target_color": target,
+            "container_half_height": float(self._container_half_height),
+            "container_pos": self._container_pos.tolist(),
+            "carry_pose": self.get_carry_pose().tolist(),
+            "drop_target": self.get_drop_target().tolist(),
+            "asset_seed": int(self._asset_seed),
+            "speed_m_s": 0.0,
+            "seed": int(seed),
+            "tags": [target],
+            "init_pos": self._mode2_poses[target].tolist(),
+            "init_vel": [0.0, 0.0, 0.0],
+            "spawn_redraws": 0,
+            "ride_j7_margin_rad": None,
+            "init_quat_wxyz": upright.tolist(),
+            "grasp_mode": "weld" if self._weld else "physics",
+            **self._house_meta,
+        }
+        return dict(self._meta)
+
     def reset_episode(self, *, seed: int, speed: float) -> dict[str, Any]:
         """Start a fresh episode: arm to home, object at a random spot, box nudged.
 
         ``seed`` makes the layout repeatable. ``speed`` (m/s) is the object's constant
         speed for this episode. Returns a meta dict to save with the log.
+        Mode 2 ignores ``speed`` (always static) and places all cubes.
         """
+        if self._mode == 2:
+            return self._reset_mode2_episode(seed=int(seed))
+
         rng = np.random.default_rng(int(seed))
 
         speed = float(speed)
@@ -1853,10 +2162,10 @@ class Phase0Scene:
             vel_xy=np.asarray(lin_vel, dtype=np.float64)[:2],
             tcp=float(self._tcp_offset[0, 2].item()),
             dt=float(self.dt),
-            wait_s=float(sm.get("settle_s", 0.05)),
-            chase_speed=float(sm.get("ee_speed_max", 0.365)),
+            wait_s=0.0,  # chase starts on the first step; no home pause to replay
+            chase_speed=float(sm.get("robot_speed_max_m_s", 0.365)),
             ride_s=1.0,
-            keep_r_min=float(sm.get("reach_zone_radius", 0.2)),
+            keep_r_min=float(sm.get("robot_base_safe_zone_m", 0.1)),
         )
         m = r["margin"]
         return None if not np.isfinite(m) else float(m)
@@ -1935,6 +2244,11 @@ class Phase0Scene:
                 self.sim.render()  # cameras see the end of the control step
         self.robot.update(self.physics_dt)
         self.object.update(self.physics_dt)
+        if self._mode == 2:
+            for color, body in self._mode2_cubes.items():
+                if color != self._mode2_target:
+                    body.update(self.physics_dt)
+            self._pin_mode2_distractors()
         if self.container is not None:
             self.container.update(self.physics_dt)
 
@@ -2008,6 +2322,11 @@ class Phase0Scene:
                 self._step_physics_object(bool(attach_object) or not bool(kinematic_object))
             self.robot.write_data_to_sim()
             self.object.write_data_to_sim()
+            if self._mode == 2:
+                self._pin_mode2_distractors()
+                for color, body in self._mode2_cubes.items():
+                    if color != self._mode2_target:
+                        body.write_data_to_sim()
             if self.container is not None:
                 # Hold container kinematic pose (seed jitter applied at reset).
                 pose = torch.zeros((1, 7), device=self.robot.device, dtype=torch.float32)

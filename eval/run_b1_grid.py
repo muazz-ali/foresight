@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B1 full-grid gate: oracle expert on speed × delay (16 cells × 80).
+"""B1 full-grid gate: oracle sm on speed × delay (16 cells × 80).
 
 See the B1 gate prompt. Dual GPU:
   GPU0 = unseen cells (C33 first)
@@ -8,7 +8,7 @@ One cell per GPU; shared STOP file under the output root.
 
   conda activate dynamicVLA_isaac
   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. PYTHONNOUSERSITE=1 \\
-    python scripts/run_b1_grid.py --role unseen --device cuda:0 \\
+    python eval/run_b1_grid.py --role unseen --device cuda:0 \\
       -o data/eval/B1_grid_v1 --phase full
 
 Phases: freeze | c30 | delay-check | neg-control | smoke | full | sensitivity | report
@@ -119,10 +119,10 @@ def freeze_config(out: Path, cfg_path: Path) -> Path:
         "_note": "B1 overrides applied after load_yaml(snapshot). Do not edit mid-run.",
         "_t_close": "SPEC-DERIVED",
         "robot.gripper_close_time_ms": 180,
-        "claim_timing.obs_delay_buffer": True,
-        "claim_timing.enforce_apply_at": False,
+        "claim_timing.enabled_noise_on_replan": True,
+        "claim_timing.apply_delta_delay_to_robot": False,
         "claim_timing.delta_meas_noise_ms": 5.0,
-        "claim_timing.delta_meas_replan_ms": 330.0,
+        "claim_timing.replan_meas_noise_ms": 330.0,
         "claim_timing.pre_shape_slack_mm": 5.0,
         "claim_timing.pre_shape_max_open_mm": 80.0,
         "scene.object_categories": list(CLAIM_OBJECTS),
@@ -156,12 +156,18 @@ def load_frozen(out: Path, fallback_cfg: Path) -> dict:
                 float(ov["robot.gripper_close_time_ms"]) * 1e-3
             )
         ct = cfg.setdefault("claim_timing", {})
-        ct["obs_delay_buffer"] = bool(ov.get("claim_timing.obs_delay_buffer", True))
-        ct["enforce_apply_at"] = bool(ov.get("claim_timing.enforce_apply_at", False))
+        ct["enabled_noise_on_replan"] = bool(
+            ov.get("claim_timing.enabled_noise_on_replan", True)
+        )
+        ct["apply_delta_delay_to_robot"] = bool(
+            ov.get("claim_timing.apply_delta_delay_to_robot", False)
+        )
         if "claim_timing.delta_meas_noise_ms" in ov:
             ct["delta_meas_noise_s"] = float(ov["claim_timing.delta_meas_noise_ms"]) * 1e-3
-        if "claim_timing.delta_meas_replan_ms" in ov:
-            ct["delta_meas_replan_s"] = float(ov["claim_timing.delta_meas_replan_ms"]) * 1e-3
+        if "claim_timing.replan_meas_noise_ms" in ov:
+            ct["replan_meas_noise_s"] = (
+                float(ov["claim_timing.replan_meas_noise_ms"]) * 1e-3
+            )
         if "claim_timing.pre_shape_slack_mm" in ov:
             ct["pre_shape_slack_m"] = float(ov["claim_timing.pre_shape_slack_mm"]) * 1e-3
         if "claim_timing.pre_shape_max_open_mm" in ov:
@@ -274,8 +280,8 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
     cfg = load_frozen(out, Path(args.sim_cfg_file))
     # Apply t_close override (sensitivity / C30).
     cfg.setdefault("robot", {})["gripper_close_time_s"] = float(args.t_close_ms) * 1e-3
-    cfg.setdefault("claim_timing", {})["obs_delay_buffer"] = True
-    cfg["claim_timing"]["enforce_apply_at"] = False
+    cfg.setdefault("claim_timing", {})["enabled_noise_on_replan"] = True
+    cfg["claim_timing"]["apply_delta_delay_to_robot"] = False
     device = str(getattr(args, "device", None) or cfg.get("sim", {}).get("device", "cuda:0"))
     cfg.setdefault("sim", {})["device"] = device
     log.info("device=%s role=%s phase=%s out=%s", device, args.role, phase, out)
@@ -294,8 +300,8 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
         asset_seed=1000,
     )
 
-    log.info("expert initialized")
-    expert = PickPlaceStateMachine(cfg)
+    log.info("sm initialized")
+    sm = PickPlaceStateMachine(cfg)
     i0 = int(args.seed_start)
     i1 = int(args.seed_end)
     wd_s = float(getattr(args, "episode_timeout_s", 0.0) or 0.0)
@@ -330,13 +336,13 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
         # --save-mp4 keeps RGB + dumps .h5/.json/.mp4 for later root-cause plots.
         want_dump = bool(getattr(args, "save_mp4", False))
         save_images = bool(save_images or want_dump)
-        expert.reset()
+        sm.reset()
         t0 = time.time()
 
         log.info("Running episode with seed %s", seed)
         ep, meta = run_episode(
             scene,
-            expert,
+            sm,
             seed=int(seed),
             speed=float(v_cms) / 100.0,
             save_images=save_images,
@@ -354,7 +360,7 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
         h5_path = None
         if want_dump and ep is not None:
             from sim.collect import episode_for_json, write_episode_h5
-            from sim.video import gates_from_expert, write_debug_mp4
+            from sim.video import gates_from_state_machine, write_debug_mp4
 
             h5_path = cell_dir / f"{stem}.h5"
             write_episode_h5(
@@ -388,7 +394,7 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
             fps = int(cfg.get("static_camera", {}).get("fps", 25))
             video_path = cell_dir / f"{stem}.mp4"
             write_debug_mp4(
-                ep, video_path, fps=fps, gates=gates_from_expert(expert)
+                ep, video_path, fps=fps, gates=gates_from_state_machine(sm)
             )
         row = {
             "cell": cell,
@@ -553,10 +559,10 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
                 )
             )
         # Bar (B1 math, §7): 10/10 successes, |Δv| at close median ≤ 0.7 and
-        # p95 ≤ the expert's speed gate (lim below), hand offset at close median ≤ the expert's own close
+        # p95 ≤ the sm's speed gate (lim below), hand offset at close median ≤ the sm's own close
         # box (close_xy_ok, 2 mm; a 1 mm bar failed even good closes at 1.6–2.0
-        # mm because the expert may close anywhere inside 2 mm). |Δv| at close alone
-        # cannot fail: the expert's speed gate only closes below the 1.39 cm/s
+        # mm because the sm may close anywhere inside 2 mm). |Δv| at close alone
+        # cannot fail: the sm's speed gate only closes below the 1.39 cm/s
         # limit, so the old "median ≤ limit" passed with 3/10 successes (v6).
         def _vals(key):
             return [
@@ -571,12 +577,14 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
         med = float(np.median(close_dv)) if close_dv else float("nan")
         p95 = float(np.percentile(close_dv, 95)) if close_dv else float("nan")
         xy_med = float(np.median(close_xy)) if close_xy else float("nan")
-        lim = 0.0025 / (float(args.t_close_ms) * 1e-3) * 100.0  # expert speed gate, cm/s
-        xy_lim_mm = 1000.0 * float(cfg["state_machine_params"].get("close_xy_ok", 0.002))
+        lim = 0.0025 / (float(args.t_close_ms) * 1e-3) * 100.0  # sm speed gate, cm/s
+        xy_lim_mm = 1000.0 * float(
+            cfg["state_machine_params"].get("close_xy_ok_m", 0.002)
+        )
         checks = {
             "success_10_of_10": n_ok == len(rows),
             "dv_close_median_le_0p7": bool(np.isfinite(med) and med <= 0.7 + 1e-9),
-            # p95 bar = the expert's own speed gate (2.5 mm / t_close = 1.39 cm/s
+            # p95 bar = the sm's own speed gate (2.5 mm / t_close = 1.39 cm/s
             # at 180 ms). A fixed 1.0 failed 10/10 runs whose worst closes
             # (1.18, 1.23) were inside that gate. Median ≤ 0.7 stays.
             "dv_close_p95_le_gate": bool(np.isfinite(p95) and p95 <= lim + 1e-9),
@@ -678,7 +686,7 @@ def _run_isaac_phases(args: argparse.Namespace, out: Path, log: logging.Logger) 
     if phase in ("sensitivity", "all") and args.role in ("unseen", "all"):
         for t_ms in (130.0, 250.0):
             cfg["robot"]["gripper_close_time_s"] = t_ms * 1e-3
-            expert = PickPlaceStateMachine(cfg)
+            sm = PickPlaceStateMachine(cfg)
             for cell, v, d in (("C33", 30, 300), ("C23", 20, 300)):
                 tag = f"{cell}_t{int(t_ms)}"
                 log.info("sensitivity %s t_close=%s", tag, t_ms)
@@ -733,7 +741,7 @@ def _write_report(out: Path) -> None:
     # Keep main 16 only.
     main = [c for c in cells if c["cell"] in {x[0] for x in UNSEEN_ORDER + SEEN_ORDER}]
     lines = [
-        "# B1 oracle expert — speed x delay grid",
+        "# B1 oracle sm — speed x delay grid",
         "",
         f"Output: `{out}`",
         "",

@@ -38,7 +38,6 @@ from interfaces.state import oracle_from_gt  # noqa: E402
 from sim.state_machine import (  # noqa: E402
     STAGE_APPROACH,
     STAGE_CLOSE,
-    STAGE_DESCEND,
     PickPlaceStateMachine,
 )
 
@@ -58,7 +57,7 @@ def _s_z_half_m(cfg: dict) -> float:
 
 
 def probe_sm(cfg: dict) -> dict:
-    """Run APPROACH + DESCEND at several object heights; check Z tracks z_grasp.
+    """Run intercept at several object heights; check Z tracks z_grasp.
 
     Call with a loaded phase0 cfg. Returns a pass/fail dict for the report.
     """
@@ -66,7 +65,7 @@ def probe_sm(cfg: dict) -> dict:
     down = None
     detail: list[dict] = []
     summaries: list[dict] = []
-    for stage in (STAGE_APPROACH, STAGE_DESCEND):
+    for stage in (STAGE_APPROACH,):
         cmd_zs: list[float] = []
         errs: list[float] = []
         for half in _PROBE_HEIGHTS_M:

@@ -10,10 +10,10 @@ Gate G0 failed (~40% flat across 0–40 cm/s) while wrapping DynamicVLA's `PickP
 
 ## Non-negotiables
 1. **`ppt.md` = Isaac Sim connect cookbook only** (AppLauncher order, `--headless --enable_cameras`, step loop). Not an architecture or state-machine guide.
-2. **Runtime lives in this repo:** `sim/` scene, cameras, scripted expert SM, success criterion, collection. Assets may live under `~/Desktop/muazzam/{objects,scenes}`; **control code must not**.
-3. **Expert SM = Foresight plan §4** four stages against GT `ObjectState` — write it here. Do not import or subclass DynamicVLA `state_machines.*`.
+2. **Runtime lives in this repo:** `sim/` scene, cameras, scripted state machine, success criterion, collection. Assets may live under `~/Desktop/muazzam/{objects,scenes}`; **control code must not**.
+3. **State machine = Foresight plan §4** four stages against GT `ObjectState` — write it here. Do not import or subclass DynamicVLA `state_machines.*`.
 4. **Verify before import.** Any external module (IsaacLab API, asset loader, third-party util): prove one minimal call works in `dynamicVLA_isaac` (or document the failure + fix) *before* wiring it into Phase 0. Broken import → debug first, then use.
-5. **DynamicVLA is read-only reference** for headless launch patterns. Never a dependency of `scripts/run_phase0.py` / `sim/`. If a change needs `sys.path` into DynamicVLA for the expert — stop.
+5. **DynamicVLA is read-only reference** for headless launch patterns. Never a dependency of `scripts/run_phase0.py` / `sim/`. If a change needs `sys.path` into DynamicVLA for the state machine — stop.
 
 ## Allowed from outside
 | Path | Use |
@@ -23,5 +23,5 @@ Gate G0 failed (~40% flat across 0–40 cm/s) while wrapping DynamicVLA's `PickP
 | `~/Desktop/muazzam/{objects,scenes}` | USD assets only |
 | DynamicVLA | Skim patterns; do not vendor SM / termination / latch |
 
-## G0 expert contract (plan §4)
-Plan jobs: approach → grab+lift → place → reset. In code (`sim/state_machine.py`) those are stage ids **0–9**: start → intercept → *(2 go-down unused)* → close → lift → carry → lower → open → home → done. Intercept aims ~0.25 s ahead with Z on the object (no hover); close when `grasp_xyz_ok`. Miss → retry stage 1. Success = our criterion (logged), not DynamicVLA `object_picked`.
+## G0 state-machine contract (plan §4)
+Plan jobs: approach → grab+lift → place → reset. In code (`sim/state_machine.py`) those are stage ids **0–8**: start → intercept → close → lift → carry → lower → open → home → done. Intercept aims with lead capped at `max_aim_ahead_ms` (Z = object centre); close when `grasp_xyz_ok`. Miss → retry stage 1. Success = our criterion (logged), not DynamicVLA `object_picked`.

@@ -1,5 +1,11 @@
 # Uncommitted change report
 
+> **Stale snapshot (2026-10-25).** Config names and layout have moved since then.
+> Current knobs: `sim/cfg/{collect,state_machine,training,evaluation}.yaml`
+> (included by `phase0_cfg.yaml` / `mode2_cfg.yaml`). Prefer those files and
+> `sim/README.md` over the yaml snippets below (`enforce_apply_at` →
+> `apply_delta_delay_to_robot`, no `finger_insert`, no default Δ jitter).
+
 **Branch:** `fo/v1/dev` @ `6264413`  
 **Scope:** working tree only (not committed)  
 **Date:** 2026-10-25  

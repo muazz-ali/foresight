@@ -62,15 +62,15 @@ def main() -> None:
     from sim.state_machine import PickPlaceStateMachine
 
     cfg = load_cfg(Path(args.sim_cfg_file))
-    cfg.setdefault("claim_timing", {})["obs_delay_buffer"] = True
-    cfg["claim_timing"]["enforce_apply_at"] = False
+    cfg.setdefault("claim_timing", {})["enabled_noise_on_replan"] = True
+    cfg["claim_timing"]["apply_delta_delay_to_robot"] = False
     cfg.setdefault("sim", {})["device"] = str(getattr(args, "device", None) or "cuda:0")
 
     scene = Phase0Scene(cfg, enable_cameras=False, object_usd="egg", asset_seed=1000)
-    expert = PickPlaceStateMachine(cfg)
+    sm = PickPlaceStateMachine(cfg)
     log, meta = run_episode(
         scene,
-        expert,
+        sm,
         seed=int(args.seed),
         speed=float(args.speed),
         save_images=False,

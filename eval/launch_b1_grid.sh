@@ -48,17 +48,17 @@ run_worker() {
 
 # Validity phases (c30 / delay / neg) on GPU0 with egg only, then full grid.
 if [[ "$PHASE" == "all" || "$PHASE" == "c30" || "$PHASE" == "delay-check" || "$PHASE" == "neg-control" ]]; then
-  CUDA_VISIBLE_DEVICES=0 $PY $ROOT/scripts/run_b1_grid.py \
+  CUDA_VISIBLE_DEVICES=0 $PY $ROOT/eval/run_b1_grid.py \
     --headless --enable_cameras --device cuda:0 \
     --role unseen --phase c30 --object egg --seed-start 0 --seed-end 9 \
     "${MP4_FLAG[@]}" \
     -o "$OUT" 2>&1 | tee "$OUT/logs/c30.log"
-  CUDA_VISIBLE_DEVICES=0 $PY $ROOT/scripts/run_b1_grid.py \
+  CUDA_VISIBLE_DEVICES=0 $PY $ROOT/eval/run_b1_grid.py \
     --headless --enable_cameras --device cuda:0 \
     --role unseen --phase delay-check --object egg --seed-start 0 --seed-end 9 \
     "${MP4_FLAG[@]}" \
     -o "$OUT" 2>&1 | tee "$OUT/logs/delay.log"
-  CUDA_VISIBLE_DEVICES=0 $PY $ROOT/scripts/run_b1_grid.py \
+  CUDA_VISIBLE_DEVICES=0 $PY $ROOT/eval/run_b1_grid.py \
     --headless --enable_cameras --device cuda:0 \
     --role unseen --phase neg-control --object egg --seed-start 0 --seed-end 9 \
     "${MP4_FLAG[@]}" \

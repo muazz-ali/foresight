@@ -23,7 +23,7 @@ from eval.b2_descend_z_grasp import (  # noqa: E402
 )
 from interfaces.config import load_yaml  # noqa: E402
 from interfaces.state import oracle_from_gt  # noqa: E402
-from sim.state_machine import STAGE_DESCEND, PickPlaceStateMachine  # noqa: E402
+from sim.state_machine import STAGE_APPROACH, PickPlaceStateMachine  # noqa: E402
 
 _YAML = ROOT / "sim" / "phase0_cfg.yaml"
 _CARRY = np.array([0.50, 0.30, 0.12], dtype=np.float64)
@@ -41,14 +41,14 @@ def test_s_z_half_is_half_of_yaml_slack(cfg):
 
 
 def test_descend_cmd_z_equals_z_grasp_for_tall_and_short(cfg):
-    """STAGE_DESCEND aim Z follows object height — never one desk height."""
+    """Intercept aim Z follows object height — never one desk height."""
     dt = float(cfg["sim"]["dt"])
     cmd_zs = []
     for half in (0.02, 0.08):
         sm = PickPlaceStateMachine(cfg, dt=dt)
         sm.set_box_poses(_CARRY, drop_pos=_DROP)
         sm.set_object_half_height(half, z_table=0.0)
-        sm.stage = STAGE_DESCEND
+        sm.stage = STAGE_APPROACH
         obj = np.array([0.55, 0.0, half])
         ee = np.array([0.45, 0.0, 0.40])
         cmd = sm.step(
@@ -63,7 +63,7 @@ def test_descend_cmd_z_equals_z_grasp_for_tall_and_short(cfg):
 
 
 def test_probe_sm_passes_on_shipped_expert(cfg):
-    """Full B2 SM probe (APPROACH + DESCEND height sweep) must pass."""
+    """Full B2 SM probe (intercept height sweep) must pass."""
     rep = probe_sm(cfg)
     assert rep["pass"]
     assert len(_PROBE_HEIGHTS_M) >= 2

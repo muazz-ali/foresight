@@ -55,10 +55,10 @@ MIN_N_SPEED = 3  # speed bins need this many closes to vote
 def _budgets_m(cfg: dict) -> tuple[float, float]:
     """XY / Z half-slack for d spread (metres).
 
-    XY from grasp_xyz_ok / 2; Z from claim_height.z_slack / 2 (same as B2).
+    XY from grasp_xyz_ok_m / 2; Z from claim_height.z_slack / 2 (same as B2).
     """
     smp = cfg.get("state_machine_params") if isinstance(cfg.get("state_machine_params"), dict) else {}
-    xyz_ok = smp.get("grasp_xyz_ok")
+    xyz_ok = smp.get("grasp_xyz_ok_m")
     if xyz_ok is None:
         mm = smp.get("grasp_xyz_ok_mm", [10.0, 10.0, 12.0])
         s_xy = 0.5 * float(mm[0]) * 1e-3
@@ -76,9 +76,7 @@ def expert_close_tau_s(cfg: dict) -> float:
     fake ``−v·dt`` (~10 mm at 30 cm/s) into every recovered d.
     """
     smp = cfg.get("state_machine_params") if isinstance(cfg.get("state_machine_params"), dict) else {}
-    pad = smp.get("robot_approach_pad_s")
-    if pad is None:
-        pad = float(smp.get("tip_lag_pad_ms", 160.0)) * 1e-3
+    pad = smp.get("robot_approach_pad_s", 0.0)
     return float(pad)
 
 
@@ -403,7 +401,7 @@ def main() -> None:
         "# B4: d_k invariance across speeds, delays, heights",
         "",
         f"Gate: σ(d_xy) ≤ {1000.0 * s_xy:.1f} mm, σ(d_z) ≤ {1000.0 * s_z:.1f} mm "
-        f"(half of grasp_xyz_ok / z_slack). Absolute targets must move; "
+        f"(half of grasp_xyz_ok_m / z_slack). Absolute targets must move; "
         f"naive (no-Δ) d must leak. Demo CLOSE uses expert τ={1000.0 * tau_s:.0f} ms.",
         "",
         "| check | detail | pass |",

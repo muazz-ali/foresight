@@ -124,7 +124,7 @@ Also relevant: #11, #12, #13 (proprioception suppresses vision) and #66 (a diffu
 **Our numbers:**
 - One chunk takes 68–164 ms to infer. The 8-step chunk is 0.32 s of blind execution.
 - E4: adding 100 ms of delay drops success from 75% to 42%. The close layer brings it back to 70%.
-- Raising the fixed Δ does nothing, because Δ is fixed at 0.25 s (`sim/phase0_cfg.yaml:143`).
+- Older runs fixed Δ at 0.25 s. Collect now draws Δ in 0–200 ms (`sim/cfg/training.yaml`); pack XY uses that look-ahead.
 
 | # | Paper | Year | Key finding | Why it matters to us |
 |---|---|---|---|---|

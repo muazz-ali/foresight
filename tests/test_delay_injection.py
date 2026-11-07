@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from control.delay import DelayInjection
+from control.delay_injection import DelayInjection
 from interfaces.config import load_yaml
 
 CFG = Path(__file__).resolve().parents[1] / "sim" / "phase0_cfg.yaml"
@@ -17,7 +17,8 @@ DT_30HZ = 1.0 / 30.0
 def test_from_cfg_reads_claim_timing():
     cfg = load_yaml(CFG)
     d = DelayInjection.from_cfg(cfg, seed=0)
-    assert d.jitter_std_s == pytest.approx(0.010)
+    # Training yaml omits jitter → default 0.
+    assert d.jitter_std_s == pytest.approx(0.0)
     assert d.train_delta_min_s == pytest.approx(0.0)
     assert d.train_delta_max_s == pytest.approx(0.200)
     assert d.eval_delta_s == pytest.approx(0.0)

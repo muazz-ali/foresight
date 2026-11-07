@@ -10,7 +10,7 @@ Agents work like lab colleagues: **one workstream each**, shared frozen interfac
 ## Workstreams (pick exactly one per Task/subagent)
 | Tag | Owns | Must not touch |
 |---|---|---|
-| `sim-scene` | In-repo Isaac scene, **Foresight** expert SM, collection (throw / no-bounce for G3) | filter math, policy nets, DynamicVLA SM |
+| `sim-scene` | In-repo Isaac scene, **Foresight** state machine, collection (throw / no-bounce for G3) | filter math, policy nets, DynamicVLA SM |
 | `perception` | detector→tracker→Kalman, 3D lift | policy training, reflex |
 | `policy` | SmolVLA/LeRobot conditioning + Δ/noise aug (last sim retrain = G3) | sim PhysX knobs, executor |
 | `control` | timestamped buffer, reflex, safety/coast (same Phase 3 as throw; before last collect) | dataset schemas, training |

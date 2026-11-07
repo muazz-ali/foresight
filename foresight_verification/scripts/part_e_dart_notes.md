@@ -10,7 +10,7 @@ Production code must stay untouched until a human approves.
 
 | Role | Location |
 |---|---|
-| Clean expert target | `sim/state_machine.py:709–717` — `return ExpertCommand(position=target, ...)` |
+| Clean state-machine target | `sim/state_machine.py:709–717` — `return StateMachineCommand(position=target, ...)` |
 | Episode loop | `sim/collect.py:294` — `cmd = expert.step(...)` |
 | Execute | `sim/collect.py:300` — `scene.set_ee_target(cmd.position, cmd.quat_wxyz, cmd.gripper_open)` |
 | Label | `sim/collect.py:326–328` — `log["action_pos"].append(cmd.position.copy())` (same vector today) |

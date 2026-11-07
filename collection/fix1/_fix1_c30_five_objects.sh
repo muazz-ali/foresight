@@ -2,7 +2,7 @@
 # C30 first-attempt on 5 non-egg objects, one new seed each (Δ=0, 30 cm/s).
 # One Isaac process per object (World cannot rebuild mid-run).
 #
-#   CUDA_VISIBLE_DEVICES=0 bash scripts/_fix1_c30_five_objects.sh
+#   CUDA_VISIBLE_DEVICES=0 bash collection/fix1/_fix1_c30_five_objects.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${OUT:-$ROOT/data/eval/fix1_static_offset/c30_five_objects}"
@@ -30,7 +30,7 @@ for trial in "${TRIALS[@]}"; do
   seed="${trial##*:}"
   echo "=== C30 object=$obj seed=$seed ==="
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
-    "$PY" "$ROOT/scripts/_fix1_c30_first_attempt.py" \
+    "$PY" "$ROOT/collection/fix1/_fix1_c30_first_attempt.py" \
       --headless --enable_cameras --device "$DEVICE" \
       -o "$OUT" -c "$CFG" \
       --object "$obj" --seeds "$seed" --asset-seed "$seed" \

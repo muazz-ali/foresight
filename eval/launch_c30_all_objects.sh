@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # C30 / C31 / C33 scout for every fruit in phase0_cfg object_categories.
-# Uses scripts/run_c30_object_scout.py (catalog = requested category — not the
+# Uses eval/run_c30_object_scout.py (catalog = requested category — not the
 # egg/lemon/onion hardcode in run_b1_grid). No sim/control/cfg edits.
 #
 # Usage:
@@ -73,7 +73,7 @@ run_one_object() {
   local logf=$OUT/logs/gpu${gpu}_${obj}.log
   mkdir -p "$obj_out" "$OUT/logs"
   echo "start gpu=$gpu obj=$obj seeds=$seeds cells=$CELLS"
-  CUDA_VISIBLE_DEVICES=$gpu $PY $ROOT/scripts/run_c30_object_scout.py \
+  CUDA_VISIBLE_DEVICES=$gpu $PY $ROOT/eval/run_c30_object_scout.py \
     --headless --enable_cameras --device cuda:0 \
     --object "$obj" --seeds "$seeds" --cells "$CELLS" \
     "${DUMP_FLAG[@]}" -o "$obj_out" >"$logf" 2>&1

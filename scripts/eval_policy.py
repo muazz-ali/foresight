@@ -134,7 +134,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--delta",
         type=float,
         default=None,
-        help="conditioning look-ahead (s); default = state_machine_params.conditioning_delta_s",
+        help="conditioning look-ahead (s); default = state_machine_params.policy_look_ahead_s",
     )
     p.add_argument("--trials-per-speed", type=int, default=G1_TRIALS)
     p.add_argument("--episode-seeds", type=int, nargs="+", default=None,
@@ -682,7 +682,7 @@ def run_episode_policy(
             size = np.asarray(getattr(scene, "_object_size", [0.07, 0.07, 0.07]), dtype=np.float64)
             r_obj, hc_obj, approx = 0.5 * float(max(size[0], size[1])), 0.0, True
             logging.warning("P_s geometry fallback (%s): sphere r=%.3f m", ex, r_obj)
-        open_half = float(scene.cfg.get("robot", {}).get("gripper_open_mm", 40.0)) / 1000.0
+        open_half = float(scene.cfg.get("robot", {}).get("gripper_open", 0.04))
         ps_rule = CaptureRule(r_obj, hc_obj, p_min=float(ps_close["p_min"]), open_half=open_half)
         meta["ps_geometry"] = {"radius_m": r_obj, "half_straight_m": hc_obj, "open_half_m": open_half,
                                "approx_sphere": approx}
@@ -1473,10 +1473,10 @@ def eval_speed_bin(args, scene, policy, speed: float, metrics_path: Path) -> dic
     successes = 0
     t0 = time.time()
     device = args._device
-    from sim.state_machine import inference_window_steps
+    from sim.state_machine import episode_max_steps
 
     # Time limit per trial, in sim steps, from the config.
-    n_steps = inference_window_steps(scene.cfg, scene.dt)
+    n_steps = episode_max_steps(scene.cfg, scene.dt)
     if bool(getattr(args, "force_place", False)):
         # Carry→lower→unglue→open→home needs more than a pick-only window.
         n_steps = max(int(n_steps), 400)
@@ -1786,13 +1786,13 @@ def main() -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-    from interfaces.config import conditioning_delta_s
+    from interfaces.config import policy_look_ahead_s
     from sim.scene import Phase0Scene, load_cfg
 
     cfg = load_cfg(args.sim_cfg_file)
     # Look-ahead delta must match training. Default comes from the config file.
     if args.delta is None:
-        args.delta = conditioning_delta_s(cfg)
+        args.delta = policy_look_ahead_s(cfg)
     logging.info("eval conditioning Δ=%.3f s (from %s)", args.delta, args.sim_cfg_file)
     args._close_time = gripper_close_time(cfg)
     logging.info("overlays: reflex=%s action_buffer=%s latency=%.3f s gripper_close_time=%.3f s (%s)",

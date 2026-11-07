@@ -5,7 +5,7 @@ expert (GT object state) must already win almost every try in each cell.
 Otherwise a policy miss is just a bad teacher.
 
 Isaac-free. Reads logged expert episodes (``.h5`` + sidecar ``.json``) or a
-``smoke_collect_report.json`` from ``scripts/smoke_claim_grid.py``.
+``smoke_collect_report.json`` from ``eval/smoke_claim_grid.py``.
 
 Grids (``--grid``):
   speed  — 0 / 0.10 / 0.20 / 0.30 m/s (delay ignored) — good for A1-style dumps
@@ -41,7 +41,7 @@ sys.path.insert(0, str(ROOT))
 
 RATE_MIN = 0.95
 MIN_N = 20  # scout; plan § claims want n≥80
-# Folder pattern from scripts/smoke_claim_grid.py
+# Folder pattern from eval/smoke_claim_grid.py
 _CELL_DIR_RE = re.compile(r"spd_(\d+)_del_(\d+)$")
 
 SPEED_GRID = (0.0, 0.10, 0.20, 0.30)
@@ -384,7 +384,7 @@ def main() -> None:
         lines.append("")
         lines.append(
             f"Missing cells: {len(rep['missing'])}. "
-            "Collect with `scripts/smoke_claim_grid.py` or pass `--grid none`."
+            "Collect with `eval/smoke_claim_grid.py` or pass `--grid none`."
         )
     lines.append("")
     lines.append(f"**Overall: {'PASS' if all_pass else 'FAIL'}**")

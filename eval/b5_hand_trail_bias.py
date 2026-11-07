@@ -325,7 +325,7 @@ def main() -> None:
     lines.append("")
     lines.append(
         "If |mean d| is a few mm with cmd mean near v·τ: DiffIK settles off-centre "
-        "inside grasp_xyz_ok. Tighten the gate or dwell until |d| is small before close."
+        "inside grasp_xyz_ok_m. Tighten the gate or dwell until |d| is small before close."
     )
     lines.append("")
     md = "\n".join(lines) + "\n"

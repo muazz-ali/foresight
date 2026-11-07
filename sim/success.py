@@ -143,7 +143,7 @@ def classify_failure(
 
     Order: success → safety-abort → never-engaged → off-table → too-late →
     grasp-slip → early-close → timeout.
-    Pass ``z_lift_min=expert.lift_height`` when the expert is available.
+    Pass ``z_lift_min=expert.lift_height_m`` when the expert is available.
     ``schema`` maps stage ids to meaning; pass ``expert.stage_schema`` so
     numbering stays correct if stages change.
     """
@@ -215,7 +215,7 @@ def episode_diagnostics(
 
     They let a human check why a label was chosen (no blind "off-table").
 
-    ``z_lift_min`` is echoed for gate logs; pass ``expert.lift_height`` when available.
+    ``z_lift_min`` is echoed for gate logs; pass ``expert.lift_height_m`` when available.
     """
     if episode is None:
         return {

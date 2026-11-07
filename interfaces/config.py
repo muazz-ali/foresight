@@ -21,21 +21,80 @@ DEFAULT_SIM_CFG = FORESIGHT_ROOT / "sim" / "phase0_cfg.yaml"
 DEFAULT_POLICY_CFG = FORESIGHT_ROOT / "policy" / "configs" / "smolvla.yaml"
 
 
-def load_yaml(path: str | Path) -> dict[str, Any]:
-    # Read one yaml file into a dict, then turn mm/ms knobs into metres/seconds.
-    from interfaces.cfg_units import normalize_cfg_units
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Merge ``overlay`` into ``base`` in place. Nested dicts merge; else replace."""
+    for key, value in overlay.items():
+        if key == "include":
+            continue
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
 
+
+def _load_yaml_raw(path: Path, *, _stack: tuple[Path, ...] = ()) -> dict[str, Any]:
+    """Read yaml + resolve ``include:`` list. Values stay as written (SI)."""
+    path = path.resolve()
+    if path in _stack:
+        chain = " → ".join(str(p) for p in _stack + (path,))
+        raise ValueError(f"yaml include cycle: {chain}")
     with open(path) as fp:
-        cfg = yaml.load(fp, Loader=yaml.FullLoader)
-    return normalize_cfg_units(cfg)
+        raw = yaml.load(fp, Loader=yaml.FullLoader) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: root must be a mapping, got {type(raw).__name__}")
+    includes = raw.get("include") or []
+    if not isinstance(includes, list):
+        raise ValueError(f"{path}: include must be a list of relative paths")
+    merged: dict[str, Any] = {}
+    for rel in includes:
+        inc = (path.parent / str(rel)).resolve()
+        if not inc.is_file():
+            raise FileNotFoundError(f"{path}: include not found: {rel} → {inc}")
+        _deep_merge(merged, _load_yaml_raw(inc, _stack=_stack + (path,)))
+    _deep_merge(merged, raw)
+    return merged
 
 
-def conditioning_delta_s(
+def _fold_timing_sections(cfg: dict[str, Any]) -> None:
+    """Merge ``policy_training_delay`` + ``evaluation`` into flat ``claim_timing``.
+
+    Split yaml files keep train vs eval readable. Runtime still reads one dict.
+    """
+    ct = cfg.get("claim_timing")
+    if ct is None:
+        ct = {}
+        cfg["claim_timing"] = ct
+    if not isinstance(ct, dict):
+        raise ValueError("claim_timing must be a mapping")
+
+    for section_name in ("policy_training_delay", "evaluation"):
+        block = cfg.pop(section_name, None)
+        if block is None:
+            continue
+        if not isinstance(block, dict):
+            raise ValueError(f"{section_name} must be a mapping")
+        for key, value in block.items():
+            if key in ct:
+                raise ValueError(
+                    f"{section_name}.{key} conflicts with claim_timing.{key}"
+                )
+            ct[key] = value
+
+
+def load_yaml(path: str | Path) -> dict[str, Any]:
+    """Read one yaml (with optional includes). Knobs are already SI."""
+    cfg = _load_yaml_raw(Path(path))
+    _fold_timing_sections(cfg)
+    return cfg
+
+
+def policy_look_ahead_s(
     cfg: dict[str, Any] | None = None,
     *,
     path: str | Path | None = None,
 ) -> float:
-    """Policy look-ahead Δ (s) from ``state_machine_params.conditioning_delta_s``.
+    """Policy look-ahead Δ (s) from ``state_machine_params.policy_look_ahead_s``.
 
     Δ = how many seconds ahead we point the policy. Collect, train, and eval
     must all read it from here, or the numbers will not match.
@@ -44,10 +103,9 @@ def conditioning_delta_s(
     if cfg is None:
         cfg = load_yaml(path or DEFAULT_SIM_CFG)
     sm = cfg["state_machine_params"]
-    if "conditioning_delta_s" in sm:
-        return float(sm["conditioning_delta_s"])
-    # Old yaml files only had ``lookahead_s``; use it so they still work.
-    return float(sm["lookahead_s"])
+    if "policy_look_ahead_s" in sm:
+        return float(sm["policy_look_ahead_s"])
+    return float(sm["max_aim_ahead_s"])
 
 
 def gripper_limits(
@@ -76,7 +134,7 @@ def policy_aug_defaults(
     pos_noise_std: random error on position (meters). vel_noise_std: on speed (m/s).
     """
     pol = load_yaml(policy_path or DEFAULT_POLICY_CFG)
-    delta = conditioning_delta_s(path=sim_path or DEFAULT_SIM_CFG)
+    delta = policy_look_ahead_s(path=sim_path or DEFAULT_SIM_CFG)
     return {
         "delta_min": delta,
         "delta_max": delta,

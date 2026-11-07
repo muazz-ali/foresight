@@ -8,7 +8,7 @@ One Isaac scene for the whole grid (do not rebuild World — GroundPlane clash).
 
   conda activate dynamicVLA_isaac
   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. PYTHONNOUSERSITE=1 \\
-    python scripts/smoke_claim_grid.py --headless --enable_cameras --device cuda:0 \\
+    python eval/smoke_claim_grid.py --headless --enable_cameras --device cuda:0 \\
       --per-cell 10 --object-usd tangerine -o data/claim_smoke_tangerine
 """
 
@@ -44,12 +44,11 @@ def _build_parser() -> argparse.ArgumentParser:
 def _pin_delay_on_cfg(cfg: dict, delay_s: float) -> None:
     """In-place: fix applied Δ for this cell (SI keys on live cfg)."""
     ct = cfg.setdefault("claim_timing", {})
-    ct["enabled"] = True
-    ct["train_delta_min_s"] = float(delay_s)
-    ct["train_delta_max_s"] = float(delay_s)
+    ct["delay_enabled"] = True
+    ct["min_delta_delay_s"] = float(delay_s)
+    ct["max_delta_delay_s"] = float(delay_s)
     ct["eval_delta_s"] = float(delay_s)
-    ct.setdefault("delta_jitter_s", 0.010)
-    ct.setdefault("enforce_apply_at", False)
+    ct.setdefault("apply_delta_delay_to_robot", False)
 
 
 def main() -> None:
@@ -81,7 +80,7 @@ def main() -> None:
         object_usd=args.object_usd,
         asset_seed=int(args.seed),
     )
-    expert = PickPlaceStateMachine(cfg)
+    sm = PickPlaceStateMachine(cfg)
 
     report: dict = {
         "speeds": list(SPEEDS),
@@ -95,7 +94,7 @@ def main() -> None:
     for delay_s in DELAYS_S:
         _pin_delay_on_cfg(cfg, delay_s)
         # Expert reads cfg at init for SM params; delay is re-read in collect each episode.
-        expert = PickPlaceStateMachine(cfg)
+        sm = PickPlaceStateMachine(cfg)
 
         for speed in SPEEDS:
             wins = 0
@@ -111,16 +110,16 @@ def main() -> None:
                 seed = int(args.seed) + int(delay_s * 1e4) + int(speed * 1e3) + attempts
                 ep, meta = run_episode(
                     scene,
-                    expert,
+                    sm,
                     seed=seed,
                     speed=float(speed),
                     save_images=True,
                 )
                 ok = episode_success(
                     ep,
-                    z_lift_min=float(expert.lift_height),
-                    container_xy_tol=float(expert.place_xy_tol),
-                    place_stage=int(expert.stage_schema.done),
+                    z_lift_min=float(sm.lift_height_m),
+                    container_xy_tol=float(sm.place_xy_tol),
+                    place_stage=int(sm.stage_schema.done),
                 )
                 reason = None if ok else clean_reject_reason(ep, meta.get("retries"))
                 if ok:

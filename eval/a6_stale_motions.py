@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from control.buffer import ActionBuffer  # noqa: E402
-from control.delay import DelayInjection  # noqa: E402
+from control.delay_injection import DelayInjection  # noqa: E402
 from control.exec_chunk import push_forecast_chunk  # noqa: E402
 from interfaces.state import ObjectState  # noqa: E402
 

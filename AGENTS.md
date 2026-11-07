@@ -1,12 +1,12 @@
 # AGENTS.md — Foresight lab contract
 
-How humans and Cursor agents work in this repo. Plain words: `WORDS.md`.
+How humans and Cursor agents work in this repo.
 
 ## Project in one line
 Tell a small policy where a moving object will be (physics prediction) → grasp. Plan: `foresight_plan.md`. Isaac tips: `ppt.md` (launch / cameras / step loop only).
 
 ## Ownership (after Gate G0)
-**Scene, scripted expert, success rules, and demo recording live in this repo (`sim/`, `scripts/`).** Do not depend on DynamicVLA at runtime. Wrapping their pick state machine for G0 topped out ~40% — do not go back to that.
+**Scene, scripted state machine, success rules, and demo recording live in this repo (`sim/`, `scripts/`).** Do not depend on DynamicVLA at runtime. Wrapping their pick controller for G0 topped out ~40% — do not go back to that.
 
 ## External dependencies
 | Path | Role |
@@ -14,7 +14,7 @@ Tell a small policy where a moving object will be (physics prediction) → grasp
 | `~/Desktop/IsaacLab` | Symlink → `muazzam/IsaacLab`. Editable Isaac Lab install. Verify APIs here. |
 | `ppt.md` | Headless AppLauncher / camera / step-loop facts only. |
 | `~/Desktop/muazzam/{objects,scenes}` | USD meshes (read). |
-| `~/Desktop/muazzam/DynamicVLA` | Optional *read-only* tips for launch. **Not** our expert or success latch. |
+| `~/Desktop/muazzam/DynamicVLA` | Optional *read-only* tips for launch. **Not** our state machine or success latch. |
 | `~/Desktop/muazzam/IsaacLab` | Canonical Isaac Lab tree. |
 
 Conda: `dynamicVLA_isaac` for sim; separate env for training. Never mix.
@@ -24,22 +24,26 @@ Conda: `dynamicVLA_isaac` for sim; separate env for training. Never mix.
 ## Suggested layout (create only when needed)
 ```
 interfaces/     # shared object message + future-number helper
-sim/            # Isaac scene, OUR scripted expert, recording
+sim/            # Isaac scene, OUR scripted state machine, recording
 perception/     # detect, track, predict (later)
 policy/         # SmolVLA / LeRobot glue
 control/        # action queue + fast grasp helper (later)
 eval/           # speed tests and pass/fail scores
+scripts/        # launchers only (run_*, train_*, launch_*)
+tests/          # pytest
+tools/diag/     # one-off probes / sanity checks
+collection/     # stale dumps — do not import at runtime
 ```
-Do not invent extra top-level packages.
+Do not invent more top-level packages. Put leftovers in `collection/`.
 
 ## Workstreams
 Tag every subagent Task with `WORKSTREAM: <tag>`.
 
 | Tag | Deliverable | Gate focus |
 |---|---|---|
-| `sim-scene` | In-repo scene + Foresight expert + logging (throw / no-bounce for G3) | G0, G3 |
+| `sim-scene` | In-repo scene + Foresight state machine + logging (throw / no-bounce for G3) | G0, G3 |
 | `perception` | Track → filter → predict | G2 |
-| `policy` | SmolVLA + 4-number pack, look-ahead / noise aug. Pack **Δ** when delay varies. No latent WM. Last sim retrain = G3. | G1, G3 |
+| `policy` | SmolVLA + 5-number pack, look-ahead / noise aug. Pack **Δ** when delay varies. No latent WM. Last sim retrain = G3. | G1, G3 |
 | `control` | Buffer + reflex + coast/safety (same Phase 3 as throw; before the last collect) | G3 |
 | `eval` | Speed curve, RMSE, **policy** labels (`never-glued / glued-no-lift / …`). n=20 scout; n≥80 to claim. | all gates |
 | `explore` | Read-only investigation | — |
@@ -61,4 +65,4 @@ Tag every subagent Task with `WORKSTREAM: <tag>`.
 - Prefer few lines + off-the-shelf libs over new frameworks.
 - Never commit unless a human asks.
 - Stop on red gates; diagnose before adding complexity.
-- Runtime code path must work from this repo without DynamicVLA on `PYTHONPATH` for the expert.
+- Runtime code path must work from this repo without DynamicVLA on `PYTHONPATH` for the state machine.

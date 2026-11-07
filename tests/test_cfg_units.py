@@ -1,133 +1,87 @@
-"""Human mm/ms/cm/s yaml → SI metres/seconds for the sim."""
+"""SI yaml loads as-is; train/eval delay folds into claim_timing."""
 
 from __future__ import annotations
 
-import copy
-
 import pytest
 
-from interfaces.cfg_units import normalize_cfg_units
-from interfaces.config import load_yaml, DEFAULT_SIM_CFG
+from interfaces.config import load_yaml, DEFAULT_SIM_CFG, FORESIGHT_ROOT
 
 
-def test_normalize_converts_mm_ms_cm_s():
-    raw = {
-        "robot": {
-            "gripper_open_mm": 40.0,
-            "gripper_close_time_ms": 180,
-            "init_pose_mm": [450.0, 0.0, 400.0, 0.0, 1.0, 0.0, 0.0],
-            "tcp_offset_mm": [0.0, 0.0, 107.0],
-        },
-        "scene": {
-            "max_object_width_mm": 75.0,
-            "min_container_clearance_mm": 10.0,
-            "container_xy_mm": [500.0, 300.0],
-            "object_xy_bounds_mm": [[480.0, 720.0], [-200.0, 100.0]],
-        },
-        "static_camera": {
-            "position_mm": [1000.0, 0.0, 600.0],
-            "clip": {"near_mm": 10.0, "far_mm": 100000.0},
-        },
-        "wrist_camera": {
-            "pos_mm": [65.0, 0.0, 0.0],
-            "clipping_range_mm": [10.0, 2000.0],
-        },
-        "state_machine_params": {
-            "grasp_xyz_ok_mm": [10.0, 10.0, 20.0],
-            "arrived_z_ok_mm": 30.0,
-            "hand_speed_max_cm_s": 250.0,
-            "hold_closed_physics_ms": 300,
-            "aim_refine_iters": 3,
-        },
-        "sim": {"dt_ms": 40},
-    }
-    cfg = normalize_cfg_units(copy.deepcopy(raw))
-    assert cfg["robot"]["gripper_open"] == 0.04
-    assert cfg["robot"]["gripper_close_time_s"] == 0.18
-    assert cfg["robot"]["init_pose"][:3] == [0.45, 0.0, 0.4]
-    assert cfg["robot"]["init_pose"][3:] == [0.0, 1.0, 0.0, 0.0]
-    assert cfg["robot"]["tcp_offset"] == [0.0, 0.0, 0.107]
-    assert cfg["scene"]["max_object_width_m"] == 0.075
-    assert cfg["scene"]["min_container_clearance_m"] == 0.01
-    assert cfg["scene"]["container_xy"] == [0.5, 0.3]
-    assert cfg["scene"]["object_xy_bounds"] == [[0.48, 0.72], [-0.2, 0.1]]
-    assert cfg["static_camera"]["position"] == [1.0, 0.0, 0.6]
-    assert cfg["static_camera"]["clip"]["near"] == 0.01
-    assert cfg["static_camera"]["clip"]["far"] == 100.0
-    assert cfg["wrist_camera"]["pos"] == [0.065, 0.0, 0.0]
-    assert cfg["wrist_camera"]["clipping_range"] == [0.01, 2.0]
-    assert cfg["state_machine_params"]["grasp_xyz_ok"] == [0.01, 0.01, 0.02]
-    assert cfg["state_machine_params"]["place_z_tol"] == 0.03
-    assert cfg["state_machine_params"]["ee_speed_max"] == 2.5
-    assert cfg["state_machine_params"]["physics_close_s"] == 0.3
-    assert cfg["state_machine_params"]["intercept_iters"] == 3
-    assert cfg["sim"]["dt"] == 0.04
-    assert "gripper_open_mm" not in cfg["robot"]
-    assert "hand_speed_max_cm_s" not in cfg["state_machine_params"]
-    assert "dt_ms" not in cfg["sim"]
-
-
-def test_legacy_si_keys_are_rejected():
-    with pytest.raises(ValueError, match="legacy key"):
-        normalize_cfg_units({"robot": {"gripper_open": 0.04}})
-    with pytest.raises(ValueError, match="legacy key"):
-        normalize_cfg_units({"sim": {"dt": 0.04}})
-    with pytest.raises(ValueError, match="legacy key"):
-        normalize_cfg_units({"state_machine_params": {"ee_speed_max": 2.5}})
-
-
-def test_legacy_human_knob_names_are_rejected():
-    with pytest.raises(ValueError, match="tip_lag_pad_ms"):
-        normalize_cfg_units({"state_machine_params": {"robot_approach_pad_ms": 160}})
-    with pytest.raises(ValueError, match="grasp_xyz_ok_mm"):
-        normalize_cfg_units({"state_machine_params": {"hover_above_object_mm": 80}})
-    with pytest.raises(ValueError, match="grasp_xyz_ok_mm"):
-        normalize_cfg_units({"state_machine_params": {"riding_xy_ok_mm": 10}})
-    with pytest.raises(ValueError, match="grasp_xyz_ok_mm"):
-        normalize_cfg_units({"state_machine_params": {"grasp_xy_ok_mm": 10}})
-
-
-def test_phase0_yaml_loads_to_expected_si():
+def test_phase0_yaml_loads_si_keys():
     cfg = load_yaml(DEFAULT_SIM_CFG)
-    assert cfg["robot"]["init_pose"][:3] == [0.45, 0.0, 0.4]
-    assert abs(cfg["robot"]["gripper_close_time_s"] - 0.180) < 1e-12
-    assert abs(cfg["scene"]["max_object_width_m"] - 0.070) < 1e-12
-    assert cfg["state_machine_params"]["grasp_xyz_ok"] == pytest.approx(
+    assert cfg["robot"]["init_pose"][:3] == pytest.approx([0.45, 0.0, 0.4])
+    assert cfg["robot"]["gripper_open"] == pytest.approx(0.04)
+    assert cfg["robot"]["gripper_close_time_s"] == pytest.approx(0.180)
+    assert cfg["robot"]["tcp_offset"] == pytest.approx([0.0, 0.0, 0.1034])
+    ga = cfg["robot"]["gripper_actuator"]
+    assert ga["v_finger_m_s"] == pytest.approx(0.05)
+    assert ga["t_cmd_s"] == pytest.approx(0.030)
+    assert ga["t_force_s"] == pytest.approx(0.050)
+    assert cfg["scene"]["max_object_width_m"] == pytest.approx(0.070)
+    assert cfg["scene"]["min_aim_z_above_table_m"] == pytest.approx(0.015)
+    assert cfg["state_machine_params"]["grasp_xyz_ok_m"] == pytest.approx(
         [0.01, 0.01, 0.012]
     )
-    assert cfg["state_machine_params"]["close_xy_ok"] == pytest.approx(0.002)
-    assert abs(cfg["state_machine_params"]["ee_speed_max"] - 2.5) < 1e-12
-    assert abs(cfg["state_machine_params"]["lookahead_s"] - 0.40) < 1e-12
-    # tip_lag_pad_ms: 0 — DiffIK FF owns tip lag (do not double-lead).
-    assert cfg["state_machine_params"]["robot_approach_pad_s"] == 0.0
-    assert abs(cfg["state_machine_params"]["conditioning_delta_s"] - 0.25) < 1e-12
-    assert cfg["state_machine_params"]["intercept_iters"] == 3
-    # Claim default: 30 Hz control (was 0.04 s / 25 Hz for G0–G2).
-    assert abs(cfg["sim"]["dt"] - (1.0 / 30.0)) < 1e-9
-    assert cfg["claim_timing"]["delta_jitter_s"] == pytest.approx(0.010)
-    assert cfg["claim_timing"]["train_delta_max_s"] == pytest.approx(0.200)
-    assert cfg["claim_timing"]["close_speed_guard"] is True
-    # Grasp height latch (claim Z): mm yaml → metres.
+    assert cfg["state_machine_params"]["close_xy_ok_m"] == pytest.approx(0.002)
+    assert cfg["state_machine_params"]["robot_speed_max_m_s"] == pytest.approx(2.5)
+    assert cfg["state_machine_params"]["max_aim_ahead_s"] == pytest.approx(0.40)
+    assert "policy_look_ahead_s" not in cfg["state_machine_params"]
+    assert cfg["state_machine_params"]["home_radius_m"] == pytest.approx(0.10)
+    assert cfg["state_machine_params"]["move_up_above_container_m"] == pytest.approx(0.05)
+    assert cfg["state_machine_params"]["release_below_rim_m"] == pytest.approx(0.01)
+    assert cfg["state_machine_params"]["episode_max_s"] == pytest.approx(8.0)
+    assert cfg["state_machine_params"]["aim_refine_iters"] == 3
+    assert cfg["state_machine_params"]["robot_base_safe_zone_m"] == pytest.approx(0.10)
+    assert cfg["sim"]["dt"] == pytest.approx(1.0 / 30.0)
+    assert cfg["claim_timing"]["delay_enabled"] is True
+    assert cfg["claim_timing"]["min_delta_delay_s"] == pytest.approx(0.0)
+    assert cfg["claim_timing"]["max_delta_delay_s"] == pytest.approx(0.200)
+    assert cfg["claim_timing"]["apply_delta_delay_to_robot"] is False
+    assert cfg["claim_timing"]["enabled_noise_on_replan"] is False
+    assert cfg["claim_timing"]["replan_meas_noise_s"] == pytest.approx(0.330)
+    assert "policy_training_delay" not in cfg
+    assert "evaluation" not in cfg
     ch = cfg["claim_height"]
-    assert ch["finger_insert_m"] == pytest.approx(0.03)
-    assert ch.get("close_at_object_center", True) is True
-    assert ch.get("pack_z_from_depth", True) is True
+    assert ch.get("use_object_height_from_depth", True) is True
     assert ch["table_clear_m"] == pytest.approx(0.005)
     assert ch["z_slack_m"] == pytest.approx(0.005)
-    assert ch["latch_lo_m"] == pytest.approx(0.07)
-    assert ch["latch_hi_m"] == pytest.approx(0.20)
+    assert ch["stop_trusting_depth_below_m"] == pytest.approx(0.07)
+    assert ch["use_depth_below_m"] == pytest.approx(0.20)
     assert ch["depth_rmse_max_m"] == pytest.approx(0.01)
     assert ch["depth_z_bias_m"] == pytest.approx(0.0)
-    assert "camera" not in cfg
-    assert "cameras" not in cfg["scene"]
     assert cfg["static_camera"]["position"] == pytest.approx([1.0, 0.0, 0.7])
-    assert cfg["static_camera"]["clip"]["near"] == 0.01
-    assert cfg["wrist_camera"]["pos"] == [0.065, 0.0, 0.0]
-    assert cfg["wrist_camera"]["clipping_range"] == [0.01, 2.0]
+    assert cfg["wrist_camera"]["pos"] == pytest.approx([0.065, 0.0, 0.0])
+    assert cfg["wrist_camera"]["clipping_range"] == pytest.approx([0.01, 2.0])
+    assert "dt_ms" not in cfg["sim"]
+    assert "gripper_open_mm" not in cfg["robot"]
+    assert "max_aim_ahead_ms" not in cfg["state_machine_params"]
+    assert "robot_speed_max_cm_s" not in cfg["state_machine_params"]
 
 
-def test_legacy_camera_sections_are_rejected():
-    with pytest.raises(ValueError, match="static_camera"):
-        normalize_cfg_units({"camera": {"fps": 25}})
-    with pytest.raises(ValueError, match="static_camera"):
-        normalize_cfg_units({"scene": {"cameras": [{"name": "static_cam"}]}})
+def test_mode2_yaml_overrides_shared_defaults():
+    cfg = load_yaml(FORESIGHT_ROOT / "sim" / "mode2_cfg.yaml")
+    assert cfg["scene"]["mode"] == 2
+    assert cfg["scene"]["object_categories"] == [
+        "cube_blue",
+        "cube_red",
+        "cube_green",
+        "cube_yellow",
+    ]
+    assert cfg["scene"]["mode2_min_separation_m"] == pytest.approx(0.12)
+    assert cfg["scene"]["mode2_container_clearance_m"] == pytest.approx(0.15)
+    assert cfg["state_machine_params"]["lift_height_m"] == pytest.approx(0.05)
+    assert cfg["state_machine_params"]["robot_distance_to_object_m"] == pytest.approx(0.05)
+    assert cfg["claim_timing"]["delay_enabled"] is True
+    assert cfg["claim_height"]["use_object_height_from_depth"] is True
+
+
+def test_timing_fold_conflict_raises():
+    from interfaces.config import _fold_timing_sections
+
+    with pytest.raises(ValueError, match="conflicts"):
+        _fold_timing_sections(
+            {
+                "claim_timing": {"delay_enabled": True},
+                "policy_training_delay": {"delay_enabled": False},
+            }
+        )

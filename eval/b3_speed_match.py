@@ -83,8 +83,8 @@ def main():
     if not t_close:
         stop("robot.gripper_close_time_s (gripper_close_time_ms) is not set in sim/phase0_cfg.yaml.")
     t_close = float(t_close)
-    slack_mm = DEFAULT_SLACK_M * 1000
-    guard = bool((cfg.get("claim_timing") or {}).get("close_speed_guard", False))
+    sm = cfg.get("state_machine_params") or {}
+    slack_mm = float(sm.get("close_speed_slack_m", DEFAULT_SLACK_M)) * 1000
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     rows, allres = [], []
     for vdir in sorted(Path(a.root).glob("v*")):
@@ -110,10 +110,10 @@ def main():
     if not rows:
         stop(f"no recordings under {a.root}.")
     (out / "b3_report.json").write_text(json.dumps({"rows": rows, "episodes": allres, "t_close_s": t_close,
-                                                   "close_speed_guard_in_cfg": guard}, indent=1))
+                                                   "close_speed_slack_mm": slack_mm}, indent=1))
     L = ["# B3: speed matching at close (pass: |v_obj − v_hand| · t_close ≤ 2.5 mm)", "",
          f"t_close = {t_close*1000:.0f} ms (robot.gripper_close_time_s) → limit {slack_mm/t_close/10:.2f} cm/s. "
-         f"claim_timing.close_speed_guard = {guard} in the current config. Recordings: {a.root}", "",
+         f"close_speed_slack_mm = {slack_mm:.1f}. Recordings: {a.root}", "",
          "| speed | closed / episodes | pass, instant XY | instant XY mm, median / p95 | pass, instant 3D | 3D median mm | "
          "actual slide in window mm, median / p95 | pass, window | obj / hand XY speed cm/s | hand Z speed cm/s |",
          "|---|---|---|---|---|---|---|---|---|---|"]

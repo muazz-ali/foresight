@@ -40,8 +40,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, roc_curve
 
 LIFT_Z_M = 0.12  # eval_policy: held and z_max >= 12 cm counts as lifted
-T_G_S = 0.08  # robot.gripper_close_time_ms
-HALF_OPEN_M = 0.040  # robot.gripper_open_mm (per finger)
+T_G_S = 0.08  # ≈ robot.gripper_close_time_s (faster squeeze used here)
+HALF_OPEN_M = 0.040  # robot.gripper_open (per finger, metres)
 MU_SIM = 2.0  # scene.object_friction, "max" combine
 OBJECTS = "/home/gpuadmin/Desktop/muazzam/objects"
 TIMING_WINDOW = 12  # frames before the close scanned for the P_s peak
@@ -324,9 +324,8 @@ def occlusion_rows(roots, mesh, r_obj, z_pop):
 
 
 def _cam_cfg(cfg):
-    c = dict(cfg["static_camera"])
-    c["position"] = [x / 1000.0 for x in c["position_mm"]]
-    return c
+    """Copy static_camera; position is already metres in the yaml."""
+    return dict(cfg["static_camera"])
 
 
 def _visible(cam, pc, r_obj, tcp, q, disc):

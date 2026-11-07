@@ -51,10 +51,11 @@ predictors for dynamic grasping — smaller, cheaper, easier to debug.
 ### Remaining / landed (2026-10-24 evening)
 1. **Wire into eval** — landed: `--claim-timing`, `--forecast-rel`, ZLatch p̂z,
    5-D `choose_pack` (`scripts/eval_policy.py`).
-2. **Enforce delay on motion** — landed: `claim_timing.enforce_apply_at` in
-   `sim/collect.py` (hold cmd until `apply_at`).
+2. **Enforce delay on motion** — landed: `apply_delta_delay_to_robot`
+   (`sim/cfg/training.yaml`; folded into `claim_timing`) holds the cmd until
+   `apply_at` in `sim/collect.py` (default off).
 3. **Optional noise + close-speed** — landed: `use_noisy_gt`,
-   `close_speed_guard` flags in `claim_timing` (default off).
+   `close_speed_guard` on folded `claim_timing` (default off).
 4. **Dual cameras for Z** — landed: static depth in yaml + `fuse_z_top` /
    `z_top_from_static_depth`; expert fuses wrist+static.
 5. **Language + vision** — landed: `policy/configs/instructions.yaml` with

@@ -44,7 +44,7 @@ def test_shipped_cfg_close_dwell_covers_measured_close():
 
     cfg = load_yaml(CFG)
     close_s = float(cfg["robot"]["gripper_close_time_s"])
-    assert 0.0 < close_s < float(cfg["state_machine_params"]["physics_close_s"])
+    assert 0.0 < close_s < float(cfg["state_machine_params"]["SM_hold_to_close_fingers_s"])
 
 
 def test_substep_times_tile_one_control_step():

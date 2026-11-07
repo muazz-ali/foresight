@@ -1,0 +1,160 @@
+# Demo collection — cameras, robot, scene, lights, paths, sim clock.
+# Units: metres, seconds, m/s (SI). Keys match what the sim reads.
+
+# =============================================================================
+# STATIC CAMERA — fixed RGB (log / policy key: static_cam)
+# =============================================================================
+static_camera:
+  width: 480
+  height: 360
+  # Label for videos/logs only — NOT passed to Isaac CameraCfg.
+  # Real capture rate = sim.dt (cam.update once per control step; update_period=0).
+  fps: 30                 # keep equal to 1/dt (30 Hz)
+  focal_length: 2.3
+  focus_distance: 400.0
+  horizontal_aperture: 4.6
+  data_types:
+  - rgb
+  - depth                 # claim dual-cam Z fuse (with wrist RGB-D)
+  clip:
+    near: 0.01
+    far: 100.0
+  # X=1.0 m back; Z=0.70 m @ 50° tilt. Far-rim throws (~0.75–1.5 m) must stay
+  # in frame — smoke-check FOV after pose changes.
+  position: [1.0, 0.0, 0.7]
+  rotation_deg: [0.0, 50.0, 90.0]
+
+# =============================================================================
+# WRIST CAMERA — RGB-D on panda_hand (log / policy key: wrist_cam)
+# =============================================================================
+wrist_camera:
+  width: 480
+  height: 360
+  fps: 30                 # label only; same as static_camera.fps
+  focal_length: 2.3
+  focus_distance: 400.0
+  horizontal_aperture: 4.6
+  data_types:
+  - rgb
+  - depth                 # Isaac Lab distance_to_image_plane (m)
+  pos: [0.065, 0.0, 0.0]
+  quat_wxyz: [0.0, 0.7071068, 0.7071068, 0.0]
+  clipping_range: [0.01, 2.0]
+
+# =============================================================================
+# ROBOT — Franka
+# =============================================================================
+robot:
+  name: franka
+  # Pad midpoint (URDF pinch Z=0.1034 m), not the old DiffIK TCP 0.107 m.
+  # Aim / ee_pos / closed_above all use this frame so Z targets the pinch.
+  tcp_offset: [0.0, 0.0, 0.1034]
+  gripper_open: 0.04      # one finger open width; full gap ≈ 0.08 m
+  gripper_close: 0.0
+  # Finger travel time (Franka Hand: 0.05 m/s, 0.005 m travel → ~0.18 s).
+  gripper_close_time_s: 0.180
+
+  init_pose: [0.45, 0.0, 0.4, 0.0, 1.0, 0.0, 0.0]  # xyz + quat wxyz
+  max_reach_dist: 0.85
+
+  # Joint speed feed. On: joints follow the object's speed.
+  # Off: damping brakes the joints and the hand trails about 0.2 s.
+  joint_velocity_ff: true
+  # Arm joint PD (HIGH_PD defaults: stiffness 400, damping 80).
+  arm_joint_stiffness: 400.0
+  arm_joint_damping: 80.0
+
+  # Physical close model (B1). When enabled, fingers rate-limit instead of snap.
+  gripper_actuator:
+    enabled: true
+    v_finger_m_s: 0.05
+    t_cmd_s: 0.030
+    t_force_s: 0.050
+
+# =============================================================================
+# SCENE — house USD + throw + meshes (phase0 defaults; mode2 overrides)
+# =============================================================================
+scene:
+  # Physics fingers (no weld). Catchable throws + chase guards handle speed.
+  object_mass: 0.05
+  object_friction: 2.0
+  use_primitive: false              # true = debug sphere
+  object_radius: 0.03               # only if use_primitive
+  container_mass: 0.1
+  n_containers: 1
+  place_hover_above_container: 0.08
+  spawn_xy_pad: 0.03                # inset spawn from play-band edge
+  container_jitter_xy: 0.02
+  # Throw fan at far +X edge: 0 = 90° straight at robot; 1 = uniform over full 180°.
+  throw_randomness: 1.0
+  # Tip-on-side for rolling. OFF for physics-grasp expert (see phase0 notes).
+  tip_roll_categories: []
+  # Bowl seed (m). Layout: X −0.03 m from seed, Y = real +Y table rim.
+  container_xy_clip: [[0.3, 0.4], [0.41, 0.45]]  # seed; layout overwrites
+  attach_z_offset_max: -0.005       # weld only: object at most this far below EE
+  object_xy_bounds: [[0.48, 0.72], [-0.2, 0.1]]  # seed; layout overwrites
+  container_xy: [0.35, 0.42]        # X seed (layout does −0.03 m); Y → +Y rim
+
+  exclude_usd_containers:
+  - plate
+  - tray
+  - placemat
+  exclude_usd_objects:
+  - tomato   # tiny meshes slip under physics grasp
+  - beer     # tall / tip-prone; orientation out of scope
+  - bottle
+  - cup
+  - can      # tip/yaw out of scope
+  - potato   # tipped wedges wedge in the 0.08 m gripper
+  # Drop wide meshes (Franka open ≈ 0.08 m). Gate on collision XY ≤ 0.07 m.
+  max_object_width_m: 0.07
+  # Expert aim Z never below table + this (stops tip-through-table dives).
+  min_aim_z_above_table_m: 0.015
+  min_container_clearance_m: 0.01    # box taller than object by this (closed tops)
+  min_container_xy_margin_m: 0.01    # container footprint bigger than object
+  # Fingers open along world Y: container Y side ≥ object width + this.
+  min_container_finger_clearance_m: 0.06
+  # Open tops: XY fit only (fruit may stick above the rim). Not plates/trays.
+  open_container_categories:
+  - bowl
+  robot_base_keepout_m: 0.12         # coast through pedestal → safety-abort
+  ee_table_margin_m: 0.02            # hand past table footprint → safety-abort
+
+  # Keep in sync with OBJECTS in scripts/launch_p1_collect.sh.
+  # Claim scope: low fruit only (see foresight_plan.md).
+  object_categories:
+  - egg
+  - kiwi
+  - lemon
+  - lime
+  - onion
+  # Spawn filter: re-draw a throw whose planned ride brings wrist j7 near limit.
+  spawn_j7_margin_rad: 0.3
+  spawn_max_redraws: 20
+
+  container_categories:
+  - bowl
+  - box
+
+# =============================================================================
+# LIGHTING — behind / above static_camera
+# =============================================================================
+lighting:
+  temperature: [4000, 8000]
+  intensity: [150, 750]
+  behind_m: [3.0, 12.0]
+  above_m: [2.0, 15.0]
+  side_m: [-2.0, 2.0]
+
+# =============================================================================
+# PATHS + SIM CLOCK
+# =============================================================================
+paths:
+  object_dir: /home/gpuadmin/Desktop/muazzam/objects
+  scene_dir: /home/gpuadmin/Desktop/muazzam/scenes
+
+sim:
+  dt: 0.033333333                 # control / cameras / logs = 30 Hz
+  # House only: physics steps per control step (4 → 120 Hz). Floor always 1.
+  physics_substeps: 4
+  device: cuda:0

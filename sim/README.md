@@ -1,20 +1,30 @@
-# Sim — house scene + scripted expert
+# Sim — house scene + scripted state machine
 
-How the expert works (plain words + code links): [`STATE_MACHINE.md`](STATE_MACHINE.md).
+How the state machine works: [`STATE_MACHINE.md`](STATE_MACHINE.md).  
+## Config (split)
 
+| Path | What it does |
+|---|---|
+| `phase0_cfg.yaml` | Throw / claim entry — `include:` of the four files below |
+| `mode2_cfg.yaml` | Static cubes + language — same includes, Mode-2 overrides only |
+| `cfg/collect.yaml` | Cameras, robot, scene, lights, paths, sim clock |
+| `cfg/state_machine.yaml` | State-machine stages + `claim_height` (centre aim, `z_slack`) |
+| `cfg/training.yaml` | Demo delay numbers for the **policy** pack (`policy_training_delay`) |
+| `cfg/evaluation.yaml` | Eval delay / old-frame knobs |
+
+Loader: `interfaces.config.load_yaml` (resolves `include:`; yaml is SI m/s).
 
 ## Files
 | Path | What it does |
 |---|---|
-| `phase0_cfg.yaml` | Scene, cameras, expert timings, mesh folders |
 | `scene.py` | Franka + house USD + throw object + container + cameras |
 | `motion.py` | On-table coast (straight line; miss leaves the table) |
-| `physics_grasp.py` | Helpers for the real PhysX grasp: sticky material, table-footprint check, wrist depth between the fingertips |
-| `state_machine.py` | Intercept-servo pick stages (0–9) |
-| `STATE_MACHINE.md` | Simple full walkthrough with links into the code |
+| `physics_grasp.py` | Helpers for the real PhysX grasp |
+| `state_machine.py` | Intercept-servo pick stages (0–8) |
+| `STATE_MACHINE.md` | Short walkthrough |
 | `state_machine_logs.py` | Plain log lines (banners, stage lines, results) |
 | `success.py` | Did we succeed? + failure label |
-| `collect.py` | One episode loop; saves robot pose, images, future numbers |
+| `collect.py` | One episode loop; saves robot pose, images, pack |
 | `video.py` | Debug MP4 (static \| wrist + text) |
 
 Shared object message: `interfaces/state.py`.

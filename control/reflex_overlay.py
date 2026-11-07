@@ -1,4 +1,4 @@
-"""Thin glue: ReflexClose on top of an expert (or policy) hand command.
+"""Thin glue: ReflexClose on top of a state-machine or policy robot command.
 
 Used in throw / physics-grasp episodes. Far from the object the reflex stays
 off and the caller keeps driving. Near the object it steers XY at the meeting
@@ -15,9 +15,8 @@ from control.reflex import ReflexClose, ReflexOut
 from interfaces.state import ObjectState
 
 
-# Close (3) only in the happy path. Stage 2 (go down) is unused but kept if entered.
-# Do not run during stage 1 intercept — that would fight the chase aim.
-_REFLEX_STAGES = frozenset({2, 3})
+# Reflex only during close (stage 2). Do not run during intercept (stage 1).
+_REFLEX_STAGES = frozenset({2})
 
 
 def overlay_reflex(
@@ -31,12 +30,11 @@ def overlay_reflex(
 ) -> tuple[Any, ReflexOut | None]:
     """Return (possibly updated command, reflex out or None).
 
-    ``cmd`` must look like ``sim.state_machine.ExpertCommand`` (position,
+    ``cmd`` must look like ``sim.state_machine.StateMachineCommand`` (position,
     gripper_open, attach_object, kinematic_object, stage, …). Frozen dataclasses
     are rebuilt with ``replace``; plain namespaces are mutated in place.
 
-    Steer XY at the meeting point in close (stage 3; unused stage 2 if entered).
-    Only force a close once the expert is already in CLOSE.
+    Steer XY at the meeting point during close (stage 2) and force the grasp.
     """
     if int(cmd.stage) not in _REFLEX_STAGES:
         return cmd, None
@@ -53,7 +51,7 @@ def overlay_reflex(
     grip = float(cmd.gripper_open)
     attach = bool(cmd.attach_object)
     kin = bool(cmd.kinematic_object)
-    if out.close and int(cmd.stage) == 3:
+    if out.close and int(cmd.stage) == 2:
         grip = 0.0
         attach = True
         kin = False

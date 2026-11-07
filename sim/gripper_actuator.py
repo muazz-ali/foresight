@@ -85,37 +85,21 @@ class GripperActuator:
 
     @classmethod
     def from_cfg(cls, cfg: dict) -> GripperActuator:
-        """Build from ``robot.gripper_actuator`` (+ open/close widths)."""
+        """Build from ``robot.gripper_actuator`` (+ open/close widths).
+
+        Yaml is SI: ``gripper_open`` is one-finger width (full gap = 2×),
+        ``v_finger_m_s`` / ``t_cmd_s`` / ``t_force_s`` on the actuator block.
+        """
         robot = cfg.get("robot") if isinstance(cfg, dict) else {}
         robot = robot if isinstance(robot, dict) else {}
         ga = robot.get("gripper_actuator") if isinstance(robot.get("gripper_actuator"), dict) else {}
-        open_m = float(robot.get("gripper_open", 0.040)) * 2.0  # joint→gap approx
-        # phase0 stores half-gap as gripper_open (one finger). Full gap = 2×.
-        # Prefer explicit full-open if present.
-        if "gripper_open_gap_m" in robot:
-            open_m = float(robot["gripper_open_gap_m"])
-        else:
-            # Historical: gripper_open is one finger joint (0.04 → 80 mm gap).
-            open_m = 2.0 * float(robot.get("gripper_open", 0.040))
+        # gripper_open is one finger; actuator tracks full gap.
+        open_m = 2.0 * float(robot.get("gripper_open", 0.040))
         close_m = float(robot.get("gripper_close", 0.0))
-        if "gripper_close_gap_m" in robot:
-            close_m = float(robot["gripper_close_gap_m"])
-        def _s(key_s: str, key_ms: str, default: float) -> float:
-            if key_s in ga:
-                return float(ga[key_s])
-            if key_ms in ga:
-                return float(ga[key_ms]) * 1e-3
-            return float(default)
-
-        v = ga.get("v_finger_m_s")
-        if v is None and "v_finger_mm_s" in ga:
-            v = float(ga["v_finger_mm_s"]) * 1e-3
-        if v is None:
-            v = DEFAULT_V_FINGER_M_S
         return cls(
-            v_finger_m_s=float(v),
-            t_cmd_s=_s("t_cmd_s", "t_cmd_ms", DEFAULT_T_CMD_S),
-            t_force_s=_s("t_force_s", "t_force_ms", DEFAULT_T_FORCE_S),
+            v_finger_m_s=float(ga.get("v_finger_m_s", DEFAULT_V_FINGER_M_S)),
+            t_cmd_s=float(ga.get("t_cmd_s", DEFAULT_T_CMD_S)),
+            t_force_s=float(ga.get("t_force_s", DEFAULT_T_FORCE_S)),
             width_open_m=float(open_m),
             width_closed_m=float(close_m),
             width_m=float(open_m),

@@ -53,16 +53,16 @@ def _mm(m: float) -> str:
     return f"{1000.0 * float(m):.0f}"
 
 
-def gates_from_expert(expert: Any) -> dict[str, float]:
+def gates_from_state_machine(sm: Any) -> dict[str, float]:
     """Copy the expert's one grasp gate for the video footer."""
-    ok = np.asarray(expert.grasp_xyz_ok, dtype=np.float64).reshape(3)
+    ok = np.asarray(sm.grasp_xyz_ok_m, dtype=np.float64).reshape(3)
     return {
         "grasp_dx": float(ok[0]),
         "grasp_dy": float(ok[1]),
         "grasp_dz": float(ok[2]),
-        "close_gripper_s": float(expert.close_gripper_s),
-        "close_depth_m": float(expert.close_depth_m),
-        "dt": float(expert.dt),
+        "close_gripper_s": float(sm.close_gripper_s),
+        "close_depth_m": float(sm.close_depth_m),
+        "dt": float(sm.dt),
     }
 
 
@@ -74,8 +74,12 @@ def _gates_from_cfg() -> dict[str, float]:
     sm = cfg["state_machine_params"]
     scene = cfg.get("scene", {})
     physics = not bool(scene.get("use_weld_grasp", False))
-    close_s = float(sm["physics_close_s"] if physics else sm["close_gripper_s"])
-    ok = sm["grasp_xyz_ok"]
+    close_s = float(
+        sm["SM_hold_to_close_fingers_s"]
+        if physics
+        else sm.get("hold_closed_weld_s", sm["SM_hold_to_close_fingers_s"])
+    )
+    ok = sm["grasp_xyz_ok_m"]
     return {
         "grasp_dx": float(ok[0]),
         "grasp_dy": float(ok[1]),
@@ -123,7 +127,7 @@ def _state_lines(episode: dict[str, Any], t: int) -> list[str]:
 def _gate_lines(
     episode: dict[str, Any], t: int, gates: dict[str, float]
 ) -> list[str]:
-    """Top-left gate report: live hand–object gap vs the one grasp_xyz_ok box."""
+    """Top-left gate report: live hand–object gap vs the one grasp_xyz_ok_m box."""
     if "ee_pos" not in episode or "object_pos" not in episode:
         return []
 

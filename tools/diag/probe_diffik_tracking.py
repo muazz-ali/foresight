@@ -100,8 +100,8 @@ def main() -> None:
     from sim.scene import Phase0Scene, load_cfg
 
     cfg = load_cfg(Path(args.sim_cfg_file))
-    cfg.setdefault("claim_timing", {})["obs_delay_buffer"] = False
-    cfg["claim_timing"]["enforce_apply_at"] = False
+    cfg.setdefault("claim_timing", {})["enabled_noise_on_replan"] = False
+    cfg["claim_timing"]["apply_delta_delay_to_robot"] = False
     cfg.setdefault("sim", {})["device"] = str(getattr(args, "device", None) or "cuda:0")
     dt = float(cfg["sim"]["dt"])
     speeds = tuple(float(x) for x in str(args.speeds).split(",") if x.strip())

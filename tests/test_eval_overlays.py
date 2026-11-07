@@ -30,7 +30,7 @@ DT = 0.04
 
 class FakeScene:
     def __init__(self, substep=False, cfg_extra=None):
-        self.cfg = {"state_machine_params": {"inference_window_s": 1.0},
+        self.cfg = {"state_machine_params": {"episode_max_s": 1.0},
                     "robot": dict(cfg_extra or {})}
         self.dt, self.weld_grasp, self.t = DT, False, 0.0
         self.targets, self.substep_calls, self.releases = [], 0, 0

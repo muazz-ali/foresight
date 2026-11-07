@@ -11,7 +11,7 @@ rm -f "$OUT/settles.jsonl"
 
 for obj in egg lemon onion; do
   echo "=== fix1 measure object=$obj $(date -Is) ===" | tee -a "$OUT/logs/launch.log"
-  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} $PY "$ROOT/scripts/fix1_static_offset.py" \
+  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} $PY "$ROOT/eval/fix1_static_offset.py" \
     --headless --enable_cameras --device cuda:0 \
     --object "$obj" -o "$OUT" \
     >>"$OUT/logs/${obj}.log" 2>&1

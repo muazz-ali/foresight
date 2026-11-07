@@ -1,0 +1,35 @@
+# Foresight Mode 2 — static colored cubes + language (no throw).
+#
+# Same stack as phase0 via sim/cfg/. Only Mode-2 differences live here.
+# Units: metres, seconds, m/s (SI).
+
+include:
+  - cfg/collect.yaml
+  - cfg/state_machine.yaml
+  - cfg/training.yaml
+  - cfg/evaluation.yaml
+
+# -----------------------------------------------------------------------------
+# Mode 2 scene — four static cubes; language names the grasp target
+# -----------------------------------------------------------------------------
+scene:
+  mode: 2
+  # basic_block.usd is a dependency mesh next to each color block — not graspable.
+  exclude_usd_objects:
+  - basic_block
+  tip_roll_categories: []
+  throw_randomness: 0.0
+  object_categories:
+  - cube_blue
+  - cube_red
+  - cube_green
+  - cube_yellow
+  # Layout: min centre–centre gap and keep clear of the bowl.
+  mode2_min_separation_m: 0.12
+  mode2_container_clearance_m: 0.15
+  mode2_max_place_tries: 80
+
+# Shorter lift / tighter slip for still cubes (defaults otherwise from cfg/).
+state_machine_params:
+  lift_height_m: 0.05
+  robot_distance_to_object_m: 0.05

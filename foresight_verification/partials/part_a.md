@@ -95,7 +95,7 @@ Std (cm / cm/s): ee_x 3.53, ee_y 16.56, ee_z 11.96; p̂_x 4.38, p̂_y 18.83; v̂
 
 **Commanded absolute EE target**, not future measured hand pose.
 
-1. Expert returns `ExpertCommand.position/quat`.
+1. State machine returns `StateMachineCommand.position/quat`.
 2. `sim/collect.py` logs `action_pos` / `action_quat` = that command.
 3. `policy/convert_h5.pack_action` writes LeRobot `action` (“command, not measured state”).
 4. Proprio uses **post-step** `ee_pos`; action uses the **command** from the same step.
@@ -115,7 +115,7 @@ Stages **0→9**: start → intercept → *(2 unused)* → close → lift → ca
 
 Hand-dependent: intercept travel from current EE, grasp gate vs EE−obj, slip if \|obj−ee\| > 10 cm, home retreat from EE anchor.
 
-**Sources:** `sim/state_machine.py`; `sim/phase0_cfg.yaml` `state_machine_params`.
+**Sources:** `sim/state_machine.py`; `sim/cfg/state_machine.yaml` `state_machine_params`.
 
 ---
 
@@ -125,7 +125,7 @@ Hand-dependent: intercept travel from current EE, grasp gate vs EE−obj, slip i
 - Arm stiffness/damping **400 / 80**; fingers **2000 / 100**.
 - Control **dt = 40 ms (25 Hz)**; house **physics_substeps = 4** → **100 Hz** physics; render once per control step.
 
-**Sources:** `sim/scene.py` L313–328, L614–617, L1426–1467; IsaacLab `franka.py` HIGH_PD; `phase0_cfg.yaml` `sim`.
+**Sources:** `sim/scene.py`; IsaacLab `franka.py` HIGH_PD; `sim/cfg/collect.yaml` `sim` (claim default **30 Hz** now; table above is older 25 Hz run).
 
 ---
 

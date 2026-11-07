@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ride contact log: finger/palm vs object and table before CLOSE.
 
-Runs the expert on scout seeds. From first ride tick to CLOSE, logs:
+Runs the sm on scout seeds. From first ride tick to CLOSE, logs:
   - geometric clearance (finger tip vs object collision radius / table)
   - net contact-force magnitude on finger+hand bodies (PhysX link forces)
 
@@ -256,7 +256,7 @@ def main() -> None:
     from sim.state_machine import STAGE_APPROACH, STAGE_CLOSE, PickPlaceStateMachine
 
     cfg = load_cfg(args.cfg)
-    cfg.setdefault("claim_timing", {})["obs_delay_buffer"] = True
+    cfg.setdefault("claim_timing", {})["enabled_noise_on_replan"] = True
     cfg["claim_timing"]["eval_delta_ms"] = float(args.cell_delta_ms)
     # Catalog = this category only (same as run_c30_object_scout).
     cfg.setdefault("scene", {})["object_categories"] = objs

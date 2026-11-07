@@ -166,8 +166,8 @@ def analyze(h5_path: Path, *, hand_eye: np.ndarray | None = None) -> dict:
             "sign": "+ = hand/aim ahead of object along v",
         }
 
-    closes = np.where(st == 3)[0]
-    home = np.where(st == 8)[0]
+    closes = np.where(st == 2)[0]
+    home = np.where(st == 7)[0]
     close_info = None
     if len(closes):
         c = int(closes[0])

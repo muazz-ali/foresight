@@ -77,10 +77,10 @@ Fix 2 / tip lag.
 
 ## Files changed
 
-- `sim/phase0_cfg.yaml` — `close_settle_ticks: 15`
+- Historical: `close_settle_ticks: 15` (removed; expert no longer uses settle ticks). Config lives under `sim/cfg/`.
 - `sim/pinch_point.py` — URDF pad midpoint helpers
 - `sim/scene.py` — `get_hand_pose` / `get_pinch_point` / `get_tcp_minus_pinch_hand_m`
-- `scripts/fix1_static_offset.py` — 108-settle measure + fit
+- `eval/fix1_static_offset.py` — 108-settle measure + fit
 - `eval/run_fix1_measure.sh`, `eval/launch_fix1_static_offset.sh`, `eval/run_fix1_b5_recheck.sh`
 - `tests/test_pinch_point.py`, `tests/test_state_machine.py` (settle-ticks test)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Foresight Phase 0 / Gate G0 — in-repo Franka expert.
+"""Foresight Phase 0 / Gate G0 — in-repo Franka sm.
 
 Launch (conda: dynamicVLA_isaac):
 
@@ -9,11 +9,11 @@ Launch (conda: dynamicVLA_isaac):
 Object/container USD meshes are fixed for the process (2A). Diversify with
 distinct --seed across workers, or pass --object-usd / --container-usd.
 
-What it does: runs our scripted expert at set object speeds, scores each try,
+What it does: runs our scripted sm at set object speeds, scores each try,
 and writes a pass/fail report for Gate G0 (>=70% per speed, ~100 eps/hour).
 It runs by hand from the shell, in the sim conda env, with Isaac launched first.
 It must NOT use DynamicVLA code, and it does not train anything. Success comes
-from sim/success.py, not from the expert's own stage latch.
+from sim/success.py, not from the sm's own stage latch.
 Without --g0 it is only a smoke check, not a gate result.
 """
 
@@ -88,7 +88,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "conditioning look-ahead (s) for the future-XY pack; "
-            "default is expert.conditioning_delta_s (else lookahead_s)"
+            "default is sm.policy_look_ahead_s (else lookahead_s)"
         ),
     )
     return parser
@@ -151,7 +151,7 @@ def _count_failure(metrics_path: Path, speed: float) -> dict:
     return counts
 
 
-def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path: Path) -> dict:
+def run_speed_bin(args, scene, sm, speed: float, n_trials: int, metrics_path: Path) -> dict:
     """Run ``n_trials`` episodes at one object speed. Returns that speed's score.
 
     Each try: run the episode → judge success → pick a failure label → save
@@ -188,7 +188,7 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
         try:
             episode, meta = run_episode(
                 scene,
-                expert,
+                sm,
                 seed=seed,
                 speed=speed,
                 # --debug needs camera buffers for the stitched MP4.
@@ -197,7 +197,7 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
                     float(args.delta)
                     if args.delta is not None
                     else float(
-                        getattr(expert, "conditioning_delta_s", expert.lookahead_s)
+                        getattr(sm, "policy_look_ahead_s", sm.max_aim_ahead_s)
                     )
                 ),
             )
@@ -206,9 +206,9 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
             # Not DynamicVLA's object_picked.
             success = episode_success(
                 episode,
-                z_lift_min=float(expert.lift_height),
-                container_xy_tol=float(expert.place_xy_tol),
-                place_stage=int(expert.stage_schema.done),
+                z_lift_min=float(sm.lift_height_m),
+                container_xy_tol=float(sm.place_xy_tol),
+                place_stage=int(sm.stage_schema.done),
             )
         except Exception as ex:
             # Log the full error, remember it, and score this try as a failure.
@@ -223,18 +223,18 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
         # Facts about the run (farthest stage, object height low/high/end).
         # They go in the record so a failure label can be double-checked.
         diag = episode_diagnostics(
-            episode, z_lift_min=float(expert.lift_height)
+            episode, z_lift_min=float(sm.lift_height_m)
         )
         # Label WHY it failed (never-engaged | too-late | early-close | ...),
-        # using the stage ids from the expert. "success" if it passed.
+        # using the stage ids from the sm. "success" if it passed.
         failure = classify_failure(
             success=success,
             max_stage=diag["max_stage"],
             object_z_min=diag["z_min"],
             object_z_max=diag["z_max"],
             object_z_end=diag["z_end"],
-            z_lift_min=float(expert.lift_height),
-            schema=expert.stage_schema,
+            z_lift_min=float(sm.lift_height_m),
+            schema=sm.stage_schema,
             off_table=bool(meta.get("off_table", False)),
             abort_reason=meta.get("abort_reason"),
         )
@@ -292,9 +292,9 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
                                 meta.get(
                                     "delta",
                                     getattr(
-                                        expert,
-                                        "conditioning_delta_s",
-                                        expert.lookahead_s,
+                                        sm,
+                                        "policy_look_ahead_s",
+                                        sm.max_aim_ahead_s,
                                     ),
                                 )
                             )
@@ -304,12 +304,12 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
                 },
             )
             if args.debug:
-                from sim.video import gates_from_expert, write_debug_mp4
+                from sim.video import gates_from_state_machine, write_debug_mp4
 
                 fps = int(scene.cfg["static_camera"]["fps"])
                 video_path = out_dir / f"{ep_name}.mp4"
                 write_debug_mp4(
-                    episode, video_path, fps=fps, gates=gates_from_expert(expert)
+                    episode, video_path, fps=fps, gates=gates_from_state_machine(sm)
                 )
 
         log_result(
@@ -320,7 +320,7 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
             z_end=diag["z_end"],
             n_frames=record["n_frames"],
             video=video_path,
-            names=expert.stage_schema.names,
+            names=sm.stage_schema.names,
         )
 
         with open(metrics_path, "a") as fp:
@@ -354,7 +354,7 @@ def run_speed_bin(args, scene, expert, speed: float, n_trials: int, metrics_path
     return summary
 
 
-def run(args, scene, expert) -> dict:
+def run(args, scene, sm) -> dict:
     """Run every speed bin, then write ``gate_g0_report.json`` and print it.
 
     Pick of speeds: --g0 wins, then --speeds, then --speed, else 0.0 only.
@@ -381,7 +381,7 @@ def run(args, scene, expert) -> dict:
     summaries = []
     wall0 = time.time()
     for speed in speeds:
-        summaries.append(run_speed_bin(args, scene, expert, speed, n_trials, metrics_path))
+        summaries.append(run_speed_bin(args, scene, sm, speed, n_trials, metrics_path))
 
     wall = time.time() - wall0
     overall_attempts = sum(s["attempts"] for s in summaries)
@@ -452,7 +452,7 @@ def run(args, scene, expert) -> dict:
 
 
 def main() -> None:
-    """Start Isaac, build the scene and expert, run, then exit.
+    """Start Isaac, build the scene and sm, run, then exit.
 
     Order matters: Isaac's AppLauncher must start BEFORE any isaaclab / omni
     import, or imports fail. That is why most imports live inside this function.
@@ -490,7 +490,7 @@ def main() -> None:
     # Isaac / foresight imports only after AppLauncher.
     from sim.scene import Phase0Scene, load_cfg
 
-    from sim.state_machine import PickPlaceStateMachine as ExpertClass
+    from sim.state_machine import PickPlaceStateMachine as StateMachineClass
 
     # Settings live in the yaml; the --device flag may override the GPU choice.
     cfg = load_cfg(args.sim_cfg_file)
@@ -507,21 +507,21 @@ def main() -> None:
             container_usd=args.container_usd,
             asset_seed=int(args.seed),
         )
-        expert = ExpertClass(cfg, dt=scene.dt)
-        log_event(log, f"Expert intercept-servo. Step time {expert.dt:.3f} s. Look-ahead {expert.lookahead_s:.2f} s.")
+        sm = StateMachineClass(cfg, dt=scene.dt)
+        log_event(log, f"Expert intercept-servo. Step time {sm.dt:.3f} s. Look-ahead {sm.max_aim_ahead_s:.2f} s.")
         log_event(
             log,
-            f"Robot approach pad {expert.robot_approach_pad_s:.3f} s, "
-            f"hand speed cap {expert.ee_speed_max:.2f} m/s.",
+            f"Robot approach pad {sm.robot_approach_pad_s:.3f} s, "
+            f"hand speed cap {sm.robot_speed_max_m_s:.2f} m/s.",
         )
         log_how_to_read(
             log,
-            lookahead_s=float(expert.lookahead_s),
-            names=expert.stage_schema.names,
-            why=expert.stage_schema.why,
+            max_aim_ahead_s=float(sm.max_aim_ahead_s),
+            names=sm.stage_schema.names,
+            why=sm.stage_schema.why,
         )
         log_blank(log)
-        run(args, scene, expert)
+        run(args, scene, sm)
     except Exception:
         logging.exception("Phase 0 run failed")
         exit_code = 1

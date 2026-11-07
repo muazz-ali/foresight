@@ -20,28 +20,26 @@ import numpy as np
 STAGE_PLAIN = {
     0: "start",
     1: "intercept",
-    2: "go down",  # unused happy-path id; intercept closes directly
-    3: "close fingers",
-    4: "lift",
-    5: "carry to box",
-    6: "lower into box",
-    7: "open fingers",
-    8: "go home",
-    9: "done",
+    2: "close fingers",
+    3: "lift",
+    4: "carry to box",
+    5: "lower into box",
+    6: "open fingers",
+    7: "go home",
+    8: "done",
 }
 
 # One line per stage: what the hand is trying to do. Printed in the "how to read" banner.
 STAGE_WHY = {
     0: "Arm at rest. Object still on the table.",
-    1: "Chase the object (0.25 s ahead). Close when inside grasp_xyz_ok.",
-    2: "Unused. Old go-down stage; chase now closes on the same gate.",
-    3: "Fingers shut. Object is held (snapped to the hand).",
-    4: "Raise the object.",
-    5: "Move high, over the box.",
-    6: "Come down inside the box.",
-    7: "Let go. Object should stay in the box.",
-    8: "Arm rises straight off the object, then returns to rest.",
-    9: "Finished.",
+    1: "Chase the object (0.25 s ahead). Close when inside grasp_xyz_ok_m.",
+    2: "Fingers shut. Object is held (snapped to the hand).",
+    3: "Raise the object.",
+    4: "Move high, over the box.",
+    5: "Come down inside the box.",
+    6: "Let go. Object should stay in the box.",
+    7: "Arm rises straight off the object, then returns to rest.",
+    8: "Finished.",
 }
 
 # JSON still stores the short code. This is only for the human file.
@@ -162,7 +160,7 @@ def log_stage(
 def log_how_to_read(
     log: logging.Logger,
     *,
-    lookahead_s: float,
+    max_aim_ahead_s: float,
     names: dict | None = None,
     why: dict | None = None,
 ) -> None:
@@ -174,7 +172,7 @@ def log_how_to_read(
     for n in sorted(name_table):
         _bare(log, f"  {stage_label(n, name_table):<20}  {why_table.get(n, '')}")
     log_blank(log)
-    ms = 1000.0 * float(lookahead_s)
+    ms = 1000.0 * float(max_aim_ahead_s)
     _bare(
         log,
         f"Intercept: the hand aims where the object will be when the hand arrives (cap {ms:.0f} ms), with lag compensation.",

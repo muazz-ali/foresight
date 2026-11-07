@@ -1,6 +1,6 @@
-"""Episode recording loop (scripted expert + sim-truth future numbers).
+"""Episode recording loop (scripted state machine + sim-truth future numbers).
 
-What it does: runs ONE episode — expert picks, scene steps, we log every frame —
+What it does: runs ONE episode — state machine picks, scene steps, we log every frame —
 and writes the result to JSON (light) and H5 (full arrays).
 It runs from scripts/run_phase0.py (G0 score) and scripts/run_phase1_collect.py
 (training demos). Policy eval uses the same writers so the files match.
@@ -18,7 +18,7 @@ import numpy as np
 from interfaces.state import CONDITIONING_DIM, CONDITIONING_LAYOUT, conditioning_vector
 from policy.features import default_language
 from sim.state_machine_logs import log_episode_begin
-from sim.state_machine import AIM_BRANCHES, STAGE_DONE, inference_window_steps
+from sim.state_machine import AIM_BRANCHES, STAGE_DONE, episode_max_steps
 
 if TYPE_CHECKING:
     from sim.scene import Phase0Scene
@@ -197,7 +197,7 @@ def write_episode_h5(
 
 def run_episode(
     scene: Phase0Scene,
-    expert: PickPlaceStateMachine,
+    sm: PickPlaceStateMachine,
     *,
     seed: int,
     speed: float,
@@ -209,36 +209,36 @@ def run_episode(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run one scripted episode. Returns (episode_arrays, meta).
 
-    ``delta`` is the conditioning look-ahead for packing future XY — not the
-    expert's aiming ``lookahead_s``. Default is ``conditioning_delta_s`` when
-    present, else ``lookahead_s`` (getattr race-safe).
+    ``delta`` is the pack look-ahead for future XY — not the state machine's
+    ``max_aim_ahead_s``. Default is ``policy_look_ahead_s`` when present, else
+    ``max_aim_ahead_s``.
 
-    B1 oracle: pass ``obs_delay_s`` (cell Δ). The expert then only sees GT at
+    B1 oracle: pass ``obs_delay_s`` (cell Δ). The state machine then only sees GT at
     t−Δ via ``ObsDelayBuffer``; motions still run the same tick. ``forecast_off``
     aims at delayed p (negative control). ``depth_noise`` adds σ(Z)² + hand-eye.
 
-    Each step: read true state → (optional delay) → expert → scene → log.
+    Each step: read true state → (optional delay) → state machine → scene → log.
     Stops at the "done" stage or the step cap. Does not judge success.
     """
     if delta is None:
-        delta = float(getattr(expert, "conditioning_delta_s", expert.lookahead_s))
+        delta = float(getattr(sm, "policy_look_ahead_s", sm.max_aim_ahead_s))
     meta = scene.reset_episode(seed=seed, speed=speed)
     meta["language"] = default_language(
         meta.get("category"),
         meta.get("container_category"),
         seed=int(seed),
     )
-    expert.reset()
+    sm.reset()
     # Real mesh half-height + table Z → close near object centre (not in the air).
     hh = meta.get("object_half_height")
     if hh is not None:
-        expert.set_object_half_height(
+        sm.set_object_half_height(
             float(hh),
             z_table=float(getattr(scene, "_table_z", meta.get("table_z", 0.0))),
         )
-    # Tell the expert where this episode's box is, so carry / lower aim at it.
+    # Tell the state machine where this episode's box is, so carry / lower aim at it.
     # (Aim PLACE at container, or cfg fallback.)
-    expert.set_box_poses(
+    sm.set_box_poses(
         scene.get_carry_pose(),
         drop_pos=scene.get_drop_target(),
     )
@@ -247,7 +247,7 @@ def run_episode(
     # Escape/catch box stays the full table (keepout on −X only) so a far-rim
     # spawn is still chaseable — aim inset alone made lemon seed-50194 go home
     # on frame 1 ("left aim box" at x just past inset xmax).
-    if hasattr(expert, "set_aim_xy_bounds"):
+    if hasattr(sm, "set_aim_xy_bounds"):
         table_box = getattr(scene, "_table_box", None)
         if table_box is not None:
             lo = np.asarray(table_box[0], dtype=np.float64).copy()
@@ -260,24 +260,24 @@ def run_episode(
             aim_lo = lo + margin
             aim_hi = hi - margin
             aim_lo[0] = max(float(aim_lo[0]), keepout)
-            expert.set_aim_xy_bounds(
+            sm.set_aim_xy_bounds(
                 [[float(aim_lo[0]), float(aim_hi[0])], [float(aim_lo[1]), float(aim_hi[1])]]
             )
-            if hasattr(expert, "set_escape_xy_bounds"):
-                expert.set_escape_xy_bounds(
+            if hasattr(sm, "set_escape_xy_bounds"):
+                sm.set_escape_xy_bounds(
                     [
                         [float(esc_lo[0]), float(esc_hi[0])],
                         [float(esc_lo[1]), float(esc_hi[1])],
                     ]
                 )
         else:
-            expert.set_aim_xy_bounds(None)
-            if hasattr(expert, "set_escape_xy_bounds"):
-                expert.set_escape_xy_bounds(None)
+            sm.set_aim_xy_bounds(None)
+            if hasattr(sm, "set_escape_xy_bounds"):
+                sm.set_escape_xy_bounds(None)
 
-    done_stage = int(getattr(expert, "stage_done", STAGE_DONE))
+    done_stage = int(getattr(sm, "stage_done", STAGE_DONE))
     # Hard cap on steps from the yaml, so a stuck run still ends.
-    n_steps = inference_window_steps(scene.cfg, scene.dt)
+    n_steps = episode_max_steps(scene.cfg, scene.dt)
     state0 = scene.get_object_state()
     ee0, _ = scene.get_ee_pose()
     drop = scene.get_drop_target()
@@ -310,7 +310,7 @@ def run_episode(
         "timestamp": [],
         "container_pos": [],
         "wrist_depth_m": [],
-        # Step 1 claim timing (filled only when claim_timing.enabled).
+        # Claim timing (filled only when claim_timing.delay_enabled).
         "capture_t0": [],
         "applied_delta_s": [],
         "reported_delta_s": [],
@@ -336,47 +336,52 @@ def run_episode(
     reflex = None
     sm_cfg = scene.cfg.get("state_machine_params", {}) if isinstance(scene.cfg, dict) else {}
     want_reflex = bool(sm_cfg.get("use_reflex", False)) and bool(
-        getattr(expert, "physics_grasp", False)
+        getattr(sm, "physics_grasp", False)
     )
     if want_reflex:
         from control import ReflexClose
 
         # close_time = how long the fingers take to reach the object (measured,
-        # robot.gripper_close_time_s). NOT expert.close_gripper_s: that is a dwell.
+        # robot.gripper_close_time_s). NOT sm.close_gripper_s: that is a dwell.
         reflex = ReflexClose(
             close_time=float(scene.cfg["robot"]["gripper_close_time_s"]),
             radius=0.10,
-            vmax=float(getattr(expert, "ee_speed_max", 0.5)),
+            vmax=float(getattr(sm, "robot_speed_max_m_s", 0.5)),
         )
         reflex.reset()
     meta["reflex"] = bool(reflex is not None)
 
-    # Step 1: delay injection. When enabled, log t0 / applied / reported Δ and
-    # (if enforce_apply_at) hold motions until apply_at = t0 + applied_Δ.
-    # B1 obs buffer: Δ ages the expert's observations; do NOT also enforce_apply.
+    # Delay injection. When delay_enabled, log t0 / applied / reported Δ and
+    # (if apply_delta_delay_to_robot) hold motions until apply_at = t0 + applied_Δ.
+    # Old-frame path: Δ ages the state machine's observations; do NOT also hold the arm.
     delay = None
     ct = scene.cfg.get("claim_timing", {}) if isinstance(scene.cfg, dict) else {}
     ct = ct if isinstance(ct, dict) else {}
-    use_obs_delay = obs_delay_s is not None or bool(ct.get("obs_delay_buffer", False))
+    use_obs_delay = obs_delay_s is not None or bool(
+        ct.get("enabled_noise_on_replan", False)
+    )
     delta_true_s = float(obs_delay_s) if obs_delay_s is not None else float(
         ct.get("eval_delta_s", 0.0) or 0.0
     )
-    if bool(ct.get("enabled", False)) and not use_obs_delay:
+    if bool(ct.get("delay_enabled", False)) and not use_obs_delay:
         from control import DelayInjection
 
         delay = DelayInjection.from_cfg(scene.cfg, seed=int(seed))
     enforce_apply = (
         bool(delay is not None)
-        and bool(ct.get("enforce_apply_at", True))
+        and bool(ct.get("apply_delta_delay_to_robot", False))
         and not use_obs_delay
     )
     use_noisy = bool(ct.get("use_noisy_gt", False))
-    close_guard = bool(ct.get("close_speed_guard", False))
+    # Close is the 2 mm box. No separate speed gate.
+    close_guard = False
     meta["claim_timing"] = bool(delay is not None) or bool(use_obs_delay)
-    meta["enforce_apply_at"] = bool(enforce_apply)
+    meta["enforce_apply_at"] = bool(enforce_apply)  # = apply_delta_delay_to_robot
+    meta["apply_delta_delay_to_robot"] = bool(enforce_apply)
     meta["use_noisy_gt"] = bool(use_noisy)
     meta["close_speed_guard"] = bool(close_guard)
-    meta["obs_delay_buffer"] = bool(use_obs_delay)
+    meta["obs_delay_buffer"] = bool(use_obs_delay)  # = enabled_noise_on_replan
+    meta["enabled_noise_on_replan"] = bool(use_obs_delay)
     meta["obs_delay_s"] = float(delta_true_s) if use_obs_delay else None
     meta["forecast_off"] = bool(forecast_off)
 
@@ -399,7 +404,7 @@ def run_episode(
         obs_buf = ObsDelayBuffer(dt=float(scene.dt))
         delta_meas = DeltaMeasSampler(
             noise_std_s=float(ct.get("delta_meas_noise_s", 0.005)),
-            replan_period_s=float(ct.get("delta_meas_replan_s", 0.33)),
+            replan_period_s=float(ct.get("replan_meas_noise_s", 0.33)),
             seed=int(seed) + 3,
         )
         # Fixed 1 mm hand-eye offset, random direction, fixed for this episode.
@@ -410,7 +415,7 @@ def run_episode(
         # Pre-shape from object width along finger axis at grasp yaw.
         obj_size = getattr(scene, "_object_size", None)
         if obj_size is not None:
-            if getattr(expert, "grasp_yaw_mode", "fixed") == "along":
+            if getattr(sm, "grasp_yaw_mode", "fixed") == "along":
                 # Hand yaw follows the throw, so open for the widest XY side.
                 s = np.asarray(obj_size, dtype=np.float64).reshape(3)
                 m = float(max(s[0], s[1]))
@@ -423,15 +428,15 @@ def run_episode(
             )
             open_gap = 2.0 * float(scene.cfg["robot"]["gripper_open"])
             open_frac = float(np.clip(wp / max(open_gap, 1e-6), 0.0, 1.0))
-            if hasattr(expert, "set_pre_shape"):
-                expert.set_pre_shape(open_frac, w_pre_m=wp, clamped=clamped)
+            if hasattr(sm, "set_pre_shape"):
+                sm.set_pre_shape(open_frac, w_pre_m=wp, clamped=clamped)
             # Oracle B1: delayed GT top is the intended height channel.
-            expert.oracle_z_top = True
+            sm.oracle_z_top = True
             meta["w_pre_m"] = float(wp)
             meta["w_pre_raw_m"] = float(raw)
             meta["w_pre_clamped"] = bool(clamped)
 
-    # Pending expert cmds waiting for apply_at; held = last released cmd.
+    # Pending state-machine cmds waiting for apply_at; held = last released cmd.
     pending: list[tuple[float, Any, Any]] = []
     held_cmd = None
     held_t0 = -np.inf  # camera time of the frame held_cmd was planned from
@@ -449,7 +454,7 @@ def run_episode(
         d = np.where(ok, d + noise, d)
         return d.astype(np.float32) if depth.dtype == np.float32 else d
 
-    # Main loop: expert looks → (optional delay) → scene acts → log.
+    # Main loop: state machine looks → (optional delay) → scene acts → log.
     for t in range(n_steps):
         live_state = scene.get_object_state()
         ee_pos, ee_quat = scene.get_ee_pose()
@@ -515,7 +520,7 @@ def run_episode(
             delta_round = float(obs_buf.last_round_dt_s)
             # F1: measured frame age + η (the real robot has no true Δ).
             delta_meas_s = float(delta_meas.update(now, t_capture_used))
-            planned = expert.step(
+            planned = sm.step(
                 state,
                 ee_pos,
                 ee_quat,
@@ -530,7 +535,7 @@ def run_episode(
             )
         else:
             state = live_state
-            planned = expert.step(
+            planned = sm.step(
                 state,
                 ee_pos,
                 ee_quat,
@@ -546,7 +551,7 @@ def run_episode(
 
             planned, _ = overlay_reflex(planned, reflex, state, ee_pos)
 
-        # B3 close-speed lives in the expert (PickPlaceStateMachine): CLOSE is
+        # B3 close-speed lives in the state machine (PickPlaceStateMachine): CLOSE is
         # entered only once hand and object speeds match. No override here —
         # snapping the aim back onto the object made the lagging hand brake.
 
@@ -618,10 +623,10 @@ def run_episode(
             if filt_st is not None:
                 pack_state = filt_st
 
-        # Pack height: depth latch (p_hat_z) when enabled; else expert aim z_grasp.
-        p_hat_z = getattr(expert, "p_hat_z", None)
+        # Pack height: depth latch (p_hat_z) when enabled; else state-machine aim z_grasp.
+        p_hat_z = getattr(sm, "p_hat_z", None)
         if p_hat_z is None:
-            p_hat_z = getattr(expert, "z_grasp", None)
+            p_hat_z = getattr(sm, "z_grasp", None)
         cond = conditioning_vector(pack_state, delta=pack_delta, p_hat_z=p_hat_z)
 
         log["stage"].append(cmd.stage)
@@ -629,7 +634,7 @@ def run_episode(
         log["wrist_depth_m"].append(depth_m)
         log["object_pos"].append(state2.position.copy())
         log["object_vel"].append(state2.velocity.copy())
-        # ee_pos = post-step TCP (physics). ee_pre = pose the expert planned from
+        # ee_pos = post-step TCP (physics). ee_pre = pose the state machine planned from
         # this tick — pair with action_pos for link-3 (post−aim grows with v as
         # DiffIK lag; hand_aim_probe: TCP−pinch≈0 so frame is aligned).
         log["ee_pos"].append(ee_pos2.copy())
@@ -637,7 +642,7 @@ def run_episode(
         log["ee_vel"].append(scene.get_ee_lin_vel())
         log["ee_quat"].append(ee_quat2.copy())
         log["proprio"].append(scene.get_proprio())
-        # Log the *planned* action (what the expert wanted), not the delayed hold.
+        # Log the *planned* action (what the state machine wanted), not the delayed hold.
         log["action_pos"].append(planned.position.copy())
         log["action_quat"].append(planned.quat_wxyz.copy())
         log["gripper"].append(planned.gripper_open)
@@ -653,11 +658,11 @@ def run_episode(
         log["t_exec"].append(float(now))
         log["delta_meas_s"].append(float(delta_meas_s))
         log["delta_round_s"].append(float(delta_round))
-        # Which chase-aim branch the expert ran for the *planned* cmd this tick.
+        # Which chase-aim branch the state machine ran for the *planned* cmd this tick.
         log["aim_branch"].append(
-            AIM_BRANCHES.index(getattr(expert, "aim_branch", "none"))
+            AIM_BRANCHES.index(getattr(sm, "aim_branch", "none"))
         )
-        log["p_now"].append(np.asarray(getattr(expert, "p_now", np.full(3, np.nan))).copy())
+        log["p_now"].append(np.asarray(getattr(sm, "p_now", np.full(3, np.nan))).copy())
         ctr = scene.get_container_pose()
         log["container_pos"].append(
             ctr[0].copy() if ctr is not None else np.full(3, np.nan)
@@ -704,8 +709,8 @@ def run_episode(
     meta["abort_reason"] = getattr(scene, "abort_reason", None)
     meta["delta"] = float(delta)
     meta["aim_branch_codes"] = list(AIM_BRANCHES)
-    if hasattr(expert, "grasp_report"):
-        meta.update(expert.grasp_report())
+    if hasattr(sm, "grasp_report"):
+        meta.update(sm.grasp_report())
     if obs_buf is not None:
         meta["live_gt_leaks"] = int(obs_buf.live_gt_leaks)
         meta["delta_round_median_s"] = (

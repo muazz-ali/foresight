@@ -35,7 +35,7 @@ def cfg() -> dict:
 
 
 def test_budgets_match_yaml_half_slack(cfg):
-    """XY = grasp_xyz_ok/2 (5 mm); Z = z_slack/2 (2.5 mm)."""
+    """XY = grasp_xyz_ok_m/2 (5 mm); Z = z_slack/2 (2.5 mm)."""
     s_xy, s_z = _budgets_m(cfg)
     assert s_xy == pytest.approx(0.005, abs=1e-9)
     assert s_z == pytest.approx(0.0025, abs=1e-9)
@@ -43,7 +43,7 @@ def test_budgets_match_yaml_half_slack(cfg):
 
 def test_expert_close_tau_is_pad_only(cfg):
     """CLOSE lead = approach pad; no hand-written control tick."""
-    pad = float(cfg["state_machine_params"]["robot_approach_pad_s"])
+    pad = float(cfg["state_machine_params"].get("robot_approach_pad_s", 0.0))
     assert expert_close_tau_s(cfg) == pytest.approx(pad, abs=1e-12)
 
 

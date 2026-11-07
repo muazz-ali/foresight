@@ -3,7 +3,7 @@
 “Conditioning” = the 4 live future numbers (XY p̂, XY v̂):
   where the object will be (XY), and how fast it moves (XY).
 “Oracle state” = perfect sim pose saved each frame (14-D; Δ rebuild uses it).
-Δ defaults come from yaml (``conditioning_delta_s`` / ``smolvla.yaml``).
+Δ defaults come from yaml (``policy_look_ahead_s`` / ``smolvla.yaml``).
 
 Why this file exists:
   * The saved data has clean, perfect numbers. A real camera + filter gives

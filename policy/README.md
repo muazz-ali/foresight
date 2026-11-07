@@ -1,6 +1,5 @@
 # `policy/` — train the pick policy
 
-Plain words: see [`../WORDS.md`](../WORDS.md).
 
 | File | What it does |
 |---|---|

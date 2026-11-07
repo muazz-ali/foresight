@@ -1,355 +1,82 @@
-# How the expert works (simple guide)
+# State machine
 
-Code: [`state_machine.py`](state_machine.py).  
-Knobs: [`phase0_cfg.yaml`](phase0_cfg.yaml) → `state_machine_params`.  
-Loop: [`collect.py`](collect.py).
+Code: [`state_machine.py`](state_machine.py) · loop: [`collect.py`](collect.py)  
+Knobs: [`cfg/state_machine.yaml`](cfg/state_machine.yaml) (via `phase0_cfg` / `mode2_cfg`)
 
-This file uses short, everyday words. Hard ideas get a plain sentence first, then a link into the code.
-
----
-
-## Big picture
-
-We teach a robot arm to **pick up a sliding object** on a table and **put it in a box**.
-
-The **state machine** (also called the **expert**) is a hand-written checklist. It is **not** a neural net.
-
-Every small time step it:
-
-1. Looks at where the object is and how fast it moves
-2. Looks at where the hand is
-3. Picks the next aim for the hand, and whether fingers are open or closed
-4. Says how the object should move: slide, stick to the hand, or stay still
-
-Then the scene does that, and we repeat until **done** or time runs out.
+Scripted controller that records demos for the **policy**. Not a neural net.  
+Each step: read object + robot → pick aim / gripper / object flags → scene runs it.  
+One **stage** at a time (`0`–`8`). Names: [`STAGE_PLAIN`](state_machine_logs.py).
 
 ---
 
-## What is a “state machine”?
+## Episode loop
 
-Think of a short play with numbered scenes. Only **one scene is active** at a time.
+[`run_episode`](collect.py): reset → each tick (`sim.dt` ≈ 30 Hz, max **8 s**)  
+state machine → move robot → log → stop on **done** or timeout → [`success.py`](success.py).
 
-- The scene number is `stage` (0 through 9).
-- Spoken names live here: [`STAGE_PLAIN`](state_machine_logs.py#L12).
-- The checklist that runs each step is [`PickPlaceStateMachine.step`](state_machine.py#L360).
+**Command** (`StateMachineCommand`): robot XYZ, gripper open/closed, stage,  
+object flags — slide / glue / freeze.
 
-When a gate passes (“hand close enough”, “fingers closed long enough”, …), we move to the next scene.
-
----
-
-## One episode, start to finish
-
-The loop that drives one demo is in [`run_episode`](collect.py#L124):
-
-```
-reset scene + expert
-        │
-        ▼
-┌────────────────────────────────┐
-│  for each sim step (≤ ~10 s)   │
-│                                │
-│  1. read object + hand         │
-│  2. expert.step(...)           │  ← decide stage + command
-│  3. move hand / fingers        │
-│  4. slide / freeze / attach    │  ← flags on the command
-│  5. log frames                 │
-│  6. stop if stage == done      │
-└────────────────────────────────┘
-        │
-        ▼
-  success check (object in box, arm home)
-```
-
-Key lines in the loop:
-
-- Ask the expert: [`cmd = expert.step(...)`](collect.py#L188)
-- Move the hand: [`scene.set_ee_target(...)`](collect.py#L190)
-- Apply object flags: [`scene.step(...)`](collect.py#L191)
-
-Default step size: `sim.dt = 0.04` s (25 steps per second).  
-Max length: `inference_window_s = 10` → about 250 steps. Running out of time = fail.
-
----
-
-## What the expert outputs each step
-
-Type: [`ExpertCommand`](state_machine.py#L84)
-
-| Field | Plain meaning |
+| When | Object |
 |---|---|
-| `position` | Where the hand should go next (world XYZ) |
-| `gripper_open` | `1` = open, `0` = closed |
-| `stage` | Current scene number (0–9) |
-| `kinematic_object` | Object **slides** on the table at fixed speed |
-| `attach_object` | Object is **glued** to the hand (held) |
-| `freeze_object` | Object **stays put** (no slide) |
-
-Rule of thumb:
-
-- **Before grasp:** object slides.
-- **Close → open:** object is glued to the hand.
-- **After release / home / done:** object is often frozen so it does not bounce out of the box.
+| Before grasp | slides |
+| Close → open | glued to robot |
+| After release / home | often frozen |
 
 ---
 
-## Intercept-servo (the hard idea, said simply)
+## Chase (stage 1)
 
-**Intercept-servo** is how the hand chases a *moving* object in stage 1
-(stage 2 “go down” is unused; the same chase closes when the grasp gate passes).
+Aim where the object **will be** when the robot can get there (lead capped at **0.40 s**).  
+Recompute every step. Joint speed feed keeps the robot from lagging forever.
 
-Two ideas glued together:
-
-1. **Intercept** — Aim where the object *will be when the hand can get there*, not a fixed “always 0.25 s ahead” point. Far away → lead more. Close → lead shrinks so the hand locks onto the object.
-2. **Servo** — Every step, recompute that aim and steer toward it (a closed loop). Also add a bit of **lag compensation** so the hand settles *on* the object, not forever behind the command.
-
-### Lag compensation (why we need `tau`)
-
-The arm does not jump to a command instantly. There is a short delay from “tell the hand to go here” to “hand actually gets there”.
-
-We call that delay **`tau`** ≈ `robot_approach_pad_s + dt` ([property](state_machine.py#L170)).
-
-If we aim at the object *now*, the hand arrives late and trails behind.  
-If we aim a little *ahead by `tau`*, the hand can ride **on** the object in steady state.
-
-### Meeting time (the lead)
-
-The lead time is **not** always 0.25 s. It is roughly:
-
-> how long the hand needs to reach the meeting point  
-> (capped at `lookahead_s` = 0.40 s)  
-> **plus** `tau`
-
-Code: [`_intercept_lead_s`](state_machine.py#L231).
-
-- Far away → lead near the 0.40 s cap.
-- On top of the object → travel time → 0 → lead collapses to `tau` → hand rides the object.
-
-### Coast forecast
-
-> Forecast is constant velocity (can leave the table).
-> Physics grasp (default): `attach_object` means "close now", the scene frees the object to PhysX instead of welding it. A held object more than `slip_dist_m` from the hand sends the expert back to intercept.
-
-We roll the object forward with the **same** coast rules the scene uses: [`_forecast`](state_machine.py) → [`kinematic_forecast`](motion.py).
-
-### Object-frame gates
-
-“Are we ready to close?” compares the hand to the **object now**, not to the moving aim point.
-
-With lag compensation, that error can go to zero. Without it, the aim stays ahead forever and the gate never closes.
-
-### One grasp gate
-
-Chase aims at the object (XY ahead, Z = object Z). Close when the hand is inside
-`grasp_xyz_ok_mm` (`|dx|`, `|dy|`, `|dz|`) on GT pose — [`_grasp_gate_ok`](state_machine.py).
-Wrist depth is logged only; it must not replace GT Z.
+Close when the robot is inside `grasp_xyz_ok_m` on the **object now** (GT).  
+Aim Z = **object centre**. Gripper then closes only inside `close_xy_ok_m`.
 
 ---
 
-## The stages (0 → 9)
-
-Four jobs, split into small steps:
-
-1. Meet the moving object (ride on it)
-2. Grasp and lift
-3. Carry to the box and release
-4. Go home
-
-Spoken names: [`STAGE_PLAIN`](state_machine_logs.py#L12).  
-Schema used by success/logging: [`STAGE_SCHEMA`](state_machine.py#L48) (engaged=1, lift=4, placed=7, done=9).
-
-### Stage 0 — start
-
-[`STAGE_RESET` branch](state_machine.py#L381)
-
-Arm sits at home. Wait `settle_s` so the scene is ready.
-
-→ Then **intercept**.
-
----
-
-### Stage 1 — intercept (chase → close)
-
-[`STAGE_APPROACH` branch](state_machine.py)
-
-**Goal:** put the hand on the object and close.
-
-- Compute lead with [`_intercept_lead_s`](state_machine.py).
-- Aim with [`_forecast`](state_machine.py); target Z is the object (no hover).
-- One gate: `grasp_xyz_ok_mm` (GT only) — [`_grasp_gate_ok`](state_machine.py).
-
-→ **close fingers**.  
-If stuck too long → retry intercept ([`_restart_approach`](state_machine.py)).
-
----
-
-### Stage 2 — go down (unused)
-
-Id kept for old logs / failure labels. Happy path never enters it; if entered, same chase gate as stage 1.
-
----
-
-### Stage 3 — close fingers
-
-[`STAGE_CLOSE` branch](state_machine.py#L455)
-
-Fingers close. Object **attaches** (glued to the hand).
-
-We do **not** freeze here: freezing a fast object would teleport-stop it.
-
-Wait `close_gripper_s` → **lift**.
-
----
-
-### Stage 4 — lift
-
-[`STAGE_LIFT` branch](state_machine.py#L467)
-
-Keep holding. Raise by `lift_height` at the grasp XY.
-
-→ **carry to box**. Stall → home.
-
----
-
-### Stage 5 — carry to box
-
-[`STAGE_CARRY` branch](state_machine.py#L483)
-
-Fly high to the box XY. Height clears the rim ([`_retract_z`](state_machine.py#L311)).
-
-→ **lower into box**. Stall → home.
-
----
-
-### Stage 6 — lower into box
-
-[`STAGE_LOWER` branch](state_machine.py#L498)
-
-Move down to the drop pose inside the container ([`_drop_target`](state_machine.py#L316)).
-
-→ **open fingers**. Stall → home.
-
----
-
-### Stage 7 — open fingers
-
-[`STAGE_OPEN` branch](state_machine.py#L512)
-
-Release. The hand holds still where the open began. Weld mode pins the object;
-physics grasp (default) lets it drop into the box. A lower that is blocked over
-the box (object on the floor, finger on the rim) also comes here, so every place
-shows a real open.
-
-Require object XY near box center (`place_xy_tol`) — [`_in_container`](state_machine.py#L343).
-
-→ **go home**.
-
----
-
-### Stage 8 — go home
-
-[`STAGE_HOME` branch](state_machine.py#L524)
-
-Three legs — [`_home_target`](state_machine.py):
-1. **Retreat:** hold the XY where go-home began and rise `release_retreat_mm`
-   (100 mm), leading Z by `release_step_mm` (20 mm) per tick. A big Z jump made
-   DiffIK swing ~5 cm sideways and the open fingers dragged the fruit out
-   (34% of `g0_object_smoke` successes).
-2. **Climb** to a safe height.
-3. **Cross** to home.
-
-Done when hand is home **and** object is still in the box.
-
-→ **done**.
-
----
-
-### Stage 9 — done
-
-[`DONE` branch](state_machine.py#L532)
-
-Success latch. Arm home, fingers open, object frozen in the box. The episode loop can stop early when `stage == stage_done` (9).
-
----
-
-## Flow diagram
+## Stages
 
 ```
-  [0 start]
-      │  settle_s
-      ▼
-  [1 intercept]  ←── chase object (lag + shrinking lead); Z on object
-      │  grasp_xyz_ok (GT)
-      │
-      │  (2 go down — unused id; happy path skips it)
-      ▼
-  [3 close]      ←── glue / squeeze (no freeze)
-      │  close_gripper_s
-      ▼
-  [4 lift]
-      │
-      ▼
-  [5 carry to box]
-      │
-      ▼
-  [6 lower into box]
-      │
-      ▼
-  [7 open]       ←── release + freeze
-      │
-      ▼
-  [8 go home]
-      │
-      ▼
-  [9 done]
+0 start → 1 intercept → 2 close → 3 lift → 4 carry → 5 lower → 6 open → 7 home → 8 done
 ```
+
+| Stage | What happens |
+|---|---|
+| 0 | Same step → chase (no home pause) |
+| 1 | Lead + forecast; gate `grasp_xyz_ok_m` |
+| 2 | Close gripper, glue; wait `SM_hold_to_close_fingers_s` |
+| 3 | Lift by `lift_height_m` |
+| 4 | Fly to container (clear rim) |
+| 5 | Lower to drop pose |
+| 6 | Open gripper; object in container |
+| 7 | Rise above rim, then start pose (`home_radius_m`) |
+| 8 | Done latch |
+
+Miss / slip / timeout → fail labels in [`WHY_FAILED`](state_machine_logs.py).  
+No per-stage stall clock; only `episode_max_s`.
 
 ---
 
-## Knob cheat sheet
+## Knobs
 
-Edit the **yaml names** under `state_machine_params` in [`phase0_cfg.yaml`](phase0_cfg.yaml) (stage order).  
-Loader maps them to SI keys; the expert reads those in [`__init__`](state_machine.py#L102).
+Edit [`cfg/state_machine.yaml`](cfg/state_machine.yaml). Values are SI (m / s / m/s).
 
-| Yaml name | Default | Plain meaning |
+| Yaml | Default | Meaning |
 |---|---|---|
-| `policy_look_ahead_ms` | 250 | Policy pack look-ahead (not for aiming) |
-| `wait_at_home_ms` | 50 | Pause at home before first chase |
-| `max_aim_ahead_ms` | 400 | Cap on meeting-point look-ahead |
-| `tip_lag_pad_ms` | 160 | Aim farther for tip lag (not a wait) |
-| `hand_speed_max_cm_s` | 250 | Assumed hand speed for meet-time (faster than ~1 m/s objects) |
-| `grasp_xyz_ok_mm` | [10, 10, 20] | One close gate: \|dx\|, \|dy\|, \|dz\| (mm) |
-| `wrist_close_depth_mm` | 0 | Logged only; expert close Z always uses GT \|dz\| |
-| `hold_closed_weld_ms` / `hold_closed_physics_ms` | 100 / 300 | Dwell after close before lift |
-| `near_enough_xy_mm` | 30 | Close enough XY for carry / lower / home |
-| `arrived_z_ok_mm` | 30 | Height arrival for lift / carry / lower (not grasp) |
-| `in_box_xy_ok_mm` | 120 | “In the box” XY gate |
-| `lift_height_mm` | 120 | Raise after grasp |
-| `stall_timeout_ms` | 1500 | Stall cap after grasp |
-| `chase_stall_timeout_ms` | 3000 | Longer stall while chasing |
-| `max_retries` | 3 | Re-chase tries before giving up |
-| `episode_max_ms` | 10000 | Max episode time; timeout = fail |
+| `max_aim_ahead_s` | 0.4 | Lead cap |
+| `robot_speed_max_m_s` | 2.5 | Meet-time robot speed |
+| `robot_base_safe_zone_m` | 0.1 | Base keep-out circle |
+| `grasp_xyz_ok_m` | [0.01, 0.01, 0.012] | Chase gate |
+| `close_xy_ok_m` | 0.002 | Close XY box |
+| `SM_hold_to_close_fingers_s` | 0.3 | Hold after close, then lift |
+| `arrived_xyz_m` | 0.03 | “Arrived” for later stages |
+| `release_below_rim_m` | 0.01 | Open under rim |
+| `lift_height_m` | 0.12 | Lift (mode2: 0.05) |
+| `home_radius_m` | 0.1 | Home done ball |
+| `move_up_above_container_m` | 0.05 | Rise before home |
+| `episode_max_s` | 8.0 | Only clock |
+| `z_slack_m` | 0.005 | Height close-band (± half) |
 
-Calibrate tip lag / hand speed with `tools/diag/calibrate_servo_lag.py`.
-
----
-
-## Did we succeed?
-
-After the loop, [`episode_success`](success.py#L43) / [`classify_failure`](success.py#L90) check lift height, box placement, and farthest stage.
-
-Failure labels (plain): [`WHY_FAILED`](state_machine_logs.py#L39) — never reached object, too late, grasp slip, off table, timeout, …
-
----
-
-## How this ties to the rest of `sim/`
-
-| Piece | Role |
-|---|---|
-| [`scene.py`](scene.py) | Table, arm, object, box, cameras; applies slide / freeze / glue |
-| [`motion.py`](motion.py) | On-table coast + forecast |
-| [`state_machine.py`](state_machine.py) | Stage logic above |
-| [`collect.py`](collect.py) | Step loop: expert → scene → log |
-| [`success.py`](success.py) | Pass / fail label |
-| [`video.py`](video.py) | Debug MP4 with stage text |
-| [`state_machine_logs.py`](state_machine_logs.py) | Human-readable stage names |
-| `../interfaces/state.py` | Shared object message (`position, velocity, …`) |
+Also: [`cfg/collect.yaml`](cfg/collect.yaml), [`cfg/training.yaml`](cfg/training.yaml), [`cfg/evaluation.yaml`](cfg/evaluation.yaml).  
+Scene / motion / video: see [`README.md`](README.md).
